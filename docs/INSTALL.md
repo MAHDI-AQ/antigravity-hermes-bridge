@@ -1,4 +1,4 @@
-# Human Installation Guide
+# Installation Guide
 
 Install **Hermes Swarm** in under two minutes across **Windows**, **macOS**, and **Linux / WSL2**.
 

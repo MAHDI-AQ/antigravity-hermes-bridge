@@ -14,7 +14,7 @@ scripts/
 ├── doctor.py             # Post-install checker (--json supported)
 └── check_privacy.py      # Privacy, hardcoded-path, secret, and forbidden-term gate
 docs/
-├── INSTALL.md            # Human setup guide
+├── INSTALL.md            # Installation guide
 ├── AGENT_INSTALL.md      # Deterministic agent installation playbook
 ├── ARCHITECTURE.md       # Protocol, endpoints, 3-tier topology, token economy
 ├── CONFIGURATION.md      # Env vars, ports, model catalog & limits

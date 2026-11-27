@@ -57,7 +57,7 @@ flowchart LR
 - **Node.js `>= 20`** (for the Antigravity sidecar)
 - **Antigravity IDE** and **Hermes Agent (`>= 0.21.4`)** installed locally
 
-### Option A — Human 1-Command Install
+### Option A — One-Command Install
 
 **macOS / Linux:**
 ```bash
@@ -96,7 +96,7 @@ returns `"ok": true`, and report any actions needed to reload Antigravity / Herm
 
 ## Documentation
 
-- [Human Installation Guide](docs/INSTALL.md) — Windows, macOS, Linux, custom directories, upgrades, uninstall
+- [Installation Guide](docs/INSTALL.md) — Windows, macOS, Linux, custom directories, upgrades, uninstall
 - [AI Agent Installation Playbook](docs/AGENT_INSTALL.md) — Idempotent CLI flags & JSON contract for automated installs
 - [Architecture Reference](docs/ARCHITECTURE.md) — 3-tier topology, A2A runtime, MCP tools, HTTP/SSE routes, wakeup bridge
 - [Configuration Reference](docs/CONFIGURATION.md) — All environment variables, ports, timeouts, and context-window resolution
