@@ -203,7 +203,15 @@
       <section id="tab-agent" class="tab-body" role="tabpanel" data-testid="swarm-agent-pane">
         <div id="agent-pane" class="agent-pane">
           <div id="agent-header" class="agent-header" data-testid="swarm-agent-header"></div>
-          <div id="agent-feed" class="agent-feed" data-testid="swarm-agent-feed" aria-live="polite"></div>
+          <div id="agent-feed" class="agent-feed" data-testid="swarm-agent-feed" aria-live="polite">
+            <div id="agent-committed" class="agent-committed" data-testid="swarm-agent-committed"></div>
+            <div id="agent-live-tail" class="agent-live-tail hidden" data-testid="swarm-agent-live-tail" aria-live="polite"></div>
+          </div>
+          <button id="agent-jump-live" type="button" class="jump ag-jump-live hidden" data-testid="swarm-agent-jump-live">
+            <svg class="icon" width="16" height="16" viewBox="0 0 16 16" aria-hidden="true"><path d="M8 3v9.5M4 9l4 4 4-4"/></svg>
+            <span id="agent-jump-dot" class="ag-jump-dot hidden" aria-hidden="true"></span>
+            <span>Jump to live</span>
+          </button>
           <div id="agent-live-foot" class="agent-live-foot hidden" data-testid="swarm-agent-live-foot"></div>
         </div>
       </section>

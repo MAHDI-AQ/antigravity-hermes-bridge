@@ -1146,6 +1146,7 @@ def build_observer_snapshot(
             sub_tps_est = bool(s.get("tpsEstimated")) if "tpsEstimated" in s else (s.get("tps") is None and sub_out > 0 and sub_el > 0)
             member_subs.append({
                 "id": str(s.get("id") or ""),
+                "sessionId": str(s.get("sessionId") or "").strip() or None,
                 "name": str(s.get("name") or s.get("label") or s.get("id") or "subagent"),
                 "task": str(s.get("task") or s.get("label") or s.get("summary") or ""),
                 "status": str(s.get("status") or s.get("state") or "working"),
@@ -2116,6 +2117,11 @@ def create_a2a_app(
             after_val = max(0, int(raw_after)) if raw_after is not None and str(raw_after).strip() != "" else 0
         except (TypeError, ValueError):
             return JSONResponse({"error": "Invalid after_id"}, status_code=400)
+        raw_before = qp.get("before_id")
+        try:
+            before_val = max(0, int(raw_before)) if raw_before is not None and str(raw_before).strip() != "" else 0
+        except (TypeError, ValueError):
+            return JSONResponse({"error": "Invalid before_id"}, status_code=400)
         raw_sub = str(qp.get("subagent_session_id") or "").strip() or None
         raw_limit = qp.get("limit")
         try:
@@ -2123,15 +2129,40 @@ def create_a2a_app(
         except (TypeError, ValueError):
             return JSONResponse({"error": "Invalid limit"}, status_code=400)
         try:
+            rt = await asyncio.to_thread(manager.get_runtime, sid)
             res = await asyncio.to_thread(
                 runtime_mod.query_member_session_history,
                 manager.store.state_dir,
                 sid,
                 member_name,
                 after_id=after_val,
+                before_id=before_val,
                 limit=limit_val,
                 subagent_session_id=raw_sub,
+                runtime=rt,
             )
+            meta = await asyncio.to_thread(manager.store.read_meta, sid) or models.default_swarm_meta(sid)
+            if isinstance(res, dict):
+                res.setdefault("ok", True)
+                res.setdefault("swarm", sid)
+                res.setdefault("swarmId", sid)
+                if not res.get("primaryConversationId"):
+                    res["primaryConversationId"] = meta.get("primaryConversationId")
+                if not res.get("coordinatorConversationId") and meta.get("coordinatorConversationId"):
+                    res["coordinatorConversationId"] = meta.get("coordinatorConversationId")
+                if not res.get("conversationId"):
+                    res["conversationId"] = meta.get("primaryConversationId") or meta.get("coordinatorConversationId")
+                existing_cids = [str(c).strip() for c in (res.get("conversationIds") or []) if str(c).strip()]
+                merged_cids: list[str] = []
+                for item in [
+                    *existing_cids,
+                    *(meta.get("conversationIds") or []),
+                    meta.get("primaryConversationId"),
+                    meta.get("coordinatorConversationId"),
+                ]:
+                    if isinstance(item, str) and item.strip() and item.strip() not in merged_cids:
+                        merged_cids.append(item.strip())
+                res["conversationIds"] = merged_cids
             return JSONResponse(res)
         except Exception as exc:
             store.append_swarm_log(

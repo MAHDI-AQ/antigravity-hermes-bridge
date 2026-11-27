@@ -5246,5 +5246,340 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
         self.assertEqual(killed_pids, [998877])
 
 
+    def test_v3_member_history_scope_state_timestamps_live_overlay_and_subagent_guard(self) -> None:
+        import sqlite3
+
+        hermes_home = self.tmp_root / "hermes_home_v3_full"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        db_path = hermes_home / "state.db"
+        con = sqlite3.connect(str(db_path))
+        con.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, "
+            "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, "
+            "cache_write_tokens INTEGER, reasoning_tokens INTEGER, "
+            "estimated_cost_usd REAL, actual_cost_usd REAL, model TEXT, model_config TEXT, "
+            "message_count INTEGER, tool_call_count INTEGER, started_at REAL, ended_at REAL, "
+            "billing_provider TEXT, billing_base_url TEXT, title TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, timestamp REAL, "
+            "content TEXT, reasoning TEXT, reasoning_content TEXT, display_metadata TEXT, "
+            "tool_calls TEXT, tool_name TEXT, tool_call_id TEXT, compacted INTEGER)"
+        )
+        # Worker w-main session + its child subagent + an unrelated foreign subagent
+        con.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-main-1", None, "cli", 400, 120, 1000, 0, 50, 0.0, None, "demo-model", "{}", 4, 2, 1795799100.0, None, "custom", "https://example.invalid/v1", "Worker Main"),
+        )
+        con.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-sub-own", "hs-main-1", "subagent", 80, 25, 0, 0, 0, 0.0, None, "demo-sub-model", "{}", 1, 0, 1795799120.0, None, "custom", "https://example.invalid/v1", "Own Sub"),
+        )
+        con.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-foreign-parent", None, "cli", 999, 999, 0, 0, 0, 0.0, None, "secret-model", "{}", 1, 0, 1795799100.0, None, "custom", "https://example.invalid/v1", "Foreign Parent"),
+        )
+        con.execute(
+            "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-sub-foreign", "hs-foreign-parent", "subagent", 777, 111, 0, 0, 0, 0.0, None, "secret-model", "{}", 1, 0, 1795799130.0, None, "custom", "https://example.invalid/v1", "Foreign Sub"),
+        )
+        # Messages in hs-main-1: float epoch sec, ms epoch, and 0/null edge cases
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-main-1", "user", 1795799157.445611, "Do work", None, None, "{}", "[]", None, None, 0),
+        )
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-main-1", "assistant", 1795799160123, "Checking", "Step think", None, json.dumps({"reasoning_tokens": 18}), json.dumps([{"id": "tc-committed", "name": "read_file", "arguments": {"path": "a.py"}}]), None, None, 0),
+        )
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-main-1", "tool", 0.0, "ok", None, None, "{}", "[]", "read_file", "tc-committed", 0),
+        )
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-sub-own", "assistant", 1795799165.5, "Own subagent reply", None, None, "{}", "[]", None, None, 0),
+        )
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("hs-sub-foreign", "assistant", 1795799166.5, "SECRET FOREIGN DATA", None, None, "{}", "[]", None, None, 0),
+        )
+        con.commit()
+        con.close()
+
+        async def _run_full_history_checks() -> None:
+            import httpx
+
+            ws_dir = self.tmp_root / "ws_v3_full_hist"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+            sid = "conv-v3-full-hist"
+            coord_cid = "coord-v3-full-hist"
+            mgr.store.upsert_meta(
+                sid,
+                title="Full History Spec",
+                workspace=str(ws_dir),
+                primary_conversation_id=sid,
+                coordinator_conversation_id=coord_cid,
+            )
+            rt = mgr.get_runtime(sid)
+            ctrl = http_server.EmbeddedA2AHttpController(mgr)
+            base_url = ctrl.start(host="127.0.0.1", port=0)
+            try:
+                t_id = "task-full-1"
+                ctx_id = "ctx-full-1"
+                with rt._state_rlock:
+                    rt._tasks[t_id] = {
+                        "id": t_id,
+                        "contextId": ctx_id,
+                        "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+                        "metadata": {
+                            "createdAt": models.now_iso(),
+                            "workerConfig": {"worker_name": "w-main", "role": "worker", "model": "demo-model"},
+                            "liveActivity": {
+                                "hermesSessionId": "hs-main-1",
+                                "startedAt": models.now_iso(),
+                                "tps": 31.2,
+                                "tpsEstimated": True,
+                                "currentTool": {"name": "grep", "preview": "pattern=foo", "startedAt": models.now_iso()},
+                                "recentTools": [{"name": "grep", "preview": "pattern=foo", "status": "running", "durationMs": 0}],
+                            },
+                            "tokens": {"pureInput": 400, "cachedInput": 1000, "output": 120},
+                        },
+                    }
+                    rt._context_sessions[ctx_id] = "hs-main-1"
+                # Seed live buffers (including committed tc-committed and uncommitted tc-live)
+                rt._append_live_reasoning(t_id, "Live thought delta")
+                rt._append_live_transcript(t_id, "Live answer delta")
+                rt._append_live_tool_trace(t_id, {"event": "tool_use", "name": "read_file", "tool_call_id": "tc-committed", "input": {"path": "a.py"}})
+                rt._append_live_tool_trace(t_id, {"event": "tool_result", "name": "read_file", "tool_call_id": "tc-committed", "duration_ms": 5, "is_error": False, "output_preview": "ok"})
+                rt._append_live_tool_trace(t_id, {"event": "tool_use", "name": "grep", "tool_call_id": "tc-live", "input": {"pattern": "foo"}})
+                rt._save_state()
+
+                # Deliberately omit member_rec state or set raw TASK_STATE_WORKING on a second worker
+                mgr.board_service.upsert_member(
+                    "w-main",
+                    role="worker",
+                    state="working",
+                    task_id=t_id,
+                    swarm_id=sid,
+                )
+                mgr.board_service.upsert_subagents(
+                    "w-main",
+                    [{"id": "sub-1", "sessionId": "hs-sub-own", "label": "Own Sub", "status": "working"}],
+                    swarm_id=sid,
+                )
+
+                # Verify get_live_worker_overlay returns live buffers + telemetry
+                overlay = rt.get_live_worker_overlay("w-main")
+                self.assertIsNotNone(overlay)
+                self.assertTrue(overlay["active"])
+                self.assertEqual(overlay["state"], "working")
+                self.assertEqual(overlay["reasoning"], "Live thought delta")
+                self.assertEqual(overlay["transcript"], "Live answer delta")
+                self.assertEqual(len(overlay["toolTrace"]), 3)
+
+                # Verify build_observer_snapshot includes subagent sessionId
+                snap = http_server.build_observer_snapshot(mgr, sid)
+                w_snap = next(m for m in snap["members"] if m["name"] == "w-main")
+                self.assertEqual(w_snap["subagents"][0]["sessionId"], "hs-sub-own")
+
+                with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                    # 1. Full query with runtime overlay + scope keys + timestampMs + dedup
+                    res = runtime_mod.query_member_session_history(self.state_dir, sid, "w-main", runtime=rt)
+                    self.assertTrue(res["ok"])
+                    self.assertEqual(res["swarm"], sid)
+                    self.assertEqual(res["swarmId"], sid)
+                    self.assertEqual(res["primaryConversationId"], sid)
+                    self.assertEqual(res["coordinatorConversationId"], coord_cid)
+                    self.assertEqual(res["conversationId"], sid)
+                    self.assertIn(sid, res["conversationIds"])
+                    self.assertIn(coord_cid, res["conversationIds"])
+                    self.assertEqual(res["state"], "working")
+                    self.assertEqual(res["messages"][0]["timestampMs"], 1795799157446)
+                    self.assertEqual(res["messages"][1]["timestampMs"], 1795799160123)
+                    self.assertIsNone(res["messages"][2]["timestampMs"])
+                    self.assertTrue(res["live"]["active"])
+                    self.assertEqual(res["live"]["reasoning"], "Live thought delta")
+                    self.assertEqual(res["live"]["transcript"], "Live answer delta")
+                    self.assertEqual(res["live"]["currentTool"]["name"], "grep")
+                    # Committed tc-committed MUST be deduped, only tc-live remains
+                    trace_ids = [item.get("tool_call_id") for item in res["live"]["toolTrace"]]
+                    self.assertEqual(trace_ids, ["tc-live"])
+
+                    # 2. Incremental poll after_id=3 must STILL dedup tc-committed from earlier DB rows
+                    res_inc = runtime_mod.query_member_session_history(self.state_dir, sid, "w-main", after_id=3, runtime=rt)
+                    self.assertEqual(res_inc["messages"], [])
+                    self.assertEqual([item.get("tool_call_id") for item in res_inc["live"]["toolTrace"]], ["tc-live"])
+
+                    # 3. Valid subagent query returns own subagent messages and suppresses parent live overlay
+                    res_sub = runtime_mod.query_member_session_history(
+                        self.state_dir, sid, "w-main", subagent_session_id="hs-sub-own", runtime=rt
+                    )
+                    self.assertEqual(res_sub["sessionId"], "hs-sub-own")
+                    self.assertEqual(len(res_sub["messages"]), 1)
+                    self.assertEqual(res_sub["messages"][0]["content"], "Own subagent reply")
+                    self.assertFalse(res_sub["live"]["active"])
+                    self.assertIsNone(res_sub["currentTool"])
+
+                    # 4. Foreign subagent query is rejected cleanly with zero leak
+                    res_foreign = runtime_mod.query_member_session_history(
+                        self.state_dir, sid, "w-main", subagent_session_id="hs-sub-foreign", runtime=rt
+                    )
+                    self.assertIsNone(res_foreign["sessionId"])
+                    self.assertEqual(res_foreign["messages"], [])
+                    self.assertEqual(res_foreign["totalCount"], 0)
+                    self.assertFalse(res_foreign["hasMore"])
+                    self.assertFalse(res_foreign["live"]["active"])
+                    self.assertTrue(res_foreign.get("subagentRejected"))
+                    self.assertEqual(res_foreign["tokens"], {})
+
+                    # 5. HTTP GET /board/member/history passes runtime=rt and canonical scope keys
+                    async with httpx.AsyncClient(timeout=5.0) as client:
+                        r_http = await client.get(
+                            f"{base_url}/board/member/history",
+                            params={"conversationId": sid, "member": "w-main"},
+                        )
+                        self.assertEqual(r_http.status_code, 200)
+                        j_http = r_http.json()
+                        self.assertTrue(j_http["ok"])
+                        self.assertEqual(j_http["primaryConversationId"], sid)
+                        self.assertEqual(j_http["coordinatorConversationId"], coord_cid)
+                        self.assertTrue(j_http["live"]["active"])
+                        self.assertEqual(j_http["live"]["reasoning"], "Live thought delta")
+                        self.assertEqual([x.get("tool_call_id") for x in j_http["live"]["toolTrace"]], ["tc-live"])
+
+                    # 6. Raw TASK_STATE_WORKING fallback & killed worker suppression
+                    with rt._state_rlock:
+                        rt._tasks["task-raw-2"] = {
+                            "id": "task-raw-2",
+                            "contextId": "ctx-raw-2",
+                            "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+                            "metadata": {
+                                "workerConfig": {"worker_name": "w-raw", "role": "worker", "model": "demo-model"},
+                                "liveActivity": {"currentTool": {"name": "bash", "preview": "ls"}},
+                            },
+                        }
+                    rt._save_state()
+                    res_raw = runtime_mod.query_member_session_history(self.state_dir, sid, "w-raw", runtime=rt)
+                    self.assertEqual(res_raw["state"], "working")
+
+                    mgr.board_service.upsert_member("w-main", role="worker", state="killed", killed=True, task_id=t_id, swarm_id=sid)
+                    res_killed = runtime_mod.query_member_session_history(self.state_dir, sid, "w-main", runtime=rt)
+                    self.assertEqual(res_killed["state"], "killed")
+                    self.assertIsNone(res_killed["currentTool"])
+                    self.assertFalse(res_killed["live"]["active"])
+            finally:
+                ctrl.stop()
+                await mgr.shutdown()
+
+        asyncio.run(_run_full_history_checks())
+
+        # 7. Verify _read_stdout captures thinking/reasoning/thought events into liveReasoning
+        async def _run_stdout_reasoning_capture() -> None:
+            ws_dir = self.tmp_root / "ws_v3_stdout_think"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+            sid = "conv-v3-stdout-think"
+            mgr.store.upsert_meta(sid, title="Stdout Think", workspace=str(ws_dir), primary_conversation_id=sid)
+            rt = mgr.get_runtime(sid)
+
+            class _FakeStream:
+                def __init__(self, lines: list[bytes]) -> None:
+                    self._lines = list(lines)
+
+                async def read(self, _n: int = 65536) -> bytes:
+                    if not self._lines:
+                        return b""
+                    return self._lines.pop(0)
+
+            class _FakeProc:
+                def __init__(self, stdout_lines: list[bytes]) -> None:
+                    self.pid = 55501
+                    self.returncode = None
+                    self.stdout = _FakeStream(stdout_lines)
+                    self.stderr = _FakeStream([])
+
+                async def wait(self) -> int:
+                    self.returncode = 0
+                    return 0
+
+            stream_payload = [
+                (json.dumps({"type": "system", "subtype": "init", "session_id": "hs-think-1", "model": "demo-model"}) + "\n").encode("utf-8"),
+                (json.dumps({"type": "thinking", "text": "A "}) + "\n").encode("utf-8"),
+                (json.dumps({"type": "reasoning", "reasoning": "B "}) + "\n").encode("utf-8"),
+                (json.dumps({"type": "thought", "thought": "C"}) + "\n").encode("utf-8"),
+                (json.dumps({"type": "text", "text": "Final reply"}) + "\n").encode("utf-8"),
+                (json.dumps({"type": "result", "exit_code": 0, "text": "Final reply", "session_id": "hs-think-1"}) + "\n").encode("utf-8"),
+            ]
+            fake_proc = _FakeProc(stream_payload)
+            try:
+                with patch.object(win_launcher, "spawn_hermes_subprocess", return_value=fake_proc):
+                    task = await rt.send_message(
+                        message_parts=[models.text_part("Think out loud")],
+                        config=models.WorkerConfig(worker_name="w-think", workdir=str(ws_dir), model="demo-model"),
+                        return_immediately=False,
+                        wait_seconds=10.0,
+                    )
+                self.assertEqual((task.get("status") or {}).get("state"), models.TaskState.COMPLETED.value)
+                self.assertEqual((task.get("metadata") or {}).get("liveReasoning"), "A B C")
+                self.assertEqual((task.get("metadata") or {}).get("liveTranscript"), "Final reply")
+                overlay_done = rt.get_live_worker_overlay("w-think")
+                self.assertIsNotNone(overlay_done)
+                self.assertEqual(overlay_done["reasoning"], "A B C")
+                self.assertFalse(overlay_done["active"])
+            finally:
+                await mgr.shutdown()
+
+        asyncio.run(_run_stdout_reasoning_capture())
+
+        # 8. Verify older minimal state.db schema compatibility (missing optional columns)
+        legacy_home = self.tmp_root / "hermes_home_legacy_schema"
+        legacy_home.mkdir(parents=True, exist_ok=True)
+        legacy_db = legacy_home / "state.db"
+        lcon = sqlite3.connect(str(legacy_db))
+        lcon.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, model TEXT, started_at REAL, ended_at REAL)"
+        )
+        lcon.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, timestamp REAL, content TEXT)"
+        )
+        lcon.execute("INSERT INTO sessions VALUES ('hs-leg-1', NULL, 'cli', 'demo-model', 1795799100.0, NULL)")
+        lcon.execute("INSERT INTO messages (session_id, role, timestamp, content) VALUES ('hs-leg-1', 'assistant', 1795799110.5, 'Legacy row')")
+        lcon.commit()
+        lcon.close()
+
+        leg_sid = "conv-v3-legacy-db"
+        mgr_leg = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        mgr_leg.store.upsert_meta(leg_sid, title="Legacy DB", primary_conversation_id=leg_sid)
+        mgr_leg.board_service.upsert_member("w-leg", role="worker", state="waiting", task_id="t-leg-1", swarm_id=leg_sid)
+        leg_paths = store.resolve_swarm_paths(leg_sid, state_dir=self.state_dir, create=True)
+        leg_paths.tasks_file.write_text(
+            json.dumps({
+                "tasks": {
+                    "t-leg-1": {
+                        "id": "t-leg-1",
+                        "contextId": "c-leg-1",
+                        "status": {"state": models.TaskState.COMPLETED.value},
+                        "metadata": {
+                            "workerConfig": {"worker_name": "w-leg", "model": "demo-model"},
+                            "liveActivity": {"hermesSessionId": "hs-leg-1"},
+                        },
+                    }
+                }
+            }),
+            encoding="utf-8",
+        )
+        with patch.dict(os.environ, {"HERMES_HOME": str(legacy_home)}):
+            res_leg = runtime_mod.query_member_session_history(self.state_dir, leg_sid, "w-leg")
+        self.assertTrue(res_leg["ok"])
+        self.assertEqual(res_leg["state"], "waiting")
+        self.assertEqual(len(res_leg["messages"]), 1)
+        self.assertEqual(res_leg["messages"][0]["content"], "Legacy row")
+        self.assertEqual(res_leg["messages"][0]["timestampMs"], 1795799110500)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

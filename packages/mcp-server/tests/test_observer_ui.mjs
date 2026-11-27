@@ -3663,6 +3663,7 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
     const feed = document.getElementById('agent-feed');
     return {
       hasCompacted: !!feed?.querySelector('.ag-compacted'),
+      workGroupSummary: feed?.querySelector('details.ag-work-group > summary')?.textContent || '',
       thinkSummary: feed?.querySelector('details.ag-think > summary')?.textContent || '',
       replyText: feed?.querySelector('.ag-reply')?.textContent || '',
       toolSummary: feed?.querySelector('details.ag-tool-card > summary')?.textContent || '',
@@ -3670,13 +3671,16 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
     };
   });
   assert.equal(agentPaneCheck.hasCompacted, true, 'Expected .ag-compacted divider');
+  assert.match(agentPaneCheck.workGroupSummary, /Worked for 1s/);
   assert.match(agentPaneCheck.thinkSummary, /Thought process · 42 tok/);
   assert.match(agentPaneCheck.replyText, /Inspecting main\.mjs/);
   assert.match(agentPaneCheck.toolSummary, /read_file/);
   assert.match(agentPaneCheck.toolSummary, /ok/);
   assert.equal(agentPaneCheck.hasSubPill, true, 'Expected Tier-3 subagent pill switcher');
 
-  // Expand collapsible reasoning & tool card
+  // Expand collapsible work group, reasoning & tool card
+  await page.click('details.ag-work-group > summary');
+  await page.waitForSelector('details.ag-work-group[open] details.ag-think');
   await page.click('details.ag-think > summary');
   await page.waitForSelector('details.ag-think[open] .ag-think-body');
   assert.match(await page.textContent('details.ag-think .ag-think-body'), /Checking route handler/);
@@ -3729,4 +3733,478 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
   );
   assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
   assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
+});
+test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrapped TASK, Worked for Xs, rich MD, epoch-sec timestamps, object currentTool, live tail scroll/details preservation, files changed, subagent switching, compacted, jump-to-live, zero textarea', async (t) => {
+  const pw = await loadPlaywright();
+  const executablePath = findBrowserExecutable();
+  const browser = await pw.chromium.launch({
+    headless: true,
+    args: ['--no-proxy-server', '--proxy-bypass-list=<-loopback>'],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  t.after(() => browser.close());
+
+  const tempState = mkdtempSync(join(tmpdir(), 'hermes-img2-ui-'));
+  t.after(() => rmSync(tempState, { recursive: true, force: true }));
+
+  let liveTick = 0;
+  let delayMainMs = 0;
+  const epochSecBase = 1795799100;
+  const bigOutput = 'X'.repeat(28000);
+
+  const seenBeforeIds = [];
+  const img2Snapshot = {
+    swarm: 'img2-parity-swarm',
+    id: 'img2-parity-swarm',
+    etag: 'img2-etag-1',
+    head: 2,
+    title: 'Image 2 Parity Swarm',
+    dir: tempState,
+    workspace: 'C:/Projects/demo-img2',
+    primaryConversationId: 'conv-img2-primary',
+    coordinatorConversationId: 'conv-img2-coord',
+    allowedFiles: {
+      'C:/Projects/demo-img2': 'file:///C:/Projects/demo-img2',
+    },
+    meta: {
+      swarmId: 'img2-parity-swarm',
+      title: 'Image 2 Parity Swarm',
+      workspace: 'C:/Projects/demo-img2',
+      primaryConversationId: 'conv-img2-primary',
+      coordinatorConversationId: 'conv-img2-coord',
+    },
+    members: [
+      {
+        name: 'coordinator',
+        role: 'coordinator',
+        status: 'working',
+        conversationId: 'conv-img2-coord',
+        posts: 1,
+        subagents: [],
+      },
+      {
+        name: 'builder',
+        role: 'worker',
+        status: 'TASK_STATE_WORKING',
+        model: 'anthropic/claude-sonnet-4',
+        steps: 6,
+        toolCalls: 4,
+        posts: 1,
+        tps: 44.2,
+        currentTool: { name: 'terminal', preview: 'npm test', startedAt: new Date(epochSecBase * 1000).toISOString() },
+        tokens: { totalProcessed: 120000, pureInput: 30000, cachedInput: 85000, output: 5000, contextUsed: 45000, contextLimit: 200000 },
+        subagents: [
+          { id: 'tc-sub-1', sessionId: 'sess-sub-1', name: 'auditor', task: 'Audit markdown XSS', status: 'done', model: 'flash', steps: 2 },
+        ],
+      },
+      {
+        name: 'retired-worker',
+        role: 'worker',
+        status: 'working',
+        killed: true,
+        model: 'flash',
+        currentTool: { name: 'bash', preview: 'stale tool' },
+        posts: 0,
+        subagents: [],
+      },
+    ],
+    messages: [
+      { seq: 1, id: 'm-1', agent: 'coordinator', sender: 'coordinator', text: '@builder Start parity check', ts: epochSecBase * 1000 },
+      { seq: 2, id: 'm-2', agent: 'builder', sender: 'builder', text: 'Working on #1', ts: (epochSecBase + 5) * 1000 },
+    ],
+  };
+
+  const upstreamServer = createServer(async (req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    if (reqUrl.pathname === '/board') {
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: img2Snapshot.etag });
+      res.end(JSON.stringify(img2Snapshot));
+      return;
+    }
+    if (reqUrl.pathname === '/board/member/history') {
+      const member = reqUrl.searchParams.get('member') || 'builder';
+      const subId = reqUrl.searchParams.get('subagent_session_id') || '';
+      const conv = reqUrl.searchParams.get('conversationId') || 'conv-img2-primary';
+      const afterId = Number(reqUrl.searchParams.get('after_id') || '0');
+      const beforeId = Number(reqUrl.searchParams.get('before_id') || '0');
+      if (beforeId > 0) seenBeforeIds.push(beforeId);
+      if (!subId && delayMainMs > 0) {
+        await new Promise((r) => setTimeout(r, delayMainMs));
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (beforeId > 0) {
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'img2-parity-swarm',
+          primaryConversationId: conv,
+          member,
+          state: 'TASK_STATE_WORKING',
+          model: 'anthropic/claude-sonnet-4',
+          messages: [
+            { id: 5, role: 'user', content: '[TASK]\nEarlier turn before cursor', timestamp: epochSecBase - 120 },
+            { id: 6, role: 'assistant', content: 'Earlier reply loaded via `before_id`.', timestamp: epochSecBase - 110 },
+          ],
+          lastId: 6,
+          hasMore: false,
+        }));
+        return;
+      }
+      if (member === 'retired-worker') {
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'img2-parity-swarm',
+          primaryConversationId: conv,
+          member,
+          state: 'TASK_STATE_WORKING',
+          currentTool: { name: 'bash', preview: 'stale tool' },
+          live: { active: true, transcript: 'Should never shimmer', currentTool: { name: 'bash', preview: 'stale' } },
+          messages: [
+            { id: 1, role: 'user', content: 'Done task', timestamp: epochSecBase },
+            { id: 2, role: 'assistant', content: 'Finished before kill.', timestamp: epochSecBase + 3 },
+          ],
+          lastId: 2,
+          hasMore: false,
+        }));
+        return;
+      }
+      if (subId === 'sess-sub-1') {
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'img2-parity-swarm',
+          primaryConversationId: conv,
+          member,
+          sessionId: 'sess-sub-1',
+          state: 'waiting',
+          model: 'flash',
+          subagents: [{ sessionId: 'sess-sub-1', label: 'auditor', state: 'waiting', steps: 2 }],
+          messages: [
+            { id: 50, role: 'user', content: 'Audit XSS safety', timestamp: epochSecBase + 10 },
+            { id: 51, role: 'assistant', content: 'Subagent `auditor` confirmed zero XSS.', timestamp: epochSecBase + 14 },
+          ],
+          lastId: 51,
+          hasMore: false,
+        }));
+        return;
+      }
+      const committed = [
+        {
+          id: 10,
+          role: 'user',
+          content: '[SYSTEM / ROLE]\nInternal role preamble line 1\nInternal role preamble line 2\n\n[TASK]\nFix the worker chat view and verify CI #1',
+          timestamp: epochSecBase + 0.445,
+        },
+        {
+          id: 20,
+          role: 'assistant',
+          reasoning: 'Checking **board_ui/app.js** and `styles.css`.',
+          reasoningTokens: 18,
+          toolCalls: [
+            { id: 'tc-edit-1', name: 'edit_file', arguments: JSON.stringify({ path: 'board_ui/app.js', old_string: 'a\nb', new_string: 'x\ny\nz' }) },
+            { id: 'tc-edit-bad', name: 'edit_file', arguments: JSON.stringify({ path: '../../etc/passwd', old_string: '1', new_string: '2' }) },
+            { id: 'tc-edit-sibling', name: 'edit_file', arguments: JSON.stringify({ path: 'C:/Projects/demo-img2-evil/secret.txt', old_string: '1', new_string: '2' }) },
+            { id: 'tc-big', name: 'terminal', arguments: JSON.stringify({ command: 'cat big.log' }) },
+          ],
+          timestamp: epochSecBase + 10,
+        },
+        {
+          id: 30,
+          role: 'tool',
+          toolCallId: 'tc-edit-1',
+          toolName: 'edit_file',
+          content: '{"ok":true}',
+          timestamp: epochSecBase + 22,
+        },
+        {
+          id: 40,
+          role: 'tool',
+          toolCallId: 'tc-edit-bad',
+          toolName: 'edit_file',
+          content: '{"ok":true}',
+          timestamp: epochSecBase + 23,
+        },
+        {
+          id: 45,
+          role: 'tool',
+          toolCallId: 'tc-edit-sibling',
+          toolName: 'edit_file',
+          content: '{"ok":true}',
+          timestamp: epochSecBase + 24,
+        },
+        {
+          id: 50,
+          role: 'tool',
+          toolCallId: 'tc-big',
+          toolName: 'terminal',
+          content: bigOutput,
+          timestamp: epochSecBase + 25,
+        },
+        {
+          id: 60,
+          role: 'assistant',
+          compacted: true,
+          content: [
+            '## Parity Summary',
+            '',
+            '> Verified escape-first Markdown',
+            '',
+            '- Root item',
+            '  1. Nested step one',
+            '  2. Nested step two',
+            '',
+            '| Check | Result |',
+            '| :--- | ---: |',
+            '| Markdown | pass |',
+            '',
+            'See [safe docs](https://github.com/MAHDI-AQ/hermes-swarm) and [bad](javascript:alert(1)).',
+            '',
+            '```js',
+            'const ok = true;',
+            '```',
+            '',
+            'Ping @builder on #1.',
+            '',
+            '---',
+            'Filler line 1\n\nFiller line 2\n\nFiller line 3\n\nFiller line 4\n\nFiller line 5\n\nFiller line 6\n\nFiller line 7\n\nFiller line 8',
+          ].join('\n'),
+          timestamp: epochSecBase + 35,
+        },
+      ];
+      const slice = afterId > 0 ? committed.filter((m) => m.id > afterId) : committed;
+      liveTick += 1;
+      res.end(JSON.stringify({
+        ok: true,
+        swarm: 'img2-parity-swarm',
+        primaryConversationId: conv,
+        member,
+        state: 'TASK_STATE_WORKING',
+        model: 'anthropic/claude-sonnet-4',
+        tps: 44.2,
+        tpsEstimated: false,
+        currentTool: { name: 'terminal', preview: `tick-${liveTick}`, startedAt: new Date().toISOString() },
+        tokens: img2Snapshot.members[1].tokens,
+        subagents: [{ sessionId: 'sess-sub-1', label: 'auditor', state: 'waiting', steps: 2 }],
+        live: {
+          active: true,
+          elapsedMs: 4200 + liveTick * 500,
+          currentTool: { name: 'terminal', preview: `tick-${liveTick}` },
+          reasoning: 'Streaming **thought** check',
+          transcript: `Streaming reply tick ${liveTick}\n\n\`\`\`python\nprint("streaming"`,
+          toolTrace: [
+            { toolCallId: 'tc-edit-1', name: 'edit_file', preview: 'should-be-deduped', status: 'ok' },
+            { toolCallId: 'tc-live-1', name: 'terminal', preview: `tick-${liveTick}`, status: 'running' },
+          ],
+        },
+        messages: slice,
+        lastId: 60,
+        hasMore: afterId === 0,
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+
+  const upstreamPort = await listenServer(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const sidecarProc = await spawnSidecarProcess({
+    HERMES_A2A_STATE_DIR: tempState,
+    HERMES_A2A_BOARD_URL: `http://127.0.0.1:${upstreamPort}`,
+    HERMES_SWARM_DISABLE_WAKEUP: '1',
+    ANTIGRAVITY_CONVERSATION_ID: 'conv-img2-primary',
+  });
+  t.after(() => sidecarProc.stop());
+
+  const SUBPATH_PREFIX = '/remote-proxy/plugin/hermes-swarm/swarm_board';
+  const proxy = createSubpathProxy(sidecarProc.port, SUBPATH_PREFIX);
+  const proxyPort = await listenServer(proxy.server);
+  t.after(() => closeServer(proxy.server));
+
+  async function runImg2Suite(pageUrl, originPrefix, colorScheme) {
+    const context = await browser.newContext({ viewport: { width: 920, height: 640 }, colorScheme });
+    const page = await context.newPage();
+    await page.route('**/_sidecar/get-conversation-metadata', (route) =>
+      route.fulfill({ status: 200, contentType: 'application/json', body: '{}' }),
+    );
+    const obs = attachPageObservers(page, originPrefix);
+    await page.addInitScript(() => {
+      window.__auxCalls = [];
+      window.addEventListener('DOMContentLoaded', () => {
+        if (window.sidecar) {
+          window.sidecar.ui = window.sidecar.ui || {};
+          window.sidecar.ui.toggleAuxPane = (req) => window.__auxCalls.push(req);
+        }
+      });
+    });
+
+    await page.goto(pageUrl, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#board:not(.hidden)', { timeout: 10000 });
+    await page.evaluate(() => {
+      window.sidecar = window.sidecar || {};
+      window.sidecar.ui = window.sidecar.ui || {};
+      window.sidecar.ui.toggleAuxPane = (req) => window.__auxCalls.push(req);
+    });
+
+    // Open builder worker from Members tab
+    await page.click('#tabbtn-members');
+    await page.waitForSelector('[data-open-member="builder"]');
+    await page.click('[data-open-member="builder"]');
+    await page.waitForSelector('#tab-agent.active .ag-reply', { timeout: 5000 });
+
+    const checks = await page.evaluate(() => {
+      const feed = document.getElementById('agent-feed');
+      const pill = feed.querySelector('.ag-user-pill');
+      const sysInline = feed.querySelector('.ag-sys-inline');
+      const workGroup = feed.querySelector('details.ag-work-group:not(.ag-live-work)');
+      const footText = document.getElementById('agent-live-foot')?.textContent || '';
+      const liveTail = document.getElementById('agent-live-tail');
+      const reply = feed.querySelector('#agent-committed .ag-reply');
+      const links = [...reply.querySelectorAll('a')].map((a) => ({ href: a.getAttribute('href'), text: a.textContent }));
+      const openFileBtns = [...feed.querySelectorAll('[data-ag-file]')].map((b) => b.dataset.agFile);
+      const liveDedupHit = [...(liveTail?.querySelectorAll('.ag-tool-prev') || [])].some((el) => el.textContent.includes('should-be-deduped'));
+      return {
+        theme: document.documentElement.dataset.theme,
+        textareaCount: document.querySelectorAll('textarea').length,
+        pillText: pill?.textContent || '',
+        pillHasSystemWall: (pill?.textContent || '').includes('Internal role preamble'),
+        hasCollapsedSysBrief: Boolean(sysInline && !sysInline.open),
+        workSummary: workGroup?.querySelector('summary')?.textContent || '',
+        hasCompacted: !!feed.querySelector('.ag-compacted'),
+        hasTable: !!reply.querySelector('table.ag-table'),
+        hasNestedOl: !!reply.querySelector('ul ol'),
+        hasBlockquote: !!reply.querySelector('blockquote'),
+        hasHr: !!reply.querySelector('hr'),
+        hasCodeBlock: !!reply.querySelector('.ag-codeblock pre code'),
+        codeLang: reply.querySelector('.ag-codelang')?.textContent || '',
+        links,
+        has1970: (feed.textContent || '').includes('1970'),
+        footText,
+        footVisible: !document.getElementById('agent-live-foot')?.classList.contains('hidden'),
+        liveTailVisible: !liveTail?.classList.contains('hidden'),
+        liveHasUnclosedFenceCode: !!liveTail?.querySelector('.ag-live-reply .ag-codeblock pre code'),
+        liveDedupHit,
+        filesChangedSummary: feed.querySelector('.ag-files-changed > summary')?.textContent || '',
+        openFileBtns,
+      };
+    });
+
+    assert.equal(checks.theme, colorScheme);
+    assert.equal(checks.textareaCount, 0, 'Must have ZERO textarea elements');
+    assert.match(checks.pillText, /Fix the worker chat view/);
+    assert.equal(checks.pillHasSystemWall, false, '[SYSTEM / ROLE] must be unwrapped out of .ag-user-pill');
+    assert.equal(checks.hasCollapsedSysBrief, true, 'System / Role brief must be collapsed by default');
+    assert.match(checks.workSummary, /Worked for 15s/, `Unexpected work summary: ${checks.workSummary}`);
+    assert.equal(checks.hasCompacted, true);
+    assert.equal(checks.hasTable, true);
+    assert.equal(checks.hasNestedOl, true);
+    assert.equal(checks.hasBlockquote, true);
+    assert.equal(checks.hasHr, true);
+    assert.equal(checks.hasCodeBlock, true);
+    assert.equal(checks.codeLang, 'js');
+    assert.deepEqual(checks.links, [{ href: 'https://github.com/MAHDI-AQ/hermes-swarm', text: 'safe docs' }]);
+    assert.equal(checks.has1970, false, 'Epoch-seconds timestamps must NEVER render as 1970');
+    assert.equal(checks.footVisible, true, 'TASK_STATE_WORKING must normalize to working and show live foot');
+    assert.equal(checks.footText.includes('[object Object]'), false, 'currentTool object must not render [object Object]');
+    assert.match(checks.footText, /Running terminal\(tick-/);
+    assert.equal(checks.liveTailVisible, true);
+    assert.equal(checks.liveHasUnclosedFenceCode, true, 'Unclosed streaming fence must still render codeblock cleanly');
+    assert.equal(checks.liveDedupHit, false, 'Committed toolCallId must be deduplicated from live.toolTrace');
+    assert.match(checks.filesChangedSummary, /3 files changed/);
+    assert.deepEqual(checks.openFileBtns, ['board_ui/app.js'], 'Only validated workspace-root path may be clickable; ../../etc/passwd and sibling prefix demo-img2-evil must not');
+
+    // Expand "Worked for 15s" and verify oversized output is truncated cleanly, then scroll up and verify preservation across live ticks!
+    await page.click('details.ag-work-group:not(.ag-live-work) > summary');
+    await page.waitForSelector('details.ag-work-group[open] details.ag-tool-card');
+    const toolCards = page.locator('details.ag-work-group:not(.ag-live-work) details.ag-tool-card');
+    await toolCards.nth(3).locator('> summary').click();
+    const bigPreText = await toolCards.nth(3).locator('.ag-tool-pre').last().textContent();
+    assert.match(bigPreText, /truncated/);
+    assert.ok(bigPreText.length < 20000, 'Oversized tool payload must be capped');
+
+    // Expand files changed & click allowed file
+    await page.click('.ag-files-changed > summary');
+    await page.click('[data-ag-file="board_ui/app.js"]');
+    const auxCalls = await page.evaluate(() => window.__auxCalls);
+    assert.deepEqual(auxCalls, [{ tabType: 'fileView', uri: 'file:///C:/Projects/demo-img2/board_ui/app.js' }]);
+
+    // Click Show older -> sends before_id=10, prepends older messages, hides Show older when hasMore=false
+    await page.click('[data-ag-older]');
+    await page.waitForFunction(
+      () => /Earlier reply loaded via before_id/.test(document.getElementById('agent-committed')?.textContent || ''),
+      null,
+      { timeout: 4000 },
+    );
+    assert.equal(seenBeforeIds.includes(10), true, `Expected before_id=10 to be sent, got ${JSON.stringify(seenBeforeIds)}`);
+
+    // Scroll up to unstick and verify open details + scrollTop preserved across live poll (~900ms), and Jump to live appears
+    await page.evaluate(() => {
+      const af = document.getElementById('agent-feed');
+      af.scrollTop = 20;
+      af.dispatchEvent(new Event('scroll'));
+    });
+    await page.waitForSelector('#agent-jump-live:not(.hidden)', { timeout: 3000 });
+    await page.waitForTimeout(1000);
+    const afterPoll = await page.evaluate(() => ({
+      scrollTop: document.getElementById('agent-feed').scrollTop,
+      workOpen: document.querySelector('details.ag-work-group:not(.ag-live-work)')?.open,
+      jumpVisible: !document.getElementById('agent-jump-live')?.classList.contains('hidden'),
+    }));
+    assert.ok(afterPoll.scrollTop <= 40, `Expected scrollTop preserved near 20, got ${afterPoll.scrollTop}`);
+    assert.equal(afterPoll.workOpen, true, 'Open <details> must remain open across live tail ticks');
+    assert.equal(afterPoll.jumpVisible, true, 'Jump to live pill must stay visible when scrolled up');
+
+    await page.click('#agent-jump-live');
+    await page.waitForFunction(() => document.getElementById('agent-jump-live')?.classList.contains('hidden'), null, { timeout: 3000 });
+
+    // Stale-fetch race protection + Tier-3 subagent click-through from Members tab
+    await page.click('#tabbtn-members');
+    await page.waitForSelector('.o2-sub-row[data-open-subagent="sess-sub-1"]');
+    delayMainMs = 700;
+    await page.click('.o2-sub-row[data-open-subagent="sess-sub-1"]');
+    await page.waitForFunction(
+      () => /confirmed zero XSS/.test(document.getElementById('agent-committed')?.textContent || ''),
+      null,
+      { timeout: 5000 },
+    );
+    // Trigger slow Main fetch then immediately switch back to subagent pill -> slow Main response must NOT overwrite subagent
+    await page.click('.agent-sub-pill[data-sub-id=""]');
+    await page.waitForTimeout(50);
+    await page.click('.agent-sub-pill[data-sub-id="sess-sub-1"]');
+    await page.waitForTimeout(900);
+    const subTextAfterRace = await page.textContent('#agent-committed');
+    assert.match(subTextAfterRace, /confirmed zero XSS/);
+    delayMainMs = 0;
+
+    // Killed worker must NEVER show live shimmer or #agent-live-foot
+    await page.click('#tabbtn-members');
+    await page.click('button.o2-mret');
+    await page.waitForSelector('[data-open-member="retired-worker"]');
+    await page.click('[data-open-member="retired-worker"]');
+    await page.waitForSelector('#tab-agent.active .ag-reply', { timeout: 5000 });
+    const killedCheck = await page.evaluate(() => ({
+      footHidden: document.getElementById('agent-live-foot')?.classList.contains('hidden'),
+      tailHidden: document.getElementById('agent-live-tail')?.classList.contains('hidden'),
+      hasShimmer: !!document.querySelector('#tab-agent .animate-shimmer-text'),
+    }));
+    assert.equal(killedCheck.footHidden, true, 'Killed worker must hide #agent-live-foot');
+    assert.equal(killedCheck.tailHidden, true, 'Killed worker must hide #agent-live-tail');
+    assert.equal(killedCheck.hasShimmer, false, 'Killed worker must NEVER show Working shimmer');
+
+    await context.close();
+    const realFailed = obs.failedRequests.filter(
+      (r) => !(r.reason === 'net::ERR_ABORTED' && /fonts\.g(?:static|oogleapis)\.com/.test(r.url))
+        && !r.url.includes('/_sidecar/get-conversation-metadata')
+        && !(r.reason === 'net::ERR_ABORTED' && r.url.includes('/api/member/history')),
+    );
+    assert.deepEqual(realFailed, [], `Failed requests: ${JSON.stringify(realFailed)}`);
+    const realConsoleErrors = obs.consoleErrors.filter(
+      (c) => !c.url.includes('/_sidecar/get-conversation-metadata') && !/Failed to resolve project ID/i.test(c.text),
+    );
+    assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
+    assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
+  }
+
+  await runImg2Suite(`${sidecarProc.baseUrl}/?conversationId=conv-img2-primary`, sidecarProc.baseUrl, 'dark');
+  await runImg2Suite(`http://127.0.0.1:${proxyPort}${SUBPATH_PREFIX}/?conversationId=conv-img2-primary`, `http://127.0.0.1:${proxyPort}`, 'light');
+  assert.deepEqual(proxy.proxyLeaks, [], `Subpath proxy leaks: ${JSON.stringify(proxy.proxyLeaks)}`);
 });

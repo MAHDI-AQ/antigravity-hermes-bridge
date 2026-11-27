@@ -18,7 +18,6 @@ import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
 const __dirname = dirname(fileURLToPath(import.meta.url));
-
 const BRIDGE_DIR = resolve(__dirname, '..');
 const SIBLING_PLUGIN_DIR = resolve(BRIDGE_DIR, '..', 'antigravity-plugin');
 const PLUGIN_DIR = process.env.HERMES_SWARM_PLUGIN_DIR
@@ -36,7 +35,10 @@ if (!process.env.HERMES_SWARM_SIDECAR_SDK_PATH) {
     join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk', 'index.mjs'),
   ];
   if (!sdkCandidates.some((candidate) => existsSync(candidate))) {
-    process.env.HERMES_SWARM_SIDECAR_SDK_PATH = join(__dirname, 'mock_sidecar_sdk.mjs');
+    const mockSdkPath = join(__dirname, 'mock_sidecar_sdk.mjs');
+    if (existsSync(mockSdkPath)) {
+      process.env.HERMES_SWARM_SIDECAR_SDK_PATH = mockSdkPath;
+    }
   }
 }
 
@@ -355,6 +357,10 @@ test('createSidecarConfig, validateFramePath, isPathWithinRoot, and injectPreloa
     sidecar.injectPreloadScript('<html><head></head><body></body></html>'),
     /<script src="\.\/preload\.js"><\/script>/,
   );
+
+  // normalizeWorkspacePath strips leading slash on Windows file:///C:/... URIs
+  assert.equal(sidecar.normalizeWorkspacePath('file:///C:/Projects/Alpha/'), 'c:/projects/alpha');
+  assert.equal(sidecar.normalizeWorkspacePath('/C:/Projects/Alpha/'), 'c:/projects/alpha');
 });
 
 test('resolveUpstreamUrl and isSwarmScopedToRequest enforce strict 1:1 conversationId scoping', async (t) => {
@@ -3847,7 +3853,7 @@ test('GET /api/member/history validates params, forwards query params, and enfor
 
   // 3) 200 forwarding to mock upstream /board/member/history with query params
   const okRes = await fetch(
-    `${sidecarProc.baseUrl}/api/member/history?conversationId=conv-hist-1&member=backend&after_id=5&limit=50&subagent_session_id=sub-9`,
+    `${sidecarProc.baseUrl}/api/member/history?conversationId=conv-hist-1&member=backend&after_id=5&before_id=99&limit=50&subagent_session_id=sub-9`,
   );
   assert.equal(okRes.status, 200);
   const okJson = await okRes.json();
@@ -3862,6 +3868,7 @@ test('GET /api/member/history validates params, forwards query params, and enfor
     conversationId: 'conv-hist-1',
     member: 'backend',
     after_id: '5',
+    before_id: '99',
     limit: '50',
     subagent_session_id: 'sub-9',
   });
@@ -3875,5 +3882,185 @@ test('GET /api/member/history validates params, forwards query params, and enfor
   assert.equal(mismatchRes.status, 403);
   const mismatchJson = await mismatchRes.json();
   assert.equal(mismatchJson.ok, false);
+  assert.deepEqual(mismatchJson.messages, []);
   assert.match(mismatchJson.error, /scope validation/i);
+  assert.match(sidecarProc.getOutput().stderr, /GET \/api\/member\/history rejected 403/);
+});
+
+test('Real Python http_server.py + runtime.py + SidecarApp /api/member/history returns 200 on matching conversationId and 403 on cross-conversation mismatch', async (t) => {
+  const cleanups = [];
+  t.after(async () => {
+    for (const fn of cleanups.reverse()) {
+      await fn();
+    }
+  });
+
+  const tempDir = mkdtempSync(join(tmpdir(), 'hermes-real-py-hist-'));
+  cleanups.push(() => rmSync(tempDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 }));
+
+  const stateDir = join(tempDir, 'state');
+  const hermesHome = join(tempDir, 'hermes_home');
+  mkdirSync(stateDir, { recursive: true });
+  mkdirSync(hermesHome, { recursive: true });
+
+  const token = 'real-py-hist-token';
+  const pyExe = resolvePythonExe();
+  const pyDriver = join(tempDir, 'py_hist_driver.py');
+  writeFileSync(
+    pyDriver,
+    `
+import json, os, sqlite3, sys
+from pathlib import Path
+
+sys.path.insert(0, ${JSON.stringify(BRIDGE_DIR)})
+import http_server, models, runtime
+
+state_dir = Path(os.environ["HERMES_A2A_STATE_DIR"])
+hermes_home = Path(os.environ["HERMES_HOME"])
+db_path = hermes_home / "state.db"
+
+con = sqlite3.connect(str(db_path))
+con.execute(
+    "CREATE TABLE sessions ("
+    "id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, "
+    "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, "
+    "cache_write_tokens INTEGER, reasoning_tokens INTEGER, "
+    "estimated_cost_usd REAL, actual_cost_usd REAL, model TEXT, model_config TEXT, "
+    "message_count INTEGER, tool_call_count INTEGER, started_at REAL, ended_at REAL, "
+    "billing_provider TEXT, billing_base_url TEXT, title TEXT)"
+)
+con.execute(
+    "CREATE TABLE messages ("
+    "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, timestamp REAL, "
+    "content TEXT, reasoning TEXT, reasoning_content TEXT, display_metadata TEXT, "
+    "tool_calls TEXT, tool_name TEXT, tool_call_id TEXT, compacted INTEGER)"
+)
+con.execute(
+    "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ("hs-real-1", None, "cli", 1200, 400, 3000, 0, 80, 0.0, None, "test-model", "{}", 2, 1, 1795799100.0, None, "custom", "http://127.0.0.1", "Worker"),
+)
+con.execute(
+    "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ("hs-real-1", "assistant", 1795799157.5, "Inspecting files", "Checking runtime", None, json.dumps({"reasoning_tokens": 25}), json.dumps([{"id": "tc-real-1", "name": "read_file", "arguments": {"path": "main.mjs"}}]), None, None, 0),
+)
+con.execute(
+    "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    ("hs-real-1", "tool", 1795799159.0, "ok", None, None, "{}", "[]", "read_file", "tc-real-1", 0),
+)
+con.commit()
+con.close()
+
+mgr = runtime.SwarmManager(state_dir=state_dir)
+sid = "real-hist-swarm"
+mgr.store.upsert_meta(
+    sid,
+    title="Real History Parity",
+    workspace=${JSON.stringify(tempDir)},
+    primary_conversation_id="conv-real-hist-prim",
+    coordinator_conversation_id="conv-real-hist-coord",
+)
+rt = mgr.get_runtime(sid)
+with rt._state_rlock:
+    rt._tasks["task-real-1"] = {
+        "id": "task-real-1",
+        "contextId": "ctx-real-1",
+        "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+        "metadata": {
+            "workerConfig": {"worker_name": "coder", "role": "worker", "model": "test-model"},
+            "liveActivity": {"hermesSessionId": "hs-real-1", "tps": 18.2, "tpsEstimated": False},
+            "tokens": {"pureInput": 1200, "cachedInput": 3000, "output": 400},
+        },
+    }
+    rt._context_sessions["ctx-real-1"] = "hs-real-1"
+rt._save_state()
+mgr.board_service.upsert_member("coder", role="worker", state="working", task_id="task-real-1", swarm_id=sid)
+
+ctrl = http_server.EmbeddedA2AHttpController(mgr)
+url = ctrl.start(host="127.0.0.1", port=0)
+print(json.dumps({"ready": True, "url": url}), flush=True)
+
+for raw in sys.stdin:
+    if raw.strip() == "quit":
+        ctrl.stop()
+        print(json.dumps({"ok": True}), flush=True)
+        break
+`,
+    'utf-8',
+  );
+
+  const pyProc = spawn(pyExe, [pyDriver], {
+    env: {
+      ...process.env,
+      HERMES_A2A_STATE_DIR: stateDir,
+      HERMES_A2A_HTTP_TOKEN: token,
+      HERMES_HOME: hermesHome,
+    },
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+
+  let pyStdoutBuf = '';
+  let pyStderr = '';
+  const bootMsg = await new Promise((resolveBoot, rejectBoot) => {
+    const timer = setTimeout(() => rejectBoot(new Error(`Python hist driver timeout. stderr=${pyStderr}`)), 10000);
+    pyProc.stdout.on('data', (chunk) => {
+      pyStdoutBuf += chunk.toString('utf-8');
+      const idx = pyStdoutBuf.indexOf('\n');
+      if (idx >= 0) {
+        clearTimeout(timer);
+        resolveBoot(JSON.parse(pyStdoutBuf.slice(0, idx).trim()));
+      }
+    });
+    pyProc.stderr.on('data', (c) => { pyStderr += c.toString('utf-8'); });
+    pyProc.once('exit', (code) => {
+      clearTimeout(timer);
+      rejectBoot(new Error(`Python hist driver exited code=${code} stderr=${pyStderr}`));
+    });
+  });
+
+  cleanups.push(async () => {
+    if (pyProc.exitCode === null) {
+      try { pyProc.stdin.write('quit\n'); } catch {}
+      await new Promise((r) => {
+        const timer = setTimeout(() => { pyProc.kill(); r(); }, 2000);
+        pyProc.once('exit', () => { clearTimeout(timer); r(); });
+      });
+    }
+  });
+
+  assert.equal(bootMsg.ready, true);
+
+  const sidecarProc = await spawnSidecarProcess({
+    HERMES_A2A_STATE_DIR: stateDir,
+    HERMES_A2A_BOARD_URL: bootMsg.url,
+    HERMES_A2A_HTTP_TOKEN: token,
+    HERMES_SWARM_DISABLE_WAKEUP: '1',
+    ANTIGRAVITY_CONVERSATION_ID: '',
+  });
+  cleanups.push(() => sidecarProc.stop());
+
+  // 1) Matching conversationId -> HTTP 200 with non-empty messages and canonical scope
+  const okRes = await fetch(
+    `${sidecarProc.baseUrl}/api/member/history?conversationId=conv-real-hist-prim&member=coder&limit=10`,
+  );
+  assert.equal(okRes.status, 200);
+  const okJson = await okRes.json();
+  assert.equal(okJson.ok, true);
+  assert.equal(okJson.swarm, 'real-hist-swarm');
+  assert.equal(okJson.member, 'coder');
+  assert.equal(okJson.state, 'working');
+  assert.equal(Array.isArray(okJson.messages), true);
+  assert.equal(okJson.messages.length, 2);
+  assert.equal(okJson.messages[0].content, 'Inspecting files');
+  assert.ok(Number.isInteger(okJson.messages[0].timestampMs) && okJson.messages[0].timestampMs > 1e12);
+
+  // 2) Cross-conversation mismatch (swarmId passed instead of bound conversationId) -> HTTP 403 with messages: []
+  const mismatchRes = await fetch(
+    `${sidecarProc.baseUrl}/api/member/history?conversationId=real-hist-swarm&member=coder&limit=10`,
+  );
+  assert.equal(mismatchRes.status, 403);
+  const mismatchJson = await mismatchRes.json();
+  assert.equal(mismatchJson.ok, false);
+  assert.deepEqual(mismatchJson.messages, []);
+  assert.match(mismatchJson.error, /scope validation/i);
+  assert.match(sidecarProc.getOutput().stderr, /GET \/api\/member\/history rejected 403/);
 });

@@ -496,10 +496,12 @@
     return `<details class="o2-tools" data-o2tools="${esc(n)}" data-testid="swarm-member-recent-tools"${isOpen ? ' open' : ''}><summary>Recent activity (${list.length})</summary><ul class="o2-tools-list">${rows}</ul></details>`;
   }
 
-  function subagentsTreeHtml(x){
+  function subagentsTreeHtml(x, parentName){
     const subs = Array.isArray(x.subagents) ? x.subagents : [];
     if(!subs.length) return '';
+    const pName = String(parentName || x.rawName || x.name || '').trim();
     const items = subs.slice(0, 12).map(s => {
+      const subId = String(s.sessionId || s.id || '').trim();
       const rawName = String(s.name || s.id || 'subagent');
       const rawTask = String(s.task || s.summary || '');
       const dup = rawTask && (rawName === rawTask || (rawName.length > 36 && rawTask.startsWith(rawName.slice(0, 36))));
@@ -520,7 +522,10 @@
       if (subCtxPct > 0) metaParts.push(`${Math.round(subCtxPct)}% ctx`);
       if(Number(s.elapsedMs) > 0) metaParts.push(fmtMs(Number(s.elapsedMs)));
       else if(!subSteps && st && st !== 'idle') metaParts.push(st);
-      return `<li class="o2-sub-row" data-testid="swarm-subagent-row">
+      const clickAttrs = (pName && subId)
+        ? ` data-open-member="${esc(pName)}" data-open-subagent="${esc(subId)}" role="button" tabindex="0" title="Open ${esc(name)} transcript"`
+        : '';
+      return `<li class="o2-sub-row${subId ? ' clickable' : ''}" data-testid="swarm-subagent-row"${clickAttrs}>
         <span class="o2-sub-dot ${esc(st)}" aria-hidden="true"></span>
         <span class="o2-sub-name" title="${esc(name)}">${esc(name)}</span>
         ${task ? `<span class="o2-sub-task" title="${esc(task)}">${esc(task)}</span>` : ''}
@@ -633,7 +638,7 @@
           ${nowHtml}
           ${metricsHtml}
           ${recentHtml}
-          ${subagentsTreeHtml(x)}
+          ${subagentsTreeHtml(x, x.rawName || n)}
         </div>
       </article>`;
     };
@@ -920,15 +925,19 @@
     el.querySelectorAll('[data-open-member]').forEach(b => {
       b.onclick = (e) => {
         if (e.target.closest('details.o2-tools')) return;
+        const subEl = e.target.closest('[data-open-subagent]');
+        if (subEl && subEl !== b) return;
         const btn = e.target.closest('button');
         if (btn && btn !== b) return;
-        if (hooks.member) hooks.member(b.dataset.openMember);
+        if (b.dataset.openSubagent) e.stopPropagation();
+        if (hooks.member) hooks.member(b.dataset.openMember, b.dataset.openSubagent || '');
       };
       if (b.getAttribute('role') === 'button') {
         b.onkeydown = (e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
-            if (hooks.member) hooks.member(b.dataset.openMember);
+            e.stopPropagation();
+            if (hooks.member) hooks.member(b.dataset.openMember, b.dataset.openSubagent || '');
           }
         };
       }

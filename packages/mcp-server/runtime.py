@@ -6,6 +6,7 @@ import asyncio
 import atexit
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -1003,16 +1004,32 @@ class SwarmRuntime:
         if not delta:
             return
         with self._state_rlock:
-            buf = self._live_buffers.setdefault(task_id, {"liveTranscript": "", "liveToolTrace": []})
-            txt = buf["liveTranscript"] + delta
+            buf = self._live_buffers.setdefault(
+                task_id, {"liveTranscript": "", "liveReasoning": "", "liveToolTrace": []}
+            )
+            txt = str(buf.get("liveTranscript") or "") + delta
             if len(txt) > _LIVE_TRANSCRIPT_MAX_CHARS:
                 txt = txt[-_LIVE_TRANSCRIPT_MAX_CHARS:]
             buf["liveTranscript"] = txt
 
+    def _append_live_reasoning(self, task_id: str, delta: str) -> None:
+        if not delta:
+            return
+        with self._state_rlock:
+            buf = self._live_buffers.setdefault(
+                task_id, {"liveTranscript": "", "liveReasoning": "", "liveToolTrace": []}
+            )
+            txt = str(buf.get("liveReasoning") or "") + delta
+            if len(txt) > _LIVE_TRANSCRIPT_MAX_CHARS:
+                txt = txt[-_LIVE_TRANSCRIPT_MAX_CHARS:]
+            buf["liveReasoning"] = txt
+
     def _append_live_tool_trace(self, task_id: str, entry: dict[str, Any]) -> None:
         with self._state_rlock:
-            buf = self._live_buffers.setdefault(task_id, {"liveTranscript": "", "liveToolTrace": []})
-            trace: list[dict[str, Any]] = buf["liveToolTrace"]
+            buf = self._live_buffers.setdefault(
+                task_id, {"liveTranscript": "", "liveReasoning": "", "liveToolTrace": []}
+            )
+            trace: list[dict[str, Any]] = buf.setdefault("liveToolTrace", [])
             trace.append(entry)
             if len(trace) > _TOOL_TRACE_LIMIT:
                 del trace[: len(trace) - _TOOL_TRACE_LIMIT]
@@ -1076,6 +1093,7 @@ class SwarmRuntime:
                 meta = view.setdefault("metadata", {})
                 if buf:
                     meta["liveTranscript"] = str(buf.get("liveTranscript") or "")
+                    meta["liveReasoning"] = str(buf.get("liveReasoning") or "")
                     meta["liveToolTrace"] = [dict(x) for x in (buf.get("liveToolTrace") or [])]
                 self._enrich_view_telemetry_unlocked(view)
                 out.append(view)
@@ -1112,6 +1130,71 @@ class SwarmRuntime:
                 reverse=True,
             )
             return dict(matches[0])
+
+    def get_live_worker_overlay(self, worker_name: str) -> dict[str, Any] | None:
+        """Return live in-memory telemetry and streaming buffers for `worker_name` cleanly under lock."""
+        wlow = str(worker_name or "").strip().lower()
+        if not wlow:
+            return None
+        with self._state_rlock:
+            matches = [
+                t for t in self._tasks.values()
+                if str((((t.get("metadata") or {}).get("workerConfig") or {}).get("worker_name") or "")).strip().lower() == wlow
+            ]
+            if not matches:
+                return None
+
+            def _sort_key(t: dict[str, Any]) -> tuple[int, str]:
+                st = str(((t.get("status") or {}).get("state")) or "")
+                active_rank = 1 if st in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value) else 0
+                ts = str(((t.get("status") or {}).get("timestamp")) or ((t.get("metadata") or {}).get("createdAt")) or "")
+                return (active_rank, ts)
+
+            matches.sort(key=_sort_key, reverse=True)
+            task = matches[0]
+            tid = str(task.get("id") or "")
+            view = models.format_task_view(task, include_artifacts=False)
+            self._enrich_view_telemetry_unlocked(view)
+            meta = view.get("metadata") if isinstance(view.get("metadata"), dict) else {}
+            act = meta.get("liveActivity") if isinstance(meta.get("liveActivity"), dict) else {}
+            wcfg = meta.get("workerConfig") if isinstance(meta.get("workerConfig"), dict) else {}
+            raw_state = str((view.get("status") or {}).get("state") or "")
+            is_killed = wlow in self._killed_workers
+            is_active = (not is_killed) and (raw_state in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value))
+            norm_state = _normalize_member_history_state(None, killed=is_killed, task_state=raw_state)
+
+            buf = self._live_buffers.get(tid) or {}
+            ctx_id = str(view.get("contextId") or "").strip()
+            hermes_sid = str(
+                act.get("hermesSessionId")
+                or (self._context_sessions.get(ctx_id) if ctx_id else "")
+                or ""
+            ).strip() or None
+
+            cur_tool = dict(act["currentTool"]) if is_active and isinstance(act.get("currentTool"), dict) else None
+            recent_tools = [dict(x) for x in (act.get("recentTools") or []) if isinstance(x, dict)]
+            started_at = act.get("startedAt") or meta.get("createdAt")
+            elapsed_ms = max(0, int(act.get("elapsedMs") or 0))
+            return {
+                "taskId": tid,
+                "contextId": ctx_id or None,
+                "hermesSessionId": hermes_sid,
+                "state": norm_state,
+                "rawState": raw_state,
+                "active": is_active,
+                "model": wcfg.get("model"),
+                "tokens": dict(meta.get("tokens") or {}),
+                "tps": float(act.get("tps") or 0.0),
+                "tpsEstimated": bool(act.get("tpsEstimated", False)),
+                "currentTool": cur_tool,
+                "recentTools": recent_tools,
+                "transcript": str(buf.get("liveTranscript") or ""),
+                "reasoning": str(buf.get("liveReasoning") or ""),
+                "toolTrace": [dict(x) for x in (buf.get("liveToolTrace") or []) if isinstance(x, dict)],
+                "startedAt": started_at,
+                "endedAt": act.get("endedAt"),
+                "elapsedMs": elapsed_ms,
+            }
 
     def _resolve_resume_target(self, context_id: str) -> str | None:
         with self._state_rlock:
@@ -1384,7 +1467,8 @@ class SwarmRuntime:
                 }
                 self._tasks[task_id] = task
 
-            self._live_buffers.setdefault(task_id, {"liveTranscript": "", "liveToolTrace": []})
+            with self._state_rlock:
+                self._live_buffers[task_id] = {"liveTranscript": "", "liveReasoning": "", "liveToolTrace": []}
 
             worker_name = cfg.worker_name or f"{cfg.role}-{task_id[-6:]}"
             cfg.worker_name = worker_name
@@ -1837,6 +1921,40 @@ class SwarmRuntime:
                                     if hermes_session_id:
                                         act["hermesSessionId"] = hermes_session_id
                             self._emit_observer_event("task_progress", {"taskId": task_id})
+
+                        elif ev_type in ("thinking", "reasoning", "thought"):
+                            r_delta = str(
+                                ev.get("text")
+                                or ev.get("thinking")
+                                or ev.get("reasoning")
+                                or ev.get("thought")
+                                or ev.get("delta")
+                                or ev.get("content")
+                                or ""
+                            )
+                            if r_delta:
+                                if llm_span_start_mono is None:
+                                    llm_span_start_mono = time.monotonic()
+                                self._append_live_reasoning(task_id, r_delta)
+                                if saw_tool_result:
+                                    steps_count += 1
+                                    saw_tool_result = False
+                                streamed_chars += len(r_delta)
+                                with self._state_rlock:
+                                    t = self._tasks.get(task_id)
+                                    if t:
+                                        now_think_m = time.monotonic()
+                                        cur_llm_ms = _current_llm_active_ms(now_think_m)
+                                        act = t["metadata"]["liveActivity"]
+                                        act["lastEventAt"] = models.now_iso()
+                                        act["steps"] = max(int(act.get("steps") or 0), steps_count)
+                                        act["streamedChars"] = streamed_chars
+                                        act["elapsedMs"] = max(0, int((now_think_m - turn_started_mono) * 1000))
+                                        act["llmActiveMs"] = cur_llm_ms
+                                        if int(act.get("turnOutputTokens") or 0) == 0 and cur_llm_ms > 200:
+                                            act["tps"] = round(max(1, streamed_chars // 4) / (cur_llm_ms / 1000.0), 1)
+                                            act["tpsEstimated"] = True
+                                _throttled_progress()
 
                         elif ev_type == "text":
                             delta = str(ev.get("text") or "")
@@ -2366,6 +2484,7 @@ class SwarmRuntime:
                         (task.get("status") or {}).get("state") == models.TaskState.CANCELED.value
                         or self._is_worker_killed(worker_name)
                     ):
+                        kill_ts = models.now_iso()
                         if (task.get("status") or {}).get("state") not in models.TERMINAL_STATES:
                             task["status"] = {
                                 "state": models.TaskState.CANCELED.value,
@@ -2375,8 +2494,16 @@ class SwarmRuntime:
                                     context_id=task["contextId"],
                                     task_id=task_id,
                                 ),
-                                "timestamp": models.now_iso(),
+                                "timestamp": kill_ts,
                             }
+                        act_k = (task.get("metadata") or {}).get("liveActivity")
+                        if isinstance(act_k, dict):
+                            act_k["currentTool"] = None
+                            act_k.setdefault("endedAt", kill_ts)
+                            act_k["recentTools"] = [
+                                {**r, "status": "error"} if isinstance(r, dict) and r.get("status") == "running" else r
+                                for r in (act_k.get("recentTools") or [])
+                            ]
                         self._last_active_worker_count = self._count_active_workers_unlocked()
                         ev = self._events.pop(task_id, None)
                         if ev:
@@ -2692,6 +2819,14 @@ class SwarmRuntime:
                     (task.get("status") or {}).get("state") == models.TaskState.CANCELED.value
                     or self._is_worker_killed(worker_name)
                 ):
+                    act_k = (task.get("metadata") or {}).get("liveActivity")
+                    if isinstance(act_k, dict):
+                        act_k["currentTool"] = None
+                        act_k.setdefault("endedAt", models.now_iso())
+                        act_k["recentTools"] = [
+                            {**r, "status": "error"} if isinstance(r, dict) and r.get("status") == "running" else r
+                            for r in (act_k.get("recentTools") or [])
+                        ]
                     self._last_active_worker_count = self._count_active_workers_unlocked()
                     ev = self._events.pop(task_id, None)
                     if ev:
@@ -2805,6 +2940,7 @@ class SwarmRuntime:
             meta = view.setdefault("metadata", {})
             if buf:
                 meta["liveTranscript"] = str(buf.get("liveTranscript") or "")
+                meta["liveReasoning"] = str(buf.get("liveReasoning") or "")
                 meta["liveToolTrace"] = [dict(x) for x in (buf.get("liveToolTrace") or [])]
             self._enrich_view_telemetry_unlocked(view)
             return view
@@ -2839,6 +2975,7 @@ class SwarmRuntime:
                     buf = self._live_buffers.get(str(v.get("id") or ""))
                     if buf:
                         v.setdefault("metadata", {})["liveTranscript"] = str(buf.get("liveTranscript") or "")
+                        v.setdefault("metadata", {})["liveReasoning"] = str(buf.get("liveReasoning") or "")
                         v.setdefault("metadata", {})["liveToolTrace"] = [dict(x) for x in (buf.get("liveToolTrace") or [])]
                 self._enrich_view_telemetry_unlocked(v)
                 views.append(v)
@@ -4012,30 +4149,146 @@ def _safe_json_loads(raw: Any, default: Any) -> Any:
         return default
 
 
+def _normalize_epoch_ms(raw_ts: Any) -> int | None:
+    """Convert epoch seconds, epoch milliseconds, or ISO timestamps to integer epoch ms cleanly."""
+    if raw_ts is None or isinstance(raw_ts, bool):
+        return None
+    if isinstance(raw_ts, (int, float)):
+        val = float(raw_ts)
+        if not math.isfinite(val) or val <= 0.0:
+            return None
+        if val < 1e11:
+            return int(round(val * 1000.0))
+        return int(round(val))
+    if isinstance(raw_ts, str):
+        s = raw_ts.strip()
+        if not s:
+            return None
+        try:
+            val = float(s)
+            if not math.isfinite(val) or val <= 0.0:
+                return None
+            if val < 1e11:
+                return int(round(val * 1000.0))
+            return int(round(val))
+        except ValueError:
+            pass
+        try:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            epoch_s = dt.timestamp()
+            if not math.isfinite(epoch_s) or epoch_s <= 0.0:
+                return None
+            return int(round(epoch_s * 1000.0))
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_member_history_state(
+    raw_state: Any,
+    *,
+    killed: bool = False,
+    task_state: Any = None,
+) -> str:
+    """Normalize board member and task states to canonical `working` / `waiting` / `killed` / `failed`."""
+    if killed:
+        return "killed"
+
+    def _norm_one(val: Any) -> str:
+        s = str(val or "").strip().lower()
+        if not s:
+            return ""
+        if s == "killed":
+            return "killed"
+        if s in (
+            "working",
+            "running",
+            "active",
+            "submitted",
+            "task_state_working",
+            "task_state_submitted",
+        ):
+            return "working"
+        if s in (
+            "failed",
+            "error",
+            "rejected",
+            "canceled",
+            "cancelled",
+            "task_state_failed",
+            "task_state_rejected",
+            "task_state_canceled",
+            "task_state_cancelled",
+        ):
+            return "failed"
+        if s in (
+            "waiting",
+            "idle",
+            "done",
+            "stopped",
+            "input_required",
+            "task_state_completed",
+            "task_state_input_required",
+            "task_state_auth_required",
+            "task_state_unspecified",
+        ):
+            return "waiting"
+        return "waiting"
+
+    mem_norm = _norm_one(raw_state)
+    task_norm = _norm_one(task_state)
+    if mem_norm == "killed" or task_norm == "killed":
+        return "killed"
+    if task_norm == "working":
+        return "working"
+    if task_norm in ("failed", "waiting") and mem_norm == "working":
+        return task_norm
+    return mem_norm or task_norm or "waiting"
+
+
+def _sqlite_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+    try:
+        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
+        return {str(r[1]) for r in rows if len(r) > 1}
+    except sqlite3.Error:
+        return set()
+
+
 def query_member_session_history(
     state_dir: Path,
     swarm_id: str,
     member_name: str,
     *,
     after_id: int = 0,
+    before_id: int = 0,
     limit: int = 100,
     subagent_session_id: str | None = None,
+    runtime: SwarmRuntime | None = None,
 ) -> dict[str, Any]:
     """Read paginated message history and live telemetry for a swarm worker (or its Tier-3 subagent)."""
     clamped_limit = max(1, min(300, int(limit or 100)))
     since_id = max(0, int(after_id or 0))
+    before_val = max(0, int(before_id or 0))
     sid = store.sanitize_swarm_id(swarm_id) or "default"
     paths = store.resolve_swarm_paths(sid, state_dir=state_dir)
 
-    board = store.read_board_raw(paths.board_file)
+    swarm_meta = store.read_swarm_meta(sid, state_dir=state_dir) or models.default_swarm_meta(sid)
+    meta_primary = swarm_meta.get("primaryConversationId")
+    meta_coord = swarm_meta.get("coordinatorConversationId")
+    meta_conv_ids = [str(c).strip() for c in (swarm_meta.get("conversationIds") or []) if str(c).strip()]
+    for cid_cand in (meta_primary, meta_coord):
+        if isinstance(cid_cand, str) and cid_cand.strip() and cid_cand.strip() not in meta_conv_ids:
+            meta_conv_ids.append(cid_cand.strip())
+
+    board = store.read_board_raw(sid, state_dir=state_dir)
     members = board.get("members") if isinstance(board, dict) else {}
     member_rec: dict[str, Any] = {}
     canonical_name = str(member_name or "").strip()
     if isinstance(members, dict) and canonical_name:
-        hit_name = board_mod.find_member_ci(members, canonical_name)
-        if hit_name and isinstance(members.get(hit_name), dict):
+        hit_name, hit_rec = board_mod.find_member_ci(members, canonical_name)
+        if hit_name and isinstance(hit_rec, dict):
             canonical_name = hit_name
-            member_rec = members[hit_name]
+            member_rec = hit_rec
 
     raw_tasks_doc = store.read_json_safe(paths.tasks_file, {})
     tasks_map = raw_tasks_doc.get("tasks") if isinstance(raw_tasks_doc, dict) else {}
@@ -4063,9 +4316,16 @@ def query_member_session_history(
     act = meta.get("liveActivity") if isinstance(meta.get("liveActivity"), dict) else {}
     wcfg = meta.get("workerConfig") if isinstance(meta.get("workerConfig"), dict) else {}
 
-    hermes_session_id = str(act.get("hermesSessionId") or "").strip()
+    live_overlay: dict[str, Any] | None = None
+    if runtime is not None:
+        try:
+            live_overlay = runtime.get_live_worker_overlay(canonical_name or member_name)
+        except Exception:
+            live_overlay = None
+
+    hermes_session_id = str((live_overlay or {}).get("hermesSessionId") or act.get("hermesSessionId") or "").strip()
     if not hermes_session_id:
-        ctx_id = str(task_rec.get("contextId") or member_rec.get("contextId") or "").strip()
+        ctx_id = str((live_overlay or {}).get("contextId") or task_rec.get("contextId") or member_rec.get("contextId") or "").strip()
         if ctx_id and isinstance(ctx_sessions, dict):
             hermes_session_id = str(ctx_sessions.get(ctx_id) or "").strip()
     if not hermes_session_id:
@@ -4080,12 +4340,23 @@ def query_member_session_history(
                 if hermes_session_id:
                     break
 
-    tokens = dict(meta.get("tokens") or {})
-    tps = float(act.get("tps") or 0.0)
-    tps_estimated = bool(act.get("tpsEstimated", False))
-    current_tool = act.get("currentTool")
-    worker_state = member_rec.get("state") or (task_rec.get("status") or {}).get("state")
-    worker_model = member_rec.get("model") or wcfg.get("model")
+    tokens = dict((live_overlay or {}).get("tokens") or meta.get("tokens") or {})
+    tps = float(live_overlay["tps"] if live_overlay and live_overlay.get("tps") is not None else (act.get("tps") or 0.0))
+    tps_estimated = bool(live_overlay["tpsEstimated"] if live_overlay else act.get("tpsEstimated", False))
+
+    board_killed = bool(member_rec.get("killed")) or str(member_rec.get("state") or "").strip().lower() == models.MemberState.KILLED.value
+    overlay_killed = bool(live_overlay and live_overlay.get("state") == "killed")
+    is_killed = board_killed or overlay_killed
+    eff_task_state = (live_overlay.get("rawState") or live_overlay.get("state")) if live_overlay else (task_rec.get("status") or {}).get("state")
+    worker_state = _normalize_member_history_state(member_rec.get("state"), killed=is_killed, task_state=eff_task_state)
+    worker_model = member_rec.get("model") or (live_overlay or {}).get("model") or wcfg.get("model")
+
+    req_sub = str(subagent_session_id or "").strip()
+    if worker_state == "working" and not req_sub:
+        current_tool = live_overlay.get("currentTool") if live_overlay else act.get("currentTool")
+    else:
+        current_tool = None
+
     board_subs = {
         str(s.get("sessionId") or ""): s
         for s in (member_rec.get("subagents") or [])
@@ -4098,75 +4369,142 @@ def query_member_session_history(
     total_count = 0
     last_id = since_id
     target_session_id: str | None = hermes_session_id or None
+    subagent_rejected = False
+    committed_use_ids: set[str] = set()
+    committed_result_ids: set[str] = set()
+
+    if req_sub and not hermes_session_id:
+        target_session_id = None
+        subagent_rejected = True
 
     db_path = store.default_hermes_home() / "state.db"
+    if req_sub and hermes_session_id and not db_path.is_file():
+        target_session_id = None
+        subagent_rejected = True
+
     if hermes_session_id and db_path.is_file():
         con: sqlite3.Connection | None = None
         try:
             uri = f"{db_path.resolve().as_uri()}?mode=ro"
             con = sqlite3.connect(uri, uri=True, timeout=2.0)
             con.row_factory = sqlite3.Row
+            try:
+                con.execute("PRAGMA busy_timeout = 2000")
+                con.execute("PRAGMA query_only = ON")
+            except sqlite3.Error:
+                pass
 
-            sub_rows = con.execute(
-                "SELECT id, model, title, started_at, ended_at, message_count, tool_call_count, model_config "
-                "FROM sessions WHERE parent_session_id = ? AND source = 'subagent' ORDER BY started_at ASC",
-                (hermes_session_id,),
-            ).fetchall()
+            sess_cols = _sqlite_table_columns(con, "sessions")
+            msg_cols = _sqlite_table_columns(con, "messages")
+
             valid_sub_ids: set[str] = set()
-            for sr in sub_rows:
-                sd = dict(sr)
-                s_id = str(sd.get("id") or "")
-                if not s_id:
-                    continue
-                valid_sub_ids.add(s_id)
-                mc = _safe_json_loads(sd.get("model_config"), {})
-                b_sub = board_subs.get(s_id) or {}
-                label = str(b_sub.get("label") or sd.get("title") or mc.get("_subagent_id") or s_id)
-                title = str(sd.get("title") or label)
-                msg_cnt = int(sd.get("message_count") or 0)
-                tc_cnt = int(sd.get("tool_call_count") or 0)
-                steps = max(1 if (msg_cnt > 0 or tc_cnt > 0) else 0, (msg_cnt + 1) // 3)
-                sub_state = str(
-                    b_sub.get("state")
-                    or (models.MemberState.DONE.value if sd.get("ended_at") is not None else models.MemberState.WORKING.value)
+            if sess_cols and {"id", "parent_session_id", "source"}.issubset(sess_cols):
+                sess_select = [
+                    "id",
+                    "model" if "model" in sess_cols else "NULL AS model",
+                    "title" if "title" in sess_cols else "NULL AS title",
+                    "started_at" if "started_at" in sess_cols else "NULL AS started_at",
+                    "ended_at" if "ended_at" in sess_cols else "NULL AS ended_at",
+                    "message_count" if "message_count" in sess_cols else "0 AS message_count",
+                    "tool_call_count" if "tool_call_count" in sess_cols else "0 AS tool_call_count",
+                    "model_config" if "model_config" in sess_cols else "NULL AS model_config",
+                ]
+                order_col = "started_at ASC" if "started_at" in sess_cols else "id ASC"
+                sub_sql = (
+                    f"SELECT {', '.join(sess_select)} FROM sessions "
+                    f"WHERE parent_session_id = ? AND source = 'subagent' ORDER BY {order_col}"
                 )
-                subagents.append({
-                    "sessionId": s_id,
-                    "label": label,
-                    "title": title,
-                    "state": sub_state,
-                    "steps": steps,
-                    "model": sd.get("model") or b_sub.get("model"),
-                })
+                sub_rows = con.execute(sub_sql, (hermes_session_id,)).fetchall()
+                for sr in sub_rows:
+                    sd = dict(sr)
+                    s_id = str(sd.get("id") or "")
+                    if not s_id:
+                        continue
+                    valid_sub_ids.add(s_id)
+                    mc = _safe_json_loads(sd.get("model_config"), {})
+                    b_sub = board_subs.get(s_id) or {}
+                    label = str(b_sub.get("label") or sd.get("title") or mc.get("_subagent_id") or s_id)
+                    title = str(sd.get("title") or label)
+                    msg_cnt = int(sd.get("message_count") or 0)
+                    tc_cnt = int(sd.get("tool_call_count") or 0)
+                    steps = max(1 if (msg_cnt > 0 or tc_cnt > 0) else 0, (msg_cnt + 1) // 3)
+                    sub_state = str(
+                        b_sub.get("state")
+                        or (models.MemberState.DONE.value if sd.get("ended_at") is not None else models.MemberState.WORKING.value)
+                    )
+                    subagents.append({
+                        "sessionId": s_id,
+                        "label": label,
+                        "title": title,
+                        "state": sub_state,
+                        "steps": steps,
+                        "model": sd.get("model") or b_sub.get("model"),
+                    })
 
-            req_sub = str(subagent_session_id or "").strip()
+                # Also collect nested Tier-3 descendants within this worker's own subagent tree (depth-capped)
+                frontier = list(valid_sub_ids)
+                for _depth in range(3):
+                    if not frontier:
+                        break
+                    placeholders = ",".join("?" for _ in frontier)
+                    desc_rows = con.execute(
+                        f"SELECT id FROM sessions WHERE parent_session_id IN ({placeholders}) AND source = 'subagent'",
+                        tuple(frontier),
+                    ).fetchall()
+                    next_frontier: list[str] = []
+                    for dr in desc_rows:
+                        d_id = str(dr["id"] or "")
+                        if d_id and d_id not in valid_sub_ids:
+                            valid_sub_ids.add(d_id)
+                            next_frontier.append(d_id)
+                    frontier = next_frontier
+
             if req_sub:
                 if req_sub in valid_sub_ids:
                     target_session_id = req_sub
                 else:
                     target_session_id = None
+                    subagent_rejected = True
 
-            if target_session_id:
+            if target_session_id and msg_cols and {"id", "session_id"}.issubset(msg_cols):
                 cnt_row = con.execute(
                     "SELECT COUNT(*) AS cnt FROM messages WHERE session_id = ?",
                     (target_session_id,),
                 ).fetchone()
                 total_count = int(cnt_row["cnt"]) if cnt_row else 0
 
-                if since_id > 0:
+                msg_select = [
+                    "id",
+                    "role" if "role" in msg_cols else "'' AS role",
+                    "timestamp" if "timestamp" in msg_cols else "NULL AS timestamp",
+                    "content" if "content" in msg_cols else "NULL AS content",
+                    "reasoning" if "reasoning" in msg_cols else "NULL AS reasoning",
+                    "reasoning_content" if "reasoning_content" in msg_cols else "NULL AS reasoning_content",
+                    "display_metadata" if "display_metadata" in msg_cols else "NULL AS display_metadata",
+                    "tool_calls" if "tool_calls" in msg_cols else "NULL AS tool_calls",
+                    "tool_name" if "tool_name" in msg_cols else "NULL AS tool_name",
+                    "tool_call_id" if "tool_call_id" in msg_cols else "NULL AS tool_call_id",
+                    "compacted" if "compacted" in msg_cols else "0 AS compacted",
+                ]
+                msg_cols_sql = ", ".join(msg_select)
+
+                if before_val > 0:
                     rows = con.execute(
-                        "SELECT id, role, timestamp, content, reasoning, reasoning_content, "
-                        "display_metadata, tool_calls, tool_name, tool_call_id, compacted "
-                        "FROM messages WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+                        f"SELECT {msg_cols_sql} FROM messages WHERE session_id = ? AND id < ? ORDER BY id DESC LIMIT ?",
+                        (target_session_id, before_val, clamped_limit + 1),
+                    ).fetchall()
+                    has_more = len(rows) > clamped_limit
+                    rows = list(reversed(rows[:clamped_limit]))
+                elif since_id > 0:
+                    rows = con.execute(
+                        f"SELECT {msg_cols_sql} FROM messages WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
                         (target_session_id, since_id, clamped_limit + 1),
                     ).fetchall()
                     has_more = len(rows) > clamped_limit
                     rows = rows[:clamped_limit]
                 else:
                     rows = con.execute(
-                        "SELECT id, role, timestamp, content, reasoning, reasoning_content, "
-                        "display_metadata, tool_calls, tool_name, tool_call_id, compacted "
-                        "FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                        f"SELECT {msg_cols_sql} FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
                         (target_session_id, clamped_limit + 1),
                     ).fetchall()
                     has_more = len(rows) > clamped_limit
@@ -4185,10 +4523,12 @@ def query_member_session_history(
                     except (TypeError, ValueError):
                         reasoning_tokens = 0
                     t_calls = _safe_json_loads(md.get("tool_calls"), [])
+                    raw_ts = md.get("timestamp")
                     messages.append({
                         "id": int(md["id"]),
                         "role": str(md.get("role") or ""),
-                        "timestamp": md.get("timestamp"),
+                        "timestamp": raw_ts,
+                        "timestampMs": _normalize_epoch_ms(raw_ts),
                         "content": md.get("content"),
                         "reasoning": md.get("reasoning") or md.get("reasoning_content"),
                         "reasoningTokens": reasoning_tokens,
@@ -4198,7 +4538,36 @@ def query_member_session_history(
                         "compacted": bool(md.get("compacted")),
                     })
                 if messages:
-                    last_id = messages[-1]["id"]
+                    last_id = max(last_id, messages[-1]["id"])
+
+                # Collect ALL committed toolCallIds for target_session_id so live.toolTrace
+                # deduplicates cleanly even across incremental `after_id > 0` polls.
+                if live_overlay and live_overlay.get("active") and worker_state == "working" and not req_sub:
+                    if "tool_call_id" in msg_cols:
+                        for tr in con.execute(
+                            "SELECT DISTINCT tool_call_id FROM messages "
+                            "WHERE session_id = ? AND tool_call_id IS NOT NULL AND tool_call_id != ''",
+                            (target_session_id,),
+                        ).fetchall():
+                            tid_val = str(tr["tool_call_id"] or "").strip()
+                            if tid_val:
+                                committed_result_ids.add(tid_val)
+                    if "tool_calls" in msg_cols:
+                        for tcr in con.execute(
+                            "SELECT tool_calls FROM messages "
+                            "WHERE session_id = ? AND tool_calls IS NOT NULL AND tool_calls != '' AND tool_calls != '[]'",
+                            (target_session_id,),
+                        ).fetchall():
+                            for tc_item in _safe_json_loads(tcr["tool_calls"], []):
+                                if not isinstance(tc_item, dict):
+                                    continue
+                                tc_cid = str(
+                                    tc_item.get("id") or tc_item.get("tool_call_id") or tc_item.get("toolCallId") or ""
+                                ).strip()
+                                if tc_cid:
+                                    committed_use_ids.add(tc_cid)
+        except sqlite3.Error:
+            pass
         finally:
             if con is not None:
                 try:
@@ -4206,12 +4575,79 @@ def query_member_session_history(
                 except Exception:
                     pass
 
-    if not tokens and target_session_id:
+    if subagent_rejected:
+        tokens = {}
+        tps = 0.0
+        tps_estimated = False
+        current_tool = None
+    elif req_sub and target_session_id:
+        sub_toks, _, _ = _query_hermes_session_stats(target_session_id, model=worker_model)
+        tokens = sub_toks or {}
+        tps = 0.0
+        tps_estimated = False
+        current_tool = None
+    elif not tokens and target_session_id:
         db_toks, _, _ = _query_hermes_session_stats(target_session_id, model=worker_model)
         if db_toks:
             tokens = db_toks
 
-    return {
+    is_main_live = bool(
+        live_overlay
+        and live_overlay.get("active")
+        and worker_state == "working"
+        and not req_sub
+        and not subagent_rejected
+    )
+    if is_main_live and live_overlay:
+        filtered_trace: list[dict[str, Any]] = []
+        for item in live_overlay.get("toolTrace") or []:
+            if not isinstance(item, dict):
+                continue
+            tc_id = str(item.get("tool_call_id") or item.get("toolCallId") or "").strip()
+            ev_kind = str(item.get("event") or "").strip()
+            if tc_id:
+                if ev_kind == "tool_use" and (tc_id in committed_use_ids or tc_id in committed_result_ids):
+                    continue
+                if ev_kind == "tool_result" and tc_id in committed_result_ids:
+                    continue
+            entry_copy = dict(item)
+            if tc_id and not entry_copy.get("toolCallId"):
+                entry_copy["toolCallId"] = tc_id
+            filtered_trace.append(entry_copy)
+        live_payload: dict[str, Any] = {
+            "active": True,
+            "transcript": str(live_overlay.get("transcript") or ""),
+            "reasoning": str(live_overlay.get("reasoning") or ""),
+            "currentTool": live_overlay.get("currentTool"),
+            "recentTools": list(live_overlay.get("recentTools") or []),
+            "toolTrace": filtered_trace,
+            "startedAt": live_overlay.get("startedAt"),
+            "elapsedMs": max(0, int(live_overlay.get("elapsedMs") or 0)),
+        }
+    else:
+        live_payload = {
+            "active": False,
+            "transcript": "",
+            "reasoning": "",
+            "currentTool": None,
+            "recentTools": (
+                list((live_overlay or {}).get("recentTools") or act.get("recentTools") or [])
+                if not req_sub
+                else []
+            ),
+            "toolTrace": [],
+            "startedAt": ((live_overlay or {}).get("startedAt") or act.get("startedAt")) if not req_sub else None,
+            "elapsedMs": max(0, int((live_overlay or {}).get("elapsedMs") or act.get("elapsedMs") or 0)) if not req_sub else 0,
+        }
+
+    result: dict[str, Any] = {
+        "ok": True,
+        "swarm": sid,
+        "swarmId": sid,
+        "primaryConversationId": meta_primary,
+        "coordinatorConversationId": meta_coord,
+        "conversationId": meta_primary or meta_coord,
+        "conversationIds": meta_conv_ids,
         "member": canonical_name or member_name,
         "sessionId": target_session_id,
         "parentSessionId": hermes_session_id or None,
@@ -4226,4 +4662,8 @@ def query_member_session_history(
         "state": worker_state,
         "model": worker_model,
         "subagents": subagents,
+        "live": live_payload,
     }
+    if subagent_rejected:
+        result["subagentRejected"] = True
+    return result

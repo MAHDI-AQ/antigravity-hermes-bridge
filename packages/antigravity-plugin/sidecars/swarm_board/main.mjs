@@ -1111,7 +1111,7 @@ export async function handleGetMemberHistory(
   ).trim();
   const member = String(data?.member || data?.agent || '').trim();
   if (!conv || !member) {
-    return jsonReply({ ok: false, error: 'conversationId and member are required' }, 400);
+    return jsonReply({ ok: false, error: 'conversationId and member are required', messages: [], events: [] }, 400);
   }
 
   const upstreamBase = resolveUpstreamUrl({ conversationId: conv }, config);
@@ -1120,6 +1120,10 @@ export async function handleGetMemberHistory(
   const afterId = data?.after_id ?? data?.afterId;
   if (afterId !== undefined && afterId !== null && String(afterId).trim() !== '') {
     qs.set('after_id', String(afterId).trim());
+  }
+  const beforeId = data?.before_id ?? data?.beforeId;
+  if (beforeId !== undefined && beforeId !== null && String(beforeId).trim() !== '') {
+    qs.set('before_id', String(beforeId).trim());
   }
   const rawLimit = String(data?.limit ?? '').trim();
   if (rawLimit && /^\d+$/.test(rawLimit)) {
@@ -1162,6 +1166,7 @@ export async function handleGetMemberHistory(
           error: `Upstream /board/member/history returned HTTP ${res.status}`,
           conversationId: conv,
           member,
+          messages: [],
           events: [],
         },
         status,
@@ -1176,12 +1181,16 @@ export async function handleGetMemberHistory(
       payload = await res.json();
     }
     if (!payload || typeof payload !== 'object' || !isSwarmScopedToRequest(payload, { conversationId: conv })) {
+      console.warn(
+        `[swarm_board] GET /api/member/history rejected 403 (conversation scope validation failed) for conversationId=${conv} member=${member}`,
+      );
       return jsonReply(
         {
           ok: false,
           error: 'Member history payload failed conversation scope validation',
           conversationId: conv,
           member,
+          messages: [],
           events: [],
         },
         403,
@@ -1191,10 +1200,10 @@ export async function handleGetMemberHistory(
     return jsonReply(payload, 200);
   } catch (err) {
     if (err?.code === 'PAYLOAD_TOO_LARGE') {
-      return jsonReply({ ok: false, error: 'Payload too large', conversationId: conv, member, events: [] }, 413);
+      return jsonReply({ ok: false, error: 'Payload too large', conversationId: conv, member, messages: [], events: [] }, 413);
     }
     return jsonReply(
-      { ok: false, error: err?.message || 'Member history unavailable', conversationId: conv, member, events: [] },
+      { ok: false, error: err?.message || 'Member history unavailable', conversationId: conv, member, messages: [], events: [] },
       503,
     );
   }

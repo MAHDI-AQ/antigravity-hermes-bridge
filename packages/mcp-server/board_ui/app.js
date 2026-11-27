@@ -149,7 +149,43 @@
   const viaChannelOf = (m) => m?.viaChannel || m?.via_channel || [];
 
   const parseTime = (t) => (t ? Date.parse(String(t).replace(' ', 'T')) : NaN);
-  const msgMs = (m) => (Number.isFinite(m?.ts) ? m.ts : parseTime(m?.time));
+  function normalizeTsMs(raw) {
+    if (raw == null || raw === '' || typeof raw === 'boolean') return NaN;
+    if (typeof raw === 'number') {
+      if (!Number.isFinite(raw) || raw <= 0) return NaN;
+      return raw < 1e11 ? Math.round(raw * 1000) : Math.round(raw);
+    }
+    const s = String(raw).trim();
+    if (!s) return NaN;
+    if (/^\d+(?:\.\d+)?$/.test(s)) {
+      const n = Number(s);
+      if (!Number.isFinite(n) || n <= 0) return NaN;
+      return n < 1e11 ? Math.round(n * 1000) : Math.round(n);
+    }
+    const parsed = parseTime(s);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : NaN;
+  }
+  function normalizeAgentStatus(raw, killed = false) {
+    if (killed) return 'killed';
+    const s = String(raw || '').trim().toLowerCase().replace(/^(?:task_state_|member_state_)/, '');
+    if (s === 'working' || s === 'active' || s === 'running' || s === 'busy' || s === 'in_progress') return 'working';
+    if (s === 'killed' || s === 'retired' || s === 'stopped' || s === 'canceled' || s === 'cancelled' || s === 'terminated') return 'killed';
+    if (s === 'failed' || s === 'error' || s === 'errored') return 'failed';
+    return 'waiting';
+  }
+  function formatCurrentToolLabel(ct) {
+    if (ct == null || ct === '') return '';
+    if (typeof ct === 'string') return ct.trim().slice(0, 180);
+    if (typeof ct === 'object') {
+      const name = String(ct.name || ct.toolName || ct.tool || '').trim();
+      const prev = String(ct.preview || ct.argsPreview || ct.target || '').trim();
+      if (name && prev) return `${/^running\s+/i.test(name) ? name : `Running ${name}`}(${prev})`.slice(0, 180);
+      if (name) return (/^running\s+/i.test(name) ? name : `Running ${name}`).slice(0, 180);
+      if (prev) return prev.slice(0, 180);
+    }
+    return '';
+  }
+  const msgMs = (m) => (Number.isFinite(m?.ts) ? m.ts : normalizeTsMs(m?.timestampMs ?? m?.timestamp ?? m?.time));
   const isoTime = (ms) => (Number.isFinite(ms) ? new Date(ms).toISOString() : '');
   const sameDay = (a, b) =>
     a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate();
@@ -219,7 +255,19 @@
   }
 
   function transformTextNodes(html, fn) {
-    return String(html).replace(/(<[^>]*>)|([^<]+)/g, (m, tag, text) => (tag ? tag : fn(text)));
+    let skipPre = 0, skipA = 0, skipBtn = 0;
+    return String(html).replace(/(<[^>]*>)|([^<]+)/g, (m, tag, text) => {
+      if (tag) {
+        if (/^<pre\b/i.test(tag)) skipPre++;
+        else if (/^<\/pre\b/i.test(tag)) skipPre = Math.max(0, skipPre - 1);
+        else if (/^<a\b/i.test(tag)) skipA++;
+        else if (/^<\/a\b/i.test(tag)) skipA = Math.max(0, skipA - 1);
+        else if (/^<button\b/i.test(tag)) skipBtn++;
+        else if (/^<\/button\b/i.test(tag)) skipBtn = Math.max(0, skipBtn - 1);
+        return tag;
+      }
+      return (skipPre || skipA || skipBtn) ? text : fn(text);
+    });
   }
 
   const MENTION_RE = /(^|[^\p{L}\p{N}_-])@([\p{L}\p{N}_-]+)/gu;
@@ -266,23 +314,106 @@
       .replace(/<code>(<button\b[^>]*\bseq-ref\b[^>]*>#[0-9]+<\/button>)<\/code>/g, '<code class="seq-ref-only">$1</code>');
   }
 
-  function md(src) {
-    const lines = String(src || '').split('\n');
-    let out = '', inCode = false, code = [], inList = false;
-    const inline = (t) => highlightCitations(highlightMentions(esc(t)
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-      .replace(/(^|\W)\*([^*]+)\*(?=\W|$)/g, '$1<em>$2</em>')));
-    const closeList = () => { if (inList) { out += '</ul>'; inList = false; } };
-    for (const line of lines) {
-      if (line.trim().startsWith('```')) {
+  function safeHttpsHref(raw) {
+    if (typeof raw !== 'string') return '';
+    const trimmed = raw.trim();
+    if (!/^https:\/\//i.test(trimmed)) return '';
+    try {
+      const u = new URL(trimmed);
+      if (u.protocol !== 'https:' || u.username || u.password) return '';
+      return u.href;
+    } catch {
+      return '';
+    }
+  }
+
+  function md(rawSrc) {
+    const rawStr = String(rawSrc || '').replace(/\x00/g, '').replace(/\r\n?/g, '\n');
+    const src = rawStr.length > 120000 ? `${rawStr.slice(0, 120000)}\n\n… (truncated)` : rawStr;
+    const lines = src.split('\n');
+    let out = '', inCode = false, codeLang = '', code = [];
+    const listStack = [];
+    let bqLines = [];
+
+    const inline = (rawText) => {
+      const tokens = [];
+      const hold = (html) => {
+        const idx = tokens.length;
+        tokens.push(html);
+        return `\x00M${idx}\x00`;
+      };
+      let t = String(rawText || '');
+      t = t.replace(/`([^`\n]+)`/g, (_, c) => hold(`<code>${esc(c)}</code>`));
+      t = t.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (full, label, url) => {
+        const href = safeHttpsHref(url);
+        if (!href) return full;
+        return hold(`<a class="ag-md-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(label)}</a>`);
+      });
+      t = t.replace(/https:\/\/[^\s<>"'`]+/g, (rawUrl) => {
+        let u = rawUrl;
+        let trail = '';
+        while (u.length > 8 && /[.,;:!?\]}]/.test(u[u.length - 1])) {
+          trail = u[u.length - 1] + trail;
+          u = u.slice(0, -1);
+        }
+        while (u.endsWith(')') && (u.match(/\(/g) || []).length < (u.match(/\)/g) || []).length) {
+          trail = ')' + trail;
+          u = u.slice(0, -1);
+        }
+        const href = safeHttpsHref(u);
+        if (!href) return rawUrl;
+        return hold(`<a class="ag-md-link" href="${esc(href)}" target="_blank" rel="noopener noreferrer">${esc(u)}</a>`) + trail;
+      });
+      let html = esc(t)
+        .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+        .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+        .replace(/(^|[\s(])\*([^*\n]+)\*(?=[\s).,;:!?]|$)/g, '$1<em>$2</em>');
+      html = html.replace(/\x00M(\d+)\x00/g, (_, idx) => tokens[Number(idx)] ?? '');
+      return highlightCitations(highlightMentions(html));
+    };
+
+    const closeLists = () => {
+      while (listStack.length) {
+        const top = listStack.pop();
+        if (top.hasOpenLi) out += '</li>';
+        out += `</${top.type}>`;
+      }
+    };
+    const flushBq = () => {
+      if (!bqLines.length) return;
+      out += `<blockquote>${bqLines.map((l) => (l.trim() ? `<p>${inline(l)}</p>` : '')).join('')}</blockquote>`;
+      bqLines = [];
+    };
+    const emitCodeBlock = () => {
+      const lang = codeLang ? esc(codeLang) : 'text';
+      out += `<div class="ag-codeblock" data-testid="ag-codeblock">` +
+        `<div class="ag-codehead"><span class="ag-codelang">${lang}</span>` +
+        `<button type="button" class="ghost-btn sm ag-codecopy" data-copy-code>Copy</button></div>` +
+        `<pre><code>${esc(code.join('\n'))}</code></pre></div>`;
+      code = [];
+      codeLang = '';
+      inCode = false;
+    };
+    const splitRow = (line) => {
+      let s = line.trim();
+      if (s.startsWith('|')) s = s.slice(1);
+      if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+      return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
+    };
+    const isTableSep = (line) => /^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$/.test(line)
+      || /^\s*\|\s*:?-{3,}:?\s*\|\s*$/.test(line);
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const fence = line.match(/^\s{0,3}```(.*)$/);
+      if (fence) {
         if (inCode) {
-          out += `<pre>${esc(code.join('\n'))}</pre>`;
-          code = [];
-          inCode = false;
+          emitCodeBlock();
         } else {
-          closeList();
+          flushBq();
+          closeLists();
           inCode = true;
+          codeLang = fence[1].trim().split(/\s+/)[0] || '';
         }
         continue;
       }
@@ -290,26 +421,80 @@
         code.push(line);
         continue;
       }
-      const h = line.match(/^(#{1,4})\s+(.*)$/);
-      if (h) {
-        closeList();
-        out += `<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`;
+
+      const bq = line.match(/^\s{0,3}>\s?(.*)$/);
+      if (bq) {
+        closeLists();
+        bqLines.push(bq[1]);
         continue;
       }
-      const li = line.match(/^\s*(?:[-*]|\d+\.)\s+(.*)$/);
-      if (li) {
-        if (!inList) {
-          out += '<ul>';
-          inList = true;
+      flushBq();
+
+      if (i + 1 < lines.length && line.includes('|') && isTableSep(lines[i + 1])) {
+        closeLists();
+        const headers = splitRow(line);
+        const aligns = splitRow(lines[i + 1]).map((c) => (
+          c.startsWith(':') && c.endsWith(':') ? 'center' : (c.endsWith(':') ? 'right' : 'left')
+        ));
+        i += 1;
+        const rows = [];
+        while (i + 1 < lines.length && lines[i + 1].includes('|') && lines[i + 1].trim() && !/^\s{0,3}```/.test(lines[i + 1])) {
+          i += 1;
+          rows.push(splitRow(lines[i]));
         }
-        out += `<li>${inline(li[1])}</li>`;
+        const ths = headers.map((h, idx) => `<th style="text-align:${aligns[idx] || 'left'}">${inline(h)}</th>`).join('');
+        const trs = rows.map((r) => `<tr>${headers.map((_, idx) => `<td style="text-align:${aligns[idx] || 'left'}">${inline(r[idx] || '')}</td>`).join('')}</tr>`).join('');
+        out += `<div class="ag-table-wrap"><table class="ag-table"><thead><tr>${ths}</tr></thead>${trs ? `<tbody>${trs}</tbody>` : ''}</table></div>`;
         continue;
       }
-      closeList();
+
+      if (/^\s{0,3}(?:[-*_]\s*){3,}$/.test(line)) {
+        closeLists();
+        out += '<hr>';
+        continue;
+      }
+
+      const h = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+      if (h) {
+        closeLists();
+        const lvl = Math.min(6, h[1].length);
+        out += `<h${lvl}>${inline(h[2])}</h${lvl}>`;
+        continue;
+      }
+
+      const li = line.match(/^(\s*)([-*+]|\d+\.)\s+(.*)$/);
+      if (li) {
+        const indent = li[1].replace(/\t/g, '  ').length;
+        const type = /\d+\./.test(li[2]) ? 'ol' : 'ul';
+        while (listStack.length && indent < listStack[listStack.length - 1].indent) {
+          const top = listStack.pop();
+          if (top.hasOpenLi) out += '</li>';
+          out += `</${top.type}>`;
+        }
+        if (!listStack.length || indent > listStack[listStack.length - 1].indent) {
+          out += `<${type}>`;
+          listStack.push({ type, indent, hasOpenLi: false });
+        } else if (listStack[listStack.length - 1].type !== type) {
+          const top = listStack.pop();
+          if (top.hasOpenLi) out += '</li>';
+          out += `</${top.type}>`;
+          out += `<${type}>`;
+          listStack.push({ type, indent, hasOpenLi: false });
+        } else if (listStack[listStack.length - 1].hasOpenLi) {
+          out += '</li>';
+          listStack[listStack.length - 1].hasOpenLi = false;
+        }
+        out += `<li>${inline(li[3])}`;
+        listStack[listStack.length - 1].hasOpenLi = true;
+        continue;
+      }
+
+      closeLists();
       if (line.trim()) out += `<p>${inline(line)}</p>`;
     }
-    if (inCode) out += `<pre>${esc(code.join('\n'))}</pre>`;
-    closeList();
+    if (inCode) emitCodeBlock();
+    flushBq();
+    closeLists();
     return out;
   }
 
@@ -485,8 +670,13 @@
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       clearTimeout(state.pollTimer);
+      clearTimeout(state.agentPollTimer);
     } else {
       poll();
+      if (typeof state.tab === 'string' && state.tab.startsWith('agent:')) {
+        const aName = state.tab.slice(6);
+        if (state.openAgentTabs.includes(aName)) fetchAgentHistory(aName, { incremental: true });
+      }
     }
   });
 
@@ -547,14 +737,14 @@
   {
     window.SwarmHive.hooks = {
       members: () => selectTab('members', false, true),
-      member: (name) => {
+      member: (name, subSessionId = '') => {
         const target = name === 'coordinator' ? (window.SwarmHive?.leadName || 'coordinator') : name;
         const m = (state.snap?.members || []).find((x) => x.name === target);
         const cid = convIdOf(m) || (target === 'coordinator' ? coordinatorConv() : '');
         if (target === 'coordinator' && cid && canOpenConversation()) {
           openConversation(cid);
         } else if (m || target) {
-          openAgentTab(m ? m.name : target);
+          openAgentTab(m ? m.name : target, subSessionId);
         }
       },
     };
@@ -960,6 +1150,9 @@
     const showTop = onFeed && f && f.scrollTop > 400;
     $('jump-latest').classList.toggle('hidden', !showLatest);
     $('jump-top')?.classList.toggle('hidden', !showTop);
+    if (typeof updateAgentJump === 'function') {
+      updateAgentJump(state.tab.startsWith('agent:') ? state.tab.slice(6) : '');
+    }
   }
 
   function renderMembers() {
@@ -2888,6 +3081,7 @@
         subagents: [],
         selectedSubagent: '',
         telemetry: null,
+        live: null,
         hasMore: false,
         totalCount: 0,
         lastId: 0,
@@ -2895,10 +3089,43 @@
         loading: false,
         error: null,
         stick: true,
+        hasNewWhileScrolled: false,
+        reqGen: 0,
+        lastCommittedSig: '',
+        lastLiveSig: '',
         prevTab: state.tab && !state.tab.startsWith('agent:') ? state.tab : 'members',
       };
     }
     return state.agentTabData[name];
+  }
+
+  function effectiveAgentStatus(name, data, m) {
+    if (m?.killed) return 'killed';
+    const boardSt = m?.status ? normalizeAgentStatus(m.status, !!m?.killed) : '';
+    if (boardSt === 'killed' || boardSt === 'failed') return boardSt;
+    const tel = data?.telemetry || {};
+    const baseSt = normalizeAgentStatus(tel.state || m?.status || 'waiting', !!m?.killed);
+    if (baseSt === 'killed' || baseSt === 'failed') return baseSt;
+    const subId = String(data?.selectedSubagent || '').trim();
+    if (subId) {
+      const subs = (Array.isArray(data?.subagents) && data.subagents.length ? data.subagents : m?.subagents) || [];
+      const hit = subs.find((s) => s && String(s.sessionId || s.id || '') === subId);
+      if (hit) return normalizeAgentStatus(hit.state || hit.status || 'waiting', false);
+    }
+    return baseSt;
+  }
+
+  function updateAgentJump(name) {
+    const btn = $('agent-jump-live');
+    const dot = $('agent-jump-dot');
+    const af = $('agent-feed');
+    if (!btn) return;
+    const onAgent = !!name && state.tab === `agent:${name}` && state.view === 'board';
+    const data = onAgent ? state.agentTabData[name] : null;
+    const scrollable = !!(af && af.scrollHeight > af.clientHeight + 60);
+    const show = Boolean(onAgent && data && !data.stick && scrollable);
+    btn.classList.toggle('hidden', !show);
+    if (dot) dot.classList.toggle('hidden', !(show && data?.hasNewWhileScrolled));
   }
 
   function renderAgentTabs() {
@@ -2911,7 +3138,7 @@
     for (const name of state.openAgentTabs) {
       let btn = nav.querySelector(`.tab-agent[data-agent-tab="${CSS.escape(name)}"]`);
       const m = memberOf(name);
-      const st = m ? (m.killed ? 'killed' : (m.status || 'waiting')) : 'waiting';
+      const st = normalizeAgentStatus(m?.status || 'waiting', !!m?.killed);
       const tabKey = `agent:${name}`;
       const on = state.tab === tabKey;
       if (!btn) {
@@ -2951,8 +3178,8 @@
     if (state.tab !== `agent:${name}` || !state.openAgentTabs.includes(name) || document.hidden) return;
     const m = memberOf(name);
     const data = state.agentTabData[name];
-    const st = data?.telemetry?.state || m?.status || 'waiting';
-    const intervalMs = st === 'working' ? 1500 : 4000;
+    const st = effectiveAgentStatus(name, data, m);
+    const intervalMs = st === 'working' ? 750 : 3500;
     state.agentPollTimer = setTimeout(() => {
       if (state.tab === `agent:${name}` && state.openAgentTabs.includes(name)) {
         fetchAgentHistory(name, { incremental: true });
@@ -2964,8 +3191,18 @@
     const conv = currentConv();
     if (!conv || !name) return;
     const data = ensureAgentData(name);
+    const reqSub = String(data.selectedSubagent || '');
+    const myGen = ++data.reqGen;
+    const af = $('agent-feed');
+    let olderRestore = null;
+    let beforeId = 0;
     if (older) {
-      data.limit = Math.min(300, (data.limit || 100) + 100);
+      if (af) olderRestore = { prevTop: af.scrollTop, prevHeight: af.scrollHeight };
+      if (data.messages.length) {
+        const minId = Math.min(...data.messages.map((x) => Number(x.id) || Infinity));
+        if (Number.isFinite(minId) && minId > 1) beforeId = minId;
+      }
+      if (!beforeId) data.limit = Math.min(300, (data.limit || 100) + 100);
       incremental = false;
     }
     if (state.agentPollAbort) state.agentPollAbort.abort();
@@ -2978,55 +3215,104 @@
     const qs = new URLSearchParams({
       conversationId: conv,
       member: name,
-      limit: String(data.limit || 100),
+      limit: String(beforeId > 0 ? 100 : (data.limit || 100)),
     });
-    if (incremental && data.lastId > 0) qs.set('after_id', String(data.lastId));
-    if (data.selectedSubagent) qs.set('subagent_session_id', data.selectedSubagent);
+    if (beforeId > 0) qs.set('before_id', String(beforeId));
+    else if (incremental && data.lastId > 0) qs.set('after_id', String(data.lastId));
+    if (reqSub) qs.set('subagent_session_id', reqSub);
 
     try {
       const res = await getJson(`./api/member/history?${qs.toString()}`, { signal: ac.signal, timeoutMs: 8000 });
-      if (ac.signal.aborted) return;
+      if (ac.signal.aborted || myGen !== data.reqGen || String(data.selectedSubagent || '') !== reqSub || currentConv() !== conv) {
+        return;
+      }
       data.loading = false;
       const incoming = Array.isArray(res.messages) ? res.messages : [];
-      if (incremental && data.lastId > 0) {
+      let addedNew = false;
+      if ((incremental && data.lastId > 0) || beforeId > 0) {
         if (incoming.length) {
           const seen = new Set(data.messages.map((x) => x.id));
           for (const msg of incoming) {
-            if (!seen.has(msg.id)) data.messages.push(msg);
+            if (msg && !seen.has(msg.id)) {
+              seen.add(msg.id);
+              data.messages.push(msg);
+              addedNew = true;
+            }
+          }
+          if (addedNew) {
+            data.messages.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
           }
         }
       } else {
-        data.messages = incoming;
+        const seen = new Set();
+        const deduped = [];
+        for (const msg of incoming) {
+          if (msg && !seen.has(msg.id)) {
+            seen.add(msg.id);
+            deduped.push(msg);
+          }
+        }
+        data.messages = deduped;
       }
       if (typeof res.hasMore === 'boolean') data.hasMore = res.hasMore;
       if (typeof res.totalCount === 'number') data.totalCount = res.totalCount;
-      if (typeof res.lastId === 'number' && res.lastId > 0) data.lastId = res.lastId;
-      else if (data.messages.length) data.lastId = Math.max(...data.messages.map((x) => Number(x.id) || 0));
+      const maxMsgId = data.messages.length ? Math.max(...data.messages.map((x) => Number(x.id) || 0)) : 0;
+      const resLastId = (typeof res.lastId === 'number' && res.lastId > 0) ? res.lastId : 0;
+      if (incremental || beforeId > 0) {
+        data.lastId = Math.max(data.lastId || 0, resLastId, maxMsgId);
+      } else {
+        data.lastId = resLastId || maxMsgId;
+      }
       if (Array.isArray(res.subagents)) data.subagents = res.subagents;
+      const m = memberOf(name);
       data.telemetry = {
         tokens: res.tokens || null,
         tps: res.tps ?? null,
         tpsEstimated: !!res.tpsEstimated,
-        currentTool: res.currentTool || '',
-        state: res.state || '',
+        currentTool: res.currentTool ?? null,
+        state: normalizeAgentStatus(res.state || '', !!m?.killed),
         model: res.model || '',
       };
-      if (state.tab === `agent:${name}`) renderAgentPane(name);
+      const nextLive = (!m?.killed && !reqSub && res.live && typeof res.live === 'object') ? res.live : null;
+      const prevLiveSig = JSON.stringify(data.live || null);
+      const nextLiveSig = JSON.stringify(nextLive);
+      data.live = nextLive;
+      if (!data.stick && (addedNew || (nextLive && prevLiveSig !== nextLiveSig))) {
+        data.hasNewWhileScrolled = true;
+      }
+      if (state.tab === `agent:${name}`) renderAgentPane(name, { olderRestore });
     } catch (err) {
-      if (ac.signal.aborted) return;
+      if (ac.signal.aborted || myGen !== data.reqGen || String(data.selectedSubagent || '') !== reqSub || currentConv() !== conv) {
+        return;
+      }
       data.loading = false;
       data.error = err?.message || 'Failed to load history';
       if (state.tab === `agent:${name}`) renderAgentPane(name);
     } finally {
       if (state.agentPollAbort === ac) state.agentPollAbort = null;
-      if (state.tab === `agent:${name}`) scheduleAgentPoll(name);
+      if (myGen === data.reqGen && state.tab === `agent:${name}` && currentConv() === conv) {
+        scheduleAgentPoll(name);
+      }
     }
   }
 
-  function openAgentTab(name) {
+  function openAgentTab(name, subSessionId = '') {
     if (!name) return;
     const data = ensureAgentData(name);
     if (!state.tab.startsWith('agent:')) data.prevTab = state.tab;
+    if (subSessionId) {
+      const subStr = String(subSessionId);
+      if (data.selectedSubagent !== subStr) {
+        data.selectedSubagent = subStr;
+        data.messages = [];
+        data.lastId = 0;
+        data.live = null;
+        data.lastCommittedSig = '';
+        data.lastLiveSig = '';
+        data.stick = true;
+        data.hasNewWhileScrolled = false;
+      }
+    }
     if (!state.openAgentTabs.includes(name)) state.openAgentTabs.push(name);
     renderAgentTabs();
     selectTab(`agent:${name}`, false, true);
@@ -3052,42 +3338,586 @@
     if (typeof rawArgs === 'string') {
       const s = rawArgs.trim();
       if (!s) return '';
-      try { obj = JSON.parse(s); } catch { return s.slice(0, 80); }
+      if (s.length > 200000) return s.slice(0, 90);
+      try { obj = JSON.parse(s); } catch { return s.slice(0, 90); }
     }
     if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
       const keys = Object.keys(obj);
       if (!keys.length) return '';
-      const firstVal = obj[keys[0]];
+      const prefKey = keys.find((k) => /^(?:path|file_path|filePath|TargetFile|command|cmd|query|pattern|url|name)$/i.test(k)) || keys[0];
+      const firstVal = obj[prefKey];
       const valStr = typeof firstVal === 'string' ? firstVal : JSON.stringify(firstVal);
-      const preview = `${keys[0]}=${valStr}`;
-      return preview.length > 90 ? `${preview.slice(0, 87)}...` : preview;
+      const preview = `${prefKey}=${valStr}`;
+      return preview.length > 100 ? `${preview.slice(0, 97)}...` : preview;
     }
-    const str = JSON.stringify(obj);
-    return str.length > 90 ? `${str.slice(0, 87)}...` : str;
+    const strVal = JSON.stringify(obj);
+    return strVal.length > 100 ? `${strVal.slice(0, 97)}...` : strVal;
   }
 
+  const CAP_DETAIL_TEXT = 16000;
+  const CAP_DETAIL_LINES = 400;
   function formatJsonOrText(val) {
     if (val == null) return '';
+    let out = '';
+    let origLen = 0;
     if (typeof val === 'string') {
-      const t = val.trim();
-      if ((t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'))) {
-        try { return JSON.stringify(JSON.parse(t), null, 2); } catch { /* keep raw */ }
+      origLen = val.length;
+      if (origLen > CAP_DETAIL_TEXT) {
+        out = val.slice(0, CAP_DETAIL_TEXT);
+      } else {
+        const t = val.trim();
+        if ((t.startsWith('{') && t.endsWith('}')) || (t.startsWith('[') && t.endsWith(']'))) {
+          try {
+            out = JSON.stringify(JSON.parse(t), null, 2);
+          } catch {
+            out = val;
+          }
+        } else {
+          out = val;
+        }
       }
-      return val;
+    } else {
+      try {
+        out = JSON.stringify(val, null, 2);
+      } catch {
+        out = String(val);
+      }
+      origLen = out.length;
     }
-    try { return JSON.stringify(val, null, 2); } catch { return String(val); }
+    let truncated = origLen > CAP_DETAIL_TEXT && out.length >= CAP_DETAIL_TEXT;
+    if (out.length > CAP_DETAIL_TEXT) {
+      out = out.slice(0, CAP_DETAIL_TEXT);
+      truncated = true;
+    }
+    const lines = out.split('\n');
+    if (lines.length > CAP_DETAIL_LINES) {
+      out = lines.slice(0, CAP_DETAIL_LINES).join('\n');
+      truncated = true;
+    }
+    return truncated ? `${out}\n… (truncated, ${fmtBytes(origLen)} total)` : out;
   }
 
-  function renderAgentPane(name) {
+  const TOOL_HUMAN_LABELS = {
+    read_file: 'Read',
+    write_file: 'Write',
+    write_to_file: 'Write',
+    create_file: 'Create file',
+    edit_file: 'Edit',
+    patch: 'Patch',
+    patch_file: 'Patch',
+    apply_patch: 'Apply patch',
+    replace_file_content: 'Edit',
+    multi_replace_file_content: 'Edit',
+    str_replace_editor: 'Edit',
+    delete_file: 'Delete file',
+    terminal: 'Run terminal',
+    bash: 'Run terminal',
+    run_command: 'Run terminal',
+    exec: 'Run terminal',
+    search_files: 'Search',
+    grep: 'Search',
+    grep_search: 'Search',
+    ripgrep: 'Search',
+    find_files: 'Find files',
+    find_by_name: 'Find files',
+    list_dir: 'List directory',
+    ls: 'List directory',
+    post_message: 'Post to board',
+    read_board: 'Read board',
+    swarm_wait: 'Wait on board',
+    delegate_task: 'Delegate subagent',
+    web_search: 'Web search',
+    search_web: 'Web search',
+    web_fetch: 'Fetch URL',
+    fetch_url: 'Fetch URL',
+  };
+  function humanToolLabel(tcName) {
+    const key = String(tcName || '').trim().toLowerCase();
+    return TOOL_HUMAN_LABELS[key] || '';
+  }
+
+  function unwrapUserPrompt(rawContent) {
+    const text = String(rawContent || '').replace(/\r\n?/g, '\n');
+    const sysTask = text.match(/^\s*\[SYSTEM\s*\/\s*ROLE\]\s*\n([\s\S]*?)\n+\[TASK\]\s*\n([\s\S]*)$/i);
+    if (sysTask) {
+      const systemBrief = sysTask[1].trim();
+      const taskText = sysTask[2].trim();
+      return { systemBrief, taskText: taskText || text.trim() };
+    }
+    const taskOnly = text.match(/^\s*\[TASK\]\s*\n([\s\S]*)$/i);
+    if (taskOnly) {
+      return { systemBrief: '', taskText: taskOnly[1].trim() || text.trim() };
+    }
+    return { systemBrief: '', taskText: text };
+  }
+
+  function resolveAllowedFileUri(rawPath) {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+    if (rawPath.includes('\0') || rawPath.includes('%') || rawPath.startsWith('\\\\')) return null;
+    const norm = rawPath.trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    if (!norm || norm.split('/').includes('..')) return null;
+    const allowed = state.snap?.allowedFiles;
+    if (!allowed || typeof allowed !== 'object') return null;
+    const isSafeUri = (u) => typeof u === 'string' && /^file:\/\/\//i.test(u) && !u.includes('..') && !/%2e/i.test(u);
+    const trimUriSlash = (u) => (u.length > 8 && u.endsWith('/') ? u.slice(0, -1) : u);
+    const normWin = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '').replace(/^[A-Z]:/, (d) => d.toLowerCase());
+
+    if (Object.hasOwn(allowed, rawPath) && isSafeUri(allowed[rawPath])) return allowed[rawPath];
+    if (Object.hasOwn(allowed, norm) && isSafeUri(allowed[norm])) return allowed[norm];
+
+    const allowedEntries = Object.entries(allowed)
+      .filter(([, u]) => isSafeUri(u))
+      .map(([k, u]) => ({ keyNorm: normWin(k), uri: trimUriSlash(u) }));
+
+    const candidateRoots = [
+      state.snap?.workspace,
+      state.snap?.meta?.workspace,
+      state.snap?.dir,
+      state.snap?.view?.dir,
+    ].map((r) => String(r || '').trim()).filter(Boolean);
+
+    const authorizedRoots = [];
+    for (const r of candidateRoots) {
+      const nr = normWin(r);
+      if (!nr) continue;
+      const hit = allowedEntries.find((e) => e.keyNorm === nr);
+      if (hit && !authorizedRoots.some((x) => x.normRoot === nr)) {
+        authorizedRoots.push({ normRoot: nr, uriRoot: hit.uri });
+      }
+    }
+    const primaryRoot = authorizedRoots[0] || null;
+
+    const encodeRelUri = (uriRoot, rel) => {
+      const parts = rel.split('/').filter(Boolean);
+      if (!parts.length || parts.some((p) => p === '..' || p === '.')) return null;
+      const encoded = parts.map((p) => encodeURIComponent(p)).join('/');
+      return `${uriRoot}/${encoded}`;
+    };
+
+    const isAbs = /^(?:\/|[a-zA-Z]:\/)/.test(norm);
+    if (!isAbs) {
+      const rel = norm.replace(/^\.\//, '');
+      if (!rel) return null;
+      if (Object.hasOwn(allowed, rel) && isSafeUri(allowed[rel])) return allowed[rel];
+      if (primaryRoot) {
+        const built = encodeRelUri(primaryRoot.uriRoot, rel);
+        return built && isSafeUri(built) ? built : null;
+      }
+      return null;
+    }
+
+    const nNorm = normWin(norm);
+    for (const e of allowedEntries) {
+      if (e.keyNorm === nNorm) return e.uri;
+    }
+    for (const root of authorizedRoots) {
+      if (nNorm === root.normRoot) return root.uriRoot;
+      if (nNorm.startsWith(`${root.normRoot}/`)) {
+        const rel = norm.slice(root.normRoot.length + 1);
+        const built = encodeRelUri(root.uriRoot, rel);
+        return built && isSafeUri(built) ? built : null;
+      }
+    }
+    return null;
+  }
+
+  const FILE_MUTATE_RE = /^(?:edit_file|write_file|write_to_file|create_file|patch|patch_file|apply_patch|str_replace_editor|replace_file_content|multi_replace_file_content|delete_file)$/i;
+  function countLines(strVal) {
+    if (typeof strVal !== 'string' || !strVal.length) return 0;
+    return strVal.replace(/\r\n?/g, '\n').split('\n').length;
+  }
+  function extractToolFileChange(tcName, tcArgs, resMsg) {
+    if (!FILE_MUTATE_RE.test(String(tcName || '').trim())) return null;
+    let obj = tcArgs;
+    if (typeof tcArgs === 'string') {
+      const s = tcArgs.trim();
+      if (!s || s.length > 200000) return null;
+      try { obj = JSON.parse(s); } catch { return null; }
+    }
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return null;
+    const rawPath = obj.path || obj.file_path || obj.filePath || obj.TargetFile || obj.file || obj.filename || obj.target;
+    if (typeof rawPath !== 'string' || !rawPath.trim()) return null;
+    let added = 0;
+    let deleted = 0;
+    if (Array.isArray(obj.ReplacementChunks)) {
+      for (const ch of obj.ReplacementChunks) {
+        if (!ch || typeof ch !== 'object') continue;
+        deleted += countLines(ch.TargetContent ?? ch.old_string ?? '');
+        added += countLines(ch.ReplacementContent ?? ch.new_string ?? '');
+      }
+    } else if (obj.old_string != null || obj.new_string != null || obj.TargetContent != null || obj.ReplacementContent != null) {
+      deleted = countLines(String(obj.old_string ?? obj.TargetContent ?? ''));
+      added = countLines(String(obj.new_string ?? obj.ReplacementContent ?? ''));
+    } else if (typeof obj.content === 'string' || typeof obj.CodeContent === 'string') {
+      added = countLines(String(obj.content ?? obj.CodeContent ?? ''));
+    } else if (typeof obj.patch === 'string' || typeof obj.diff === 'string') {
+      const lines = String(obj.patch ?? obj.diff).replace(/\r\n?/g, '\n').split('\n');
+      for (const l of lines) {
+        if (l.startsWith('+') && !l.startsWith('+++')) added++;
+        else if (l.startsWith('-') && !l.startsWith('---')) deleted++;
+      }
+    }
+    if (!added && !deleted && resMsg?.content && typeof resMsg.content === 'string' && resMsg.content.length < 4096) {
+      try {
+        const rObj = JSON.parse(resMsg.content);
+        if (rObj && typeof rObj === 'object') {
+          added = Math.max(0, Number(rObj.added ?? rObj.additions) || 0);
+          deleted = Math.max(0, Number(rObj.deleted ?? rObj.deletions ?? rObj.removed) || 0);
+        }
+      } catch { /* ignore */ }
+    }
+    return { path: rawPath.trim(), added, deleted };
+  }
+
+  function formatWorkedLabel(startMs, endMs) {
+    if (Number.isFinite(startMs) && Number.isFinite(endMs)) {
+      const dur = Math.max(0, endMs - startMs);
+      if (dur < 1000) return 'Worked for <1s';
+      return `Worked for ${fmtDur(dur)}`;
+    }
+    return 'Worked';
+  }
+
+  function renderToolCardHtml(name, dKey, tcName, tcArgs, resMsg, { st = 'waiting', durationMs = NaN } = {}) {
+    const isOpen = state.agentDetailsOpen.has(dKey);
+    const argPrev = parseToolArgsPreview(tcArgs);
+    const outStr = resMsg ? formatJsonOrText(resMsg.content ?? resMsg.result ?? resMsg.output ?? '') : '';
+    const isErr = Boolean(resMsg && (/^error[:\s]/i.test(outStr.trim()) || resMsg.status === 'error' || resMsg.isError));
+    const stLabel = resMsg ? (isErr ? 'error' : 'ok') : (st === 'working' ? 'running' : 'stopped');
+    const stCls = resMsg ? (isErr ? 'error' : 'ok') : (st === 'working' ? 'running' : '');
+    const human = humanToolLabel(tcName);
+    const durStr = Number.isFinite(durationMs) && durationMs >= 0 ? (durationMs < 1000 ? `${Math.round(durationMs)}ms` : fmtDur(durationMs)) : '';
+    return `<details class="ag-tool-card" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
+      <summary>
+        ${human ? `<span class="ag-tool-label">${esc(human)}</span>` : ''}
+        <span class="ag-tool-name">${esc(tcName)}</span>
+        ${argPrev ? `<span class="ag-tool-prev">${esc(argPrev)}</span>` : '<span class="ag-tool-prev"></span>'}
+        ${durStr ? `<span class="ag-tool-dur">${esc(durStr)}</span>` : ''}
+        <span class="ag-tool-status ${stCls}">${stLabel}</span>
+      </summary>
+      <div class="ag-tool-detail">
+        ${tcArgs ? `<div><div class="ag-tool-sec-lbl">Arguments</div><pre class="ag-tool-pre">${esc(formatJsonOrText(tcArgs))}</pre></div>` : ''}
+        ${resMsg ? `<div><div class="ag-tool-sec-lbl">Result</div><pre class="ag-tool-pre">${esc(outStr || '(empty)')}</pre></div>` : ''}
+      </div>
+    </details>`;
+  }
+
+  function groupAgentTimeline(messages, { name, st }) {
+    const toolResultsById = new Map();
+    for (const msg of messages) {
+      if (msg && msg.role === 'tool' && msg.toolCallId) {
+        toolResultsById.set(msg.toolCallId, msg);
+      }
+    }
+    const pairedToolIds = new Set();
+    const committedToolCallIds = new Set();
+    const timeline = [];
+    let curWork = null;
+    let turnFiles = new Map();
+    let turnKey = '0';
+
+    const recordFileChange = (fc) => {
+      if (!fc) return;
+      const prev = turnFiles.get(fc.path) || { path: fc.path, added: 0, deleted: 0 };
+      prev.added += fc.added;
+      prev.deleted += fc.deleted;
+      turnFiles.set(fc.path, prev);
+    };
+
+    const flushWork = () => {
+      if (!curWork) return;
+      const dKey = `wg:${name}:${curWork.firstId}`;
+      const isOpen = state.agentDetailsOpen.has(dKey);
+      const label = formatWorkedLabel(curWork.minMs, curWork.maxMs);
+      const tip = `${plural(curWork.steps, 'step')}${curWork.tools ? ` · ${plural(curWork.tools, 'tool call')}` : ''}`;
+      const html = `<details class="ag-work-group" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
+        <summary title="${esc(tip)}"><span>${esc(label)}</span><span class="ag-work-chev" aria-hidden="true"></span></summary>
+        <div class="ag-work-rail">${curWork.parts.join('')}</div>
+      </details>`;
+      const sig = `${curWork.parts.length}|${curWork.minMs}|${curWork.maxMs}|${curWork.parts.join('\0').length}|${curWork.lastSig}`;
+      timeline.push({ key: `wg:${curWork.firstId}`, sig, html });
+      curWork = null;
+    };
+
+    const flushFiles = () => {
+      if (!turnFiles.size) return;
+      const list = [...turnFiles.values()];
+      const totalAdd = list.reduce((a, f) => a + f.added, 0);
+      const totalDel = list.reduce((a, f) => a + f.deleted, 0);
+      const dKey = `files:${name}:${turnKey}`;
+      const isOpen = state.agentDetailsOpen.has(dKey);
+      const rows = list.map((f) => {
+        const uri = resolveAllowedFileUri(f.path);
+        const shortName = f.path.replace(/\\/g, '/').split('/').slice(-2).join('/') || f.path;
+        const pathEl = uri
+          ? `<button type="button" class="ag-fc-path ag-fc-open" data-ag-file="${esc(f.path)}" title="Open ${esc(f.path)}">${esc(shortName)}</button>`
+          : `<span class="ag-fc-path" title="${esc(f.path)}">${esc(shortName)}</span>`;
+        return `<li class="ag-fc-row">
+          ${pathEl}
+          ${f.added > 0 ? `<span class="ag-fc-add">+${f.added}</span>` : ''}
+          ${f.deleted > 0 ? `<span class="ag-fc-del">-${f.deleted}</span>` : ''}
+        </li>`;
+      }).join('');
+      const html = `<details class="ag-files-changed" data-ag-dkey="${esc(dKey)}" data-testid="ag-files-changed"${isOpen ? ' open' : ''}>
+        <summary>
+          <span class="ag-fc-count">${list.length} ${list.length === 1 ? 'file' : 'files'} changed</span>
+          ${totalAdd > 0 ? `<span class="ag-fc-add">+${totalAdd}</span>` : ''}
+          ${totalDel > 0 ? `<span class="ag-fc-del">-${totalDel}</span>` : ''}
+          <span class="ag-fc-chev" aria-hidden="true"></span>
+        </summary>
+        <ul class="ag-fc-list">${rows}</ul>
+      </details>`;
+      const sig = list.map((f) => `${f.path}:${f.added}:${f.deleted}`).join('|');
+      timeline.push({ key: `fc:${turnKey}`, sig, html });
+      turnFiles = new Map();
+    };
+
+    const ensureWork = (id, tsMs) => {
+      if (!curWork) {
+        curWork = { firstId: id, minMs: tsMs, maxMs: tsMs, steps: 0, tools: 0, parts: [], lastSig: '' };
+      } else if (Number.isFinite(tsMs)) {
+        curWork.minMs = Number.isFinite(curWork.minMs) ? Math.min(curWork.minMs, tsMs) : tsMs;
+        curWork.maxMs = Number.isFinite(curWork.maxMs) ? Math.max(curWork.maxMs, tsMs) : tsMs;
+      }
+      return curWork;
+    };
+
+    for (const msg of messages) {
+      if (!msg) continue;
+      if (msg.compacted) {
+        flushWork();
+        const cmpHtml = '<div class="ag-compacted" role="separator"><span>Context compacted</span></div>';
+        timeline.push({ key: `cmp:${msg.id}`, sig: '1', html: cmpHtml });
+      }
+      const tsMs = normalizeTsMs(msg.timestampMs ?? msg.timestamp ?? msg.ts);
+      const tsStr = Number.isFinite(tsMs) ? fmtClock(tsMs) : '';
+      const tsTitle = Number.isFinite(tsMs) ? fmtFull(tsMs) : '';
+
+      if (msg.role === 'system') {
+        flushWork();
+        const dKey = `sys:${name}:${msg.id}`;
+        const isOpen = state.agentDetailsOpen.has(dKey);
+        const sysHtml = `<details class="ag-sys" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
+          <summary>System / Role brief${tsStr ? ` · <span title="${esc(tsTitle)}">${esc(tsStr)}</span>` : ''}</summary>
+          <div class="ag-sys-body md">${md(msg.content || '')}</div>
+        </details>`;
+        timeline.push({ key: `sys:${msg.id}`, sig: `${msg.id}|${String(msg.content || '').length}`, html: sysHtml });
+        continue;
+      }
+
+      if (msg.role === 'tool') {
+        if (msg.toolCallId && pairedToolIds.has(msg.toolCallId)) continue;
+        const w = ensureWork(msg.id, tsMs);
+        w.tools += 1;
+        const dKey = `tool:${name}:${msg.id}`;
+        w.parts.push(renderToolCardHtml(name, dKey, msg.toolName || 'tool', '', msg, { st }));
+        w.lastSig = `t:${msg.id}`;
+        continue;
+      }
+
+      if (msg.role === 'user') {
+        flushWork();
+        flushFiles();
+        turnKey = String(msg.id);
+        const { systemBrief, taskText } = unwrapUserPrompt(msg.content || '');
+        const sysDKey = `usys:${name}:${msg.id}`;
+        const sysOpen = state.agentDetailsOpen.has(sysDKey);
+        const sysDisclosure = systemBrief
+          ? `<details class="ag-sys ag-sys-inline" data-ag-dkey="${esc(sysDKey)}"${sysOpen ? ' open' : ''}>
+              <summary>System / Role brief</summary>
+              <div class="ag-sys-body md">${md(systemBrief)}</div>
+            </details>`
+          : '';
+        const uHtml = `<div class="ag-user-wrap" data-testid="ag-user-prompt">
+          ${sysDisclosure}
+          <div class="ag-user-pill md">${md(taskText)}</div>
+          ${tsStr ? `<div class="ag-user-meta"><span class="ag-msg-ts" title="${esc(tsTitle)}">${esc(tsStr)}</span></div>` : ''}
+        </div>`;
+        timeline.push({ key: `u:${msg.id}`, sig: `${msg.id}|${taskText.length}|${systemBrief.length}`, html: uHtml });
+        continue;
+      }
+
+      // assistant
+      const tcs = Array.isArray(msg.toolCalls) ? msg.toolCalls : [];
+      const hasWork = Boolean(msg.reasoning || tcs.length > 0);
+      if (hasWork) {
+        const w = ensureWork(msg.id, tsMs);
+        w.steps += 1;
+        if (msg.reasoning) {
+          const dKey = `think:${name}:${msg.id}`;
+          const isOpen = state.agentDetailsOpen.has(dKey);
+          const rTok = Number(msg.reasoningTokens) || 0;
+          w.parts.push(`<details class="ag-think" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
+            <summary>Thought process${rTok > 0 ? ` · ${fmtTokCompact(rTok)} tok` : ''}</summary>
+            <div class="ag-think-body md">${md(msg.reasoning)}</div>
+          </details>`);
+        }
+        for (let i = 0; i < tcs.length; i++) {
+          const tc = tcs[i] || {};
+          const tcId = tc.id || tc.toolCallId || '';
+          if (tcId) committedToolCallIds.add(tcId);
+          const tcName = tc.name || tc.function?.name || 'tool';
+          const tcArgs = tc.arguments ?? tc.function?.arguments ?? tc.args ?? '';
+          const resMsg = tcId ? toolResultsById.get(tcId) : null;
+          let tcDur = NaN;
+          if (resMsg) {
+            if (tcId) pairedToolIds.add(tcId);
+            const resMs = normalizeTsMs(resMsg.timestampMs ?? resMsg.timestamp ?? resMsg.ts);
+            if (Number.isFinite(resMs) && Number.isFinite(tsMs)) {
+              tcDur = Math.max(0, resMs - tsMs);
+              w.maxMs = Number.isFinite(w.maxMs) ? Math.max(w.maxMs, resMs) : resMs;
+            }
+          }
+          recordFileChange(extractToolFileChange(tcName, tcArgs, resMsg));
+          w.tools += 1;
+          const dKey = `tc:${name}:${msg.id}:${tcId || i}`;
+          w.parts.push(renderToolCardHtml(name, dKey, tcName, tcArgs, resMsg, { st, durationMs: tcDur }));
+        }
+        w.lastSig = `a:${msg.id}:${w.tools}:${String(msg.reasoning || '').length}`;
+      }
+
+      if (msg.content && String(msg.content).trim()) {
+        flushWork();
+        const rawReply = String(msg.content);
+        const rHtml = `<div class="ag-reply-wrap" data-ag-msg-id="${esc(msg.id)}">
+          <div class="ag-reply md">${md(rawReply)}</div>
+          <div class="ag-reply-foot">
+            <button type="button" class="ghost-btn sm ag-reply-copy" data-copy-reply>Copy</button>
+            ${tsStr ? `<span class="ag-msg-ts" title="${esc(tsTitle)}">${esc(tsStr)}</span>` : ''}
+          </div>
+        </div>`;
+        timeline.push({ key: `r:${msg.id}`, sig: `${msg.id}|${rawReply.length}|${tsStr}`, html: rHtml });
+      }
+    }
+
+    flushWork();
+    flushFiles();
+    return { timeline, committedToolCallIds };
+  }
+
+  function reconcileCommitted(committedEl, timeline) {
+    const existingByKey = new Map();
+    for (const child of [...committedEl.children]) {
+      if (child.dataset?.agKey) existingByKey.set(child.dataset.agKey, child);
+      else child.remove();
+    }
+    const desiredKeys = new Set(timeline.map((b) => b.key));
+    for (const [k, node] of existingByKey) {
+      if (!desiredKeys.has(k)) node.remove();
+    }
+    let cursor = committedEl.firstElementChild;
+    for (const item of timeline) {
+      let node = existingByKey.get(item.key);
+      if (!node) {
+        const tmp = document.createElement('div');
+        tmp.innerHTML = item.html;
+        node = tmp.firstElementChild;
+        if (!node) continue;
+        node.dataset.agKey = item.key;
+        node.dataset.agSig = item.sig;
+        committedEl.insertBefore(node, cursor);
+        continue;
+      }
+      if (node.dataset.agSig !== item.sig) {
+        const wasCursor = cursor === node;
+        const tmp = document.createElement('div');
+        tmp.innerHTML = item.html;
+        const fresh = tmp.firstElementChild;
+        if (fresh) {
+          fresh.dataset.agKey = item.key;
+          fresh.dataset.agSig = item.sig;
+          committedEl.replaceChild(fresh, node);
+          node = fresh;
+          if (wasCursor) cursor = fresh;
+        }
+      }
+      if (node !== cursor) {
+        committedEl.insertBefore(node, cursor);
+      } else {
+        cursor = cursor.nextElementSibling;
+      }
+    }
+  }
+
+  function renderLiveTailHtml(name, data, st, committedToolCallIds) {
+    if (st !== 'working') return '';
+    const live = data.live && typeof data.live === 'object' ? data.live : null;
+    const tel = data.telemetry || {};
+    const m = memberOf(name);
+    const curLabel = formatCurrentToolLabel(live?.currentTool ?? tel.currentTool) || (m?.activity ? String(m.activity) : '');
+    const trace = Array.isArray(live?.toolTrace) ? live.toolTrace : [];
+    const liveTools = trace.filter((tc) => {
+      const tcId = tc?.toolCallId || tc?.id || '';
+      return !tcId || !committedToolCallIds.has(tcId);
+    });
+    const elapsedMs = Number(live?.elapsedMs);
+    const durSuffix = Number.isFinite(elapsedMs) && elapsedMs > 0 ? ` · ${fmtDur(elapsedMs)}` : '';
+    const summaryText = curLabel
+      ? `Working${durSuffix} · ${curLabel}`
+      : `Working${durSuffix || '…'}`;
+    let lastAsst = null;
+    for (let i = data.messages.length - 1; i >= 0; i--) {
+      if (data.messages[i]?.role === 'assistant') { lastAsst = data.messages[i]; break; }
+    }
+    const lastContent = String(lastAsst?.content || '').trim();
+    const lastReasoning = String(lastAsst?.reasoning || '').trim();
+    const liveReasoning = String(live?.reasoning || '').trim();
+    const liveTranscript = String(live?.transcript || '').trim();
+    const showLiveReasoning = Boolean(liveReasoning && liveReasoning !== lastReasoning);
+    const showLiveTranscript = Boolean(liveTranscript && liveTranscript !== lastContent);
+
+    const liveParts = [];
+    if (showLiveReasoning) {
+      const rKey = `live-think:${name}:${data.selectedSubagent || 'main'}`;
+      const rOpen = state.agentDetailsOpen.has(rKey);
+      liveParts.push(`<details class="ag-think" data-ag-dkey="${esc(rKey)}"${rOpen ? ' open' : ''}>
+        <summary>Thought process</summary>
+        <div class="ag-think-body md">${md(live.reasoning)}</div>
+      </details>`);
+    }
+    for (let i = 0; i < liveTools.length; i++) {
+      const tc = liveTools[i] || {};
+      const tcId = tc.toolCallId || tc.id || String(i);
+      const dKey = `live-tc:${name}:${tcId}`;
+      const tcArgs = tc.arguments ?? tc.preview ?? '';
+      const hasRes = tc.status === 'ok' || tc.status === 'error' || tc.result != null || tc.output != null;
+      const resMsg = hasRes ? { content: tc.result ?? tc.output ?? '', status: tc.status } : null;
+      liveParts.push(renderToolCardHtml(name, dKey, tc.name || 'tool', tcArgs, resMsg, {
+        st: 'working',
+        durationMs: Number.isFinite(Number(tc.durationMs)) ? Number(tc.durationMs) : NaN,
+      }));
+    }
+    const wgKey = `live-wg:${name}:${data.selectedSubagent || 'main'}`;
+    const wgOpen = state.agentDetailsOpen.has(wgKey);
+    const workHtml = `<details class="ag-work-group ag-live-work" data-ag-dkey="${esc(wgKey)}"${wgOpen ? ' open' : ''}>
+      <summary><span class="live-dot" aria-hidden="true"></span><span class="animate-shimmer-text">${esc(summaryText)}</span>${liveParts.length ? '<span class="ag-work-chev" aria-hidden="true"></span>' : ''}</summary>
+      ${liveParts.length ? `<div class="ag-work-rail">${liveParts.join('')}</div>` : ''}
+    </details>`;
+    const transcriptHtml = showLiveTranscript
+      ? `<div class="ag-reply ag-live-reply md">${md(live.transcript)}</div>`
+      : '';
+    return workHtml + transcriptHtml;
+  }
+
+  function renderAgentPane(name, { olderRestore = null } = {}) {
     const header = $('agent-header');
     const feed = $('agent-feed');
     const foot = $('agent-live-foot');
     if (!header || !feed || !foot) return;
 
+    let committed = $('agent-committed');
+    let liveTail = $('agent-live-tail');
+    if (!committed || !liveTail) {
+      feed.innerHTML = '<div id="agent-committed" class="agent-committed" data-testid="swarm-agent-committed"></div>' +
+        '<div id="agent-live-tail" class="agent-live-tail hidden" data-testid="swarm-agent-live-tail" aria-live="polite"></div>';
+      committed = $('agent-committed');
+      liveTail = $('agent-live-tail');
+    }
+
     const data = ensureAgentData(name);
     const m = memberOf(name);
     const tel = data.telemetry || {};
-    const st = tel.state || (m?.killed ? 'killed' : (m?.status || 'waiting'));
+    const st = effectiveAgentStatus(name, data, m);
     const model = tel.model || m?.model || '';
     const tok = (tel.tokens && typeof tel.tokens === 'object') ? tel.tokens : (m?.tokens || {});
     const processed = Number(tok.totalProcessed ?? tok.total) || 0;
@@ -3110,12 +3940,14 @@
           ${data.subagents.map((s) => {
             const sid = String(s.sessionId || s.id || '');
             const lbl = String(s.label || s.title || sid.slice(0, 12));
-            return `<button type="button" class="agent-sub-pill ${data.selectedSubagent === sid ? 'active' : ''}" data-sub-id="${esc(sid)}" title="${esc(sid)}">${esc(lbl)}</button>`;
+            const sSt = normalizeAgentStatus(s.state || s.status || 'waiting', false);
+            const stepsStr = Number(s.steps) > 0 ? ` · ${s.steps}` : '';
+            return `<button type="button" class="agent-sub-pill ${data.selectedSubagent === sid ? 'active' : ''}" data-sub-id="${esc(sid)}" title="${esc(sid)}"><span class="agent-sub-dot ${esc(sSt)}" aria-hidden="true"></span><span>${esc(lbl)}${esc(stepsStr)}</span></button>`;
           }).join('')}
         </div>`
       : '';
 
-    header.innerHTML = `
+    const headHtml = `
       <div class="agent-head-top">
         <div class="agent-head-id">
           ${avatar}
@@ -3141,132 +3973,72 @@
         ${tps > 0 ? `<span>${tpsEst ? '~' : ''}${esc(fmtTpsCompact(tps))}</span>` : ''}
       </div>
       ${subPills}`;
+    if (header.innerHTML !== headHtml) header.innerHTML = headHtml;
 
     const wasNearBottom = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 60;
     const prevTop = feed.scrollTop;
 
+    let committedToolIds = new Set();
     if (data.loading && !data.messages.length) {
-      feed.innerHTML = '<div class="ag-empty">Loading agent history…</div>';
+      const loadHtml = '<div class="ag-empty">Loading agent history…</div>';
+      if (data.lastCommittedSig !== 'loading') {
+        data.lastCommittedSig = 'loading';
+        committed.innerHTML = loadHtml;
+      }
     } else if (data.error && !data.messages.length) {
-      feed.innerHTML = `<div class="ag-empty">${esc(data.error)}</div>`;
+      const errSig = `err:${data.error}`;
+      if (data.lastCommittedSig !== errSig) {
+        data.lastCommittedSig = errSig;
+        committed.innerHTML = `<div class="ag-empty">${esc(data.error)}</div>`;
+      }
     } else if (!data.messages.length) {
-      feed.innerHTML = '<div class="ag-empty">No session history recorded yet.</div>';
+      if (data.lastCommittedSig !== 'empty') {
+        data.lastCommittedSig = 'empty';
+        committed.innerHTML = '<div class="ag-empty">No session history recorded yet.</div>';
+      }
     } else {
-      const toolResultsById = new Map();
-      for (const msg of data.messages) {
-        if (msg.role === 'tool' && msg.toolCallId) {
-          toolResultsById.set(msg.toolCallId, msg);
-        }
+      const { timeline, committedToolCallIds } = groupAgentTimeline(data.messages, { name, st });
+      committedToolIds = committedToolCallIds;
+      const cSig = timeline.map((b) => `${b.key}=${b.sig}`).join('\n');
+      if (data.lastCommittedSig !== cSig) {
+        data.lastCommittedSig = cSig;
+        reconcileCommitted(committed, timeline);
       }
-      const pairedToolIds = new Set();
-      const blocks = [];
-
-      for (const msg of data.messages) {
-        if (msg.compacted) {
-          blocks.push('<div class="ag-compacted" role="separator"><span>Context compacted</span></div>');
-        }
-        const tsStr = msg.timestamp ? fmtClock(new Date(msg.timestamp).getTime()) : '';
-        if (msg.role === 'system') {
-          const dKey = `sys:${name}:${msg.id}`;
-          const isOpen = state.agentDetailsOpen.has(dKey);
-          blocks.push(`<details class="ag-sys" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
-            <summary>System / Role brief${tsStr ? ` · ${esc(tsStr)}` : ''}</summary>
-            <div class="ag-sys-body md">${md(msg.content || '')}</div>
-          </details>`);
-          continue;
-        }
-        if (msg.role === 'tool') {
-          if (msg.toolCallId && pairedToolIds.has(msg.toolCallId)) continue;
-          const dKey = `tool:${name}:${msg.id}`;
-          const isOpen = state.agentDetailsOpen.has(dKey);
-          const outStr = formatJsonOrText(msg.content || '');
-          const isErr = /^error[:\s]/i.test(outStr.trim());
-          blocks.push(`<details class="ag-tool-card" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
-            <summary>
-              <span class="ag-tool-name">${esc(msg.toolName || 'tool')}</span>
-              <span class="ag-tool-prev">${esc(outStr.slice(0, 80))}</span>
-              <span class="ag-tool-status ${isErr ? 'error' : 'ok'}">${isErr ? 'error' : 'ok'}</span>
-            </summary>
-            <div class="ag-tool-detail">
-              <div><div class="ag-tool-sec-lbl">Output</div><pre class="ag-tool-pre">${esc(outStr || '(empty)')}</pre></div>
-            </div>
-          </details>`);
-          continue;
-        }
-        if (msg.role === 'user') {
-          blocks.push(`<div class="ag-msg">
-            <div class="ag-msg-meta"><span class="ag-msg-role">Prompt</span>${tsStr ? `<span class="ag-msg-ts">${esc(tsStr)}</span>` : ''}</div>
-            <div class="ag-user-msg md">${md(msg.content || '')}</div>
-          </div>`);
-          continue;
-        }
-        // assistant
-        const parts = [];
-        if (msg.reasoning) {
-          const dKey = `think:${name}:${msg.id}`;
-          const isOpen = state.agentDetailsOpen.has(dKey);
-          const rTok = Number(msg.reasoningTokens) || 0;
-          parts.push(`<details class="ag-think" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
-            <summary>Thought process${rTok > 0 ? ` · ${fmtTokCompact(rTok)} tok` : ''}</summary>
-            <div class="ag-think-body md">${md(msg.reasoning)}</div>
-          </details>`);
-        }
-        if (msg.content) {
-          parts.push(`<div class="ag-reply md">${md(msg.content)}</div>`);
-        }
-        const tcs = Array.isArray(msg.toolCalls) ? msg.toolCalls : [];
-        for (let i = 0; i < tcs.length; i++) {
-          const tc = tcs[i] || {};
-          const tcId = tc.id || tc.toolCallId || '';
-          const tcName = tc.name || tc.function?.name || 'tool';
-          const tcArgs = tc.arguments ?? tc.function?.arguments ?? tc.args ?? '';
-          const resMsg = tcId ? toolResultsById.get(tcId) : null;
-          if (tcId && resMsg) pairedToolIds.add(tcId);
-          const dKey = `tc:${name}:${msg.id}:${tcId || i}`;
-          const isOpen = state.agentDetailsOpen.has(dKey);
-          const argPrev = parseToolArgsPreview(tcArgs);
-          const outStr = resMsg ? formatJsonOrText(resMsg.content || '') : '';
-          const isErr = resMsg && /^error[:\s]/i.test(outStr.trim());
-          const stLabel = resMsg ? (isErr ? 'error' : 'ok') : 'running';
-          const stCls = resMsg ? (isErr ? 'error' : 'ok') : '';
-          parts.push(`<details class="ag-tool-card" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
-            <summary>
-              <span class="ag-tool-name">${esc(tcName)}</span>
-              <span class="ag-tool-prev">${esc(argPrev)}</span>
-              <span class="ag-tool-status ${stCls}">${stLabel}</span>
-            </summary>
-            <div class="ag-tool-detail">
-              ${tcArgs ? `<div><div class="ag-tool-sec-lbl">Arguments</div><pre class="ag-tool-pre">${esc(formatJsonOrText(tcArgs))}</pre></div>` : ''}
-              ${resMsg ? `<div><div class="ag-tool-sec-lbl">Result</div><pre class="ag-tool-pre">${esc(outStr || '(empty)')}</pre></div>` : ''}
-            </div>
-          </details>`);
-        }
-        if (parts.length) {
-          blocks.push(`<div class="ag-msg">
-            <div class="ag-msg-meta"><span class="ag-msg-role">${esc(name)}</span>${tsStr ? `<span class="ag-msg-ts">${esc(tsStr)}</span>` : ''}</div>
-            ${parts.join('')}
-          </div>`);
-        }
-      }
-      feed.innerHTML = blocks.join('');
     }
 
-    if (data.stick || wasNearBottom) {
+    const tailHtml = renderLiveTailHtml(name, data, st, committedToolIds);
+    if (tailHtml) {
+      if (data.lastLiveSig !== tailHtml) {
+        data.lastLiveSig = tailHtml;
+        liveTail.innerHTML = tailHtml;
+      }
+      liveTail.classList.remove('hidden');
+    } else {
+      data.lastLiveSig = '';
+      if (!liveTail.classList.contains('hidden')) liveTail.classList.add('hidden');
+      if (liveTail.innerHTML !== '') liveTail.innerHTML = '';
+    }
+
+    if (olderRestore) {
+      feed.scrollTop = olderRestore.prevTop + Math.max(0, feed.scrollHeight - olderRestore.prevHeight);
+    } else if (data.stick || wasNearBottom) {
       feed.scrollTop = feed.scrollHeight;
     } else if (prevTop > 0) {
       feed.scrollTop = prevTop;
     }
 
-    if (st === 'working') {
-      const curTool = tel.currentTool || (m?.activity || 'Thinking…');
-      foot.innerHTML = `<span class="live-dot" aria-hidden="true"></span>` +
+    if (st === 'working' && !m?.killed) {
+      const curTool = formatCurrentToolLabel(tel.currentTool ?? data.live?.currentTool) || (m?.activity ? String(m.activity) : 'Thinking…');
+      const footHtml = `<span class="live-dot" aria-hidden="true"></span>` +
         `<span class="ag-live-tool">${esc(curTool)}</span>` +
         `${tps > 0 ? `<span class="ag-live-tps">${tpsEst ? '~' : ''}${esc(fmtTpsCompact(tps))}</span>` : ''}`;
+      if (foot.innerHTML !== footHtml) foot.innerHTML = footHtml;
       foot.classList.remove('hidden');
     } else {
       foot.classList.add('hidden');
       if (foot.innerHTML !== '') foot.innerHTML = '';
     }
+    updateAgentJump(name);
   }
 
   // ---------- events ----------
@@ -3369,7 +4141,11 @@
       data.selectedSubagent = subBtn.dataset.subId || '';
       data.messages = [];
       data.lastId = 0;
+      data.live = null;
+      data.lastCommittedSig = '';
+      data.lastLiveSig = '';
       data.stick = true;
+      data.hasNewWhileScrolled = false;
       fetchAgentHistory(name, { incremental: false });
     }
   });
@@ -3379,6 +4155,47 @@
     if (d.open) state.agentDetailsOpen.add(d.dataset.agDkey);
     else state.agentDetailsOpen.delete(d.dataset.agDkey);
   }, true);
+  $('agent-feed')?.addEventListener('click', async (e) => {
+    const copyCodeBtn = e.target.closest('[data-copy-code]');
+    if (copyCodeBtn) {
+      const codeEl = copyCodeBtn.closest('.ag-codeblock')?.querySelector('pre code');
+      const ok = await copyText(codeEl?.textContent || '');
+      copyCodeBtn.textContent = ok ? 'Copied' : 'Failed';
+      setTimeout(() => { copyCodeBtn.textContent = 'Copy'; }, 1200);
+      return;
+    }
+    const copyReplyBtn = e.target.closest('[data-copy-reply]');
+    if (copyReplyBtn) {
+      const replyEl = copyReplyBtn.closest('.ag-reply-wrap')?.querySelector('.ag-reply');
+      const ok = await copyText(replyEl?.innerText || replyEl?.textContent || '');
+      copyReplyBtn.textContent = ok ? 'Copied' : 'Failed';
+      setTimeout(() => { copyReplyBtn.textContent = 'Copy'; }, 1200);
+      return;
+    }
+    const fileBtn = e.target.closest('[data-ag-file]');
+    if (fileBtn) {
+      const uri = resolveAllowedFileUri(fileBtn.dataset.agFile || '');
+      if (uri && window.sidecar?.ui?.toggleAuxPane) {
+        window.sidecar.ui.toggleAuxPane({ tabType: 'fileView', uri });
+      }
+      return;
+    }
+  });
+  $('agent-jump-live')?.addEventListener('click', () => {
+    if (!state.tab.startsWith('agent:')) return;
+    const name = state.tab.slice(6);
+    const data = state.agentTabData[name];
+    const af = $('agent-feed');
+    if (data) {
+      data.stick = true;
+      data.hasNewWhileScrolled = false;
+    }
+    if (af) {
+      if (typeof af.scrollTo === 'function') af.scrollTo({ top: af.scrollHeight, behavior: 'smooth' });
+      else af.scrollTop = af.scrollHeight;
+    }
+    updateAgentJump(name);
+  });
   $('agent-feed')?.addEventListener('scroll', () => {
     if (!state.tab.startsWith('agent:')) return;
     const name = state.tab.slice(6);
@@ -3386,6 +4203,8 @@
     const af = $('agent-feed');
     if (data && af) {
       data.stick = af.scrollTop + af.clientHeight >= af.scrollHeight - 60;
+      if (data.stick) data.hasNewWhileScrolled = false;
+      updateAgentJump(name);
     }
   }, { passive: true });
 
@@ -3437,7 +4256,15 @@
     renderFeed();
     $('agents').querySelector(`[data-agent="${CSS.escape(name)}"]`)?.focus();
   });
-  $('feed').addEventListener('click', (e) => {
+  $('feed').addEventListener('click', async (e) => {
+    const copyCodeBtn = e.target.closest('[data-copy-code]');
+    if (copyCodeBtn) {
+      const codeEl = copyCodeBtn.closest('.ag-codeblock')?.querySelector('pre code');
+      const ok = await copyText(codeEl?.textContent || '');
+      copyCodeBtn.textContent = ok ? 'Copied' : 'Failed';
+      setTimeout(() => { copyCodeBtn.textContent = 'Copy'; }, 1200);
+      return;
+    }
     if (e.target.closest('[data-show-older]')) {
       const feed = $('feed');
       const prevH = feed.scrollHeight;
