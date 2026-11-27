@@ -1,14 +1,15 @@
 # hermes-swarm-bridge
 
-Antigravity ↔ Hermes interoperability plugin exposing first-class Swarm Board tools for Hermes Agent workers collaborating with Antigravity IDE sessions.
+Antigravity <-> Hermes interoperability plugin exposing first-class Swarm Board tools and compaction-safe lifecycle hooks for Hermes Agent workers collaborating with Antigravity IDE sessions.
 
-> **Companion Requirement:** This Hermes-side plugin pairs with **Antigravity IDE** + the companion Antigravity plugin (`packages/antigravity-plugin`) and local MCP bridge (`packages/mcp-server`) from [antigravity-hermes-bridge](https://github.com/MAHDI-AQ/antigravity-hermes-bridge). When used without an active `HERMES_SWARM_ID` worker session, hooks stay dormant while keeping tool discovery intact.
+> **Companion Requirement:** This Hermes-side plugin pairs with **Antigravity IDE**, the companion Antigravity plugin (`packages/antigravity-plugin`), and the local MCP + HTTP bridge (`packages/mcp-server`) from [antigravity-hermes-bridge](https://github.com/MAHDI-AQ/antigravity-hermes-bridge). Outside a swarm session (when `HERMES_SWARM_ID` is unset), tools register cleanly for gateway/per-turn routing while hooks stay dormant.
 
-## Disclosure (Privacy, Network & Storage)
+## Disclosure (Privacy, Network, Storage & Execution)
 
-- **Network:** Communicates strictly over loopback (`127.0.0.1`) with the local Swarm HTTP bridge specified by `HERMES_SWARM_HTTP_URL` using the per-swarm Bearer token (`HERMES_SWARM_HTTP_TOKEN` or `HERMES_SWARM_TOKEN_FILE`). Makes zero external network requests.
-- **Local Storage:** Falls back atomically to `board.json`, `board_archive.jsonl`, `board.lock`, and capped `logs/bridge.jsonl` inside `HERMES_SWARM_BOARD_DIR`.
-- **Dependencies:** Pure Python standard library (`zero` pip packages). Does not transmit credentials or prompts off-machine.
+- **Network:** Communicates strictly over loopback (`127.0.0.1`) with the local Swarm HTTP server configured via `HERMES_SWARM_HTTP_URL`, using the per-swarm ephemeral Bearer token from `HERMES_SWARM_HTTP_TOKEN` or `HERMES_SWARM_TOKEN_FILE`. Makes zero external internet requests and sends zero prompts or telemetry off-machine.
+- **Credentials:** Never reads `.env` files, Hermes `auth.json`, browser profiles, keychains, or any third-party credential store.
+- **Local Storage:** When HTTP is unavailable or unconfigured, falls back atomically using `board.lock` and JSON replacement on `board.json` and `board_archive.jsonl` inside `HERMES_SWARM_BOARD_DIR`. Best-effort structured JSONL diagnostics rotate at `1 MiB` inside `<swarm_dir>/logs/bridge.jsonl`.
+- **Dependencies & Execution:** Pure Python standard library (`zero` pip dependencies, `zero` compiled binaries, `zero` self-updating code). Does not spawn background daemons, modify Hermes core modules at runtime, or auto-approve/bypass Hermes permission gates (`swarm_wait` sleeps in-process via `threading.Event.wait`).
 
 ## Registration & Activation Gate
 
