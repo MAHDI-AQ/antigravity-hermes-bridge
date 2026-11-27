@@ -1,6 +1,6 @@
 name: hermes-swarm-bridge
 version: "1.0.0"
-description: "Native Hermes worker bridge for the Swarm Board: first-class swarm_post, swarm_read, swarm_claim, swarm_release, swarm_status, swarm_wait, and swarm_channel tools inside swarm worker sessions."
+description: "Antigravity <-> Hermes interoperability bridge: connects Hermes Agent workers to an Antigravity IDE companion session via first-class swarm_post, swarm_read, swarm_claim, swarm_release, swarm_status, swarm_wait, and swarm_channel tools."
 author: "Hermes Swarm Contributors"
 license: MIT
 kind: standalone

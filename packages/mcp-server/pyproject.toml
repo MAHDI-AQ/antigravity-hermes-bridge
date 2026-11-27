@@ -43,9 +43,9 @@ hermes-swarm-mcp = "server:main"
 hermes-swarm-board = "board_cli:main"
 
 [project.urls]
-Homepage = "https://github.com/MAHDI-AQ/hermes-swarm"
-Repository = "https://github.com/MAHDI-AQ/hermes-swarm"
-Issues = "https://github.com/MAHDI-AQ/hermes-swarm/issues"
+Homepage = "https://github.com/MAHDI-AQ/antigravity-hermes-bridge"
+Repository = "https://github.com/MAHDI-AQ/antigravity-hermes-bridge"
+Issues = "https://github.com/MAHDI-AQ/antigravity-hermes-bridge/issues"
 
 [tool.hatch.build.targets.wheel]
 include = [

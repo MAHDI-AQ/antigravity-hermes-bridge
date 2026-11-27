@@ -1,6 +1,6 @@
-# AGENTS.md — Agent Guide for `hermes-swarm`
+# AGENTS.md — Agent Guide for `antigravity-hermes-bridge`
 
-> Universal context and verification instructions for AI coding agents working in or installing `hermes-swarm`.
+> Universal context and verification instructions for AI coding agents working in or installing `antigravity-hermes-bridge` (`hermes-swarm`).
 
 ## Repository Structure
 

@@ -1,6 +1,6 @@
 # AI Agent Installation Playbook
 
-> Deterministic, idempotent installation workflow designed for AI coding agents (Antigravity, Hermes Agent, Claude Code, Codex, Cursor).
+> Deterministic, idempotent installation workflow designed for AI coding agents (Antigravity, Hermes Agent, Claude Code, Codex, Cursor). Also supports native per-side installs via `agy plugin install ./packages/antigravity-plugin` and `hermes plugins install`.
 
 ## Step 1 — Pre-Flight Check
 

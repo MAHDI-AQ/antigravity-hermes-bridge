@@ -44,6 +44,8 @@ TEXT_SUFFIXES = {
 ALLOWLIST_SUBSTRINGS = (
     "github.com/MAHDI-AQ/hermes-swarm",
     "https://github.com/MAHDI-AQ/hermes-swarm",
+    "github.com/MAHDI-AQ/antigravity-hermes-bridge",
+    "https://github.com/MAHDI-AQ/antigravity-hermes-bridge",
 )
 
 FORBIDDEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [

@@ -1,0 +1,39 @@
+# Ready-to-submit Hermes Marketplace catalog entry for NousResearch/hermes-agent:
+#   Copy to `plugin-catalog/antigravity-hermes-bridge.yaml` in your fork of `NousResearch/hermes-agent`,
+#   replace `<PINNED_40_CHAR_COMMIT_SHA>` with the target verified commit on `main`,
+#   optionally add clean `screenshots:` URLs once captured, and open the PR.
+name: antigravity-hermes-bridge
+title: Antigravity <-> Hermes Bridge
+repo: https://github.com/MAHDI-AQ/antigravity-hermes-bridge
+sha: "<PINNED_40_CHAR_COMMIT_SHA>"
+subdir: packages/hermes-bridge
+description: >-
+  Antigravity <-> Hermes interoperability bridge for heterogeneous and local-model
+  agent teams. Exposes first-class swarm_post, swarm_read, swarm_claim,
+  swarm_release, swarm_status, swarm_wait, and swarm_channel tools plus
+  compaction-safe hooks inside Hermes Agent workers collaborating with an
+  Antigravity IDE session. Pairs with Antigravity IDE and the companion
+  Antigravity plugin + MCP server in the same repository.
+  Disclosure: communicates strictly over loopback (127.0.0.1) with the local
+  MCP bridge at HERMES_SWARM_HTTP_URL using a per-swarm Bearer token, with
+  atomic file-locked fallback inside HERMES_SWARM_BOARD_DIR; pure Python
+  stdlib with zero external network calls, telemetry, or credentials sent off-machine.
+maintainer: <YOUR_GITHUB_HANDLE>
+tier: community
+category: tools
+requires_hermes: ">=0.21.4"
+version: "1.0.0"
+docs_url: https://github.com/MAHDI-AQ/antigravity-hermes-bridge/blob/main/packages/hermes-bridge/README.md
+platforms: []
+capabilities:
+  provides_tools:
+    - swarm_post
+    - swarm_read
+    - swarm_claim
+    - swarm_release
+    - swarm_status
+    - swarm_wait
+    - swarm_channel
+  provides_hooks: []
+  provides_middleware: []
+  requires_env: []

@@ -1,7 +1,15 @@
 {
   "name": "hermes-swarm",
-  "displayName": "Hermes Swarm",
-  "description": "3-tier AI engineering swarm: Primary Antigravity, Coordinator subagent + Hermes A2A workers, and leaf subagents.",
+  "displayName": "Antigravity <-> Hermes Bridge",
+  "description": "Antigravity <-> Hermes interoperability bridge connecting Antigravity IDE workflows with local, open-weight, and multi-provider Hermes Agent workers.",
   "version": "2.0.0",
-  "logo": "assets/logo.svg"
+  "author": "Hermes Swarm Contributors",
+  "homepage": "https://github.com/MAHDI-AQ/antigravity-hermes-bridge",
+  "repository": "https://github.com/MAHDI-AQ/antigravity-hermes-bridge",
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "Connect Hermes workers to collaborate alongside Antigravity on this workspace",
+    "Check live Hermes worker conversation tabs, tool calls, and token telemetry",
+    "Run parallel isolated workstreams across local and custom-provider Hermes models"
+  ]
 }

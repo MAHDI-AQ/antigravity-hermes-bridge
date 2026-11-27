@@ -1,15 +1,15 @@
 <div align="center">
 
-# Hermes Swarm
+# Antigravity ↔ Hermes Bridge (`hermes-swarm`)
 
-**3-Tier Multi-Agent Orchestration for Antigravity IDE + Hermes Agent**
+**An Antigravity ↔ Hermes Interoperability Bridge for Heterogeneous & Local-Model Agent Teams**
 
-[![CI](https://github.com/MAHDI-AQ/hermes-swarm/actions/workflows/ci.yml/badge.svg)](https://github.com/MAHDI-AQ/hermes-swarm/actions/workflows/ci.yml)
+[![CI](https://github.com/MAHDI-AQ/antigravity-hermes-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/MAHDI-AQ/antigravity-hermes-bridge/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB.svg)](https://www.python.org/)
 [![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933.svg)](https://nodejs.org/)
 
-*Orchestrate parallel AI coding workers with scoped edit locks, event-driven wakeups, full billable token-economy telemetry, sticky high-volume board feeds, and live click-to-inspect worker history tabs.*
+*Pair Antigravity IDE workflows with local, open-weight, and custom-provider Hermes Agent workers — featuring scoped file locks, event-driven wakeups, billable token-economy telemetry, sticky high-volume board feeds, and live read-only worker conversation tabs.*
 
 [Quick Start](#-quick-start) · [Install with an AI Agent](#-install-with-your-ai-agent) · [Architecture](docs/ARCHITECTURE.md) · [UI Guide](docs/UI_GUIDE.md) · [Configuration](docs/CONFIGURATION.md)
 
@@ -17,9 +17,9 @@
 
 ---
 
-## Why Hermes Swarm?
+## Why Bridge Antigravity & Hermes?
 
-Running multiple autonomous AI coding agents reliably requires more than spawning background shells. **Hermes Swarm** combines an Antigravity IDE plugin + Web UI sidecar, a Python MCP + A2A runtime server, and a zero-dependency Hermes Agent plugin into one cohesive control plane:
+Teams often want Antigravity IDE for architecture, code review, and interactive UX while running heavy coding, testing, or batch workloads across Hermes Agent with local weights, custom providers, or specialized profiles. **Antigravity ↔ Hermes Bridge** (`hermes-swarm`) links both ecosystems cleanly through one MCP + A2A control plane without modifying either core tool:
 
 - **3-Tier Session-Bound Topology (`1 Conversation = 1 Swarm`):**
   - **Tier 1 (User + Primary IDE Agent):** Sets goals, initializes the conversation's isolated swarm, spawns one Coordinator subagent, and receives final verified deliverables.
@@ -57,19 +57,19 @@ flowchart LR
 - **Node.js `>= 20`** (for the Antigravity sidecar)
 - **Antigravity IDE** and **Hermes Agent (`>= 0.21.4`)** installed locally
 
-### Option A — One-Command Install
+### Option A — One-Command Install (Recommended Full Stack)
 
 **macOS / Linux:**
 ```bash
-git clone https://github.com/MAHDI-AQ/hermes-swarm.git
-cd hermes-swarm
+git clone https://github.com/MAHDI-AQ/antigravity-hermes-bridge.git
+cd antigravity-hermes-bridge
 ./scripts/install.sh
 ```
 
 **Windows (PowerShell):**
 ```powershell
-git clone https://github.com/MAHDI-AQ/hermes-swarm.git
-cd hermes-swarm
+git clone https://github.com/MAHDI-AQ/antigravity-hermes-bridge.git
+cd antigravity-hermes-bridge
 .\scripts\install.ps1
 ```
 
@@ -78,7 +78,7 @@ Then **reload Antigravity** and (if Hermes Gateway is running) restart Hermes Ga
 hermes gateway restart
 ```
 
-See [docs/INSTALL.md](docs/INSTALL.md) for custom paths, `uvx` / `pip` installation, and troubleshooting.
+> **Native Ecosystem CLIs:** You can also install the Antigravity bundle via `agy plugin install ./packages/antigravity-plugin` and the Hermes plugin via `hermes plugins install https://github.com/MAHDI-AQ/antigravity-hermes-bridge --yes-deps --enable` (alongside `packages/mcp-server` in `mcp_config.json`). See [docs/INSTALL.md](docs/INSTALL.md) for custom paths and details.
 
 ---
 
@@ -87,7 +87,7 @@ See [docs/INSTALL.md](docs/INSTALL.md) for custom paths, `uvx` / `pip` installat
 Copy and paste this into **Antigravity** or **Hermes Agent**:
 
 ```text
-Clone https://github.com/MAHDI-AQ/hermes-swarm.git, read AGENTS.md and docs/AGENT_INSTALL.md,
+Clone https://github.com/MAHDI-AQ/antigravity-hermes-bridge.git, read AGENTS.md and docs/AGENT_INSTALL.md,
 run `python scripts/install.py --non-interactive --json`, confirm `python scripts/doctor.py --json`
 returns `"ok": true`, and report any actions needed to reload Antigravity / Hermes Gateway.
 ```

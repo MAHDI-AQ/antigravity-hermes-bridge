@@ -1,6 +1,6 @@
-# Hermes Swarm
+# Antigravity <-> Hermes Bridge (`hermes-swarm`)
 
-> 3-tier multi-agent orchestration bridging Antigravity IDE and Hermes Agent with a local A2A runtime, 7-tool MCP control plane, compaction-safe Hermes bridge hooks, billable token-economy observability, and Live Agent History Tabs.
+> Antigravity <-> Hermes interoperability bridge for heterogeneous and local-model agent teams: connects Antigravity IDE workflows with Hermes Agent workers via a local A2A runtime, 7-tool MCP control plane, compaction-safe Hermes bridge hooks, billable token-economy observability, and read-only Live Worker Chat Views.
 
 ## Documentation
 

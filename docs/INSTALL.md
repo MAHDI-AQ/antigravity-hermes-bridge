@@ -1,6 +1,6 @@
 # Installation Guide
 
-Install **Hermes Swarm** in under two minutes across **Windows**, **macOS**, and **Linux / WSL2**.
+Install **Antigravity ↔ Hermes Bridge** (`hermes-swarm`) in under two minutes across **Windows**, **macOS**, and **Linux / WSL2**.
 
 ## Prerequisites
 
@@ -11,21 +11,36 @@ Install **Hermes Swarm** in under two minutes across **Windows**, **macOS**, and
 
 ---
 
-## Automatic 1-Command Install
+## Automatic 1-Command Install (Recommended Full Stack)
 
 ### macOS / Linux / WSL2
 ```bash
-git clone https://github.com/MAHDI-AQ/hermes-swarm.git
-cd hermes-swarm
+git clone https://github.com/MAHDI-AQ/antigravity-hermes-bridge.git
+cd antigravity-hermes-bridge
 ./scripts/install.sh
 ```
 
 ### Windows (PowerShell)
 ```powershell
-git clone https://github.com/MAHDI-AQ/hermes-swarm.git
-cd hermes-swarm
+git clone https://github.com/MAHDI-AQ/antigravity-hermes-bridge.git
+cd antigravity-hermes-bridge
 .\scripts\install.ps1
 ```
+
+## Preferred Native Ecosystem Commands
+
+If you prefer installing each side through its own CLI after cloning:
+
+- **Antigravity IDE side:**
+  ```bash
+  agy plugin install ./packages/antigravity-plugin
+  ```
+  *(Still register `packages/mcp-server` in `~/.gemini/antigravity/mcp_config.json`, or let `./scripts/install.sh` / `install.py` set up the MCP `.venv` and config for you.)*
+- **Hermes Agent side:**
+  ```bash
+  hermes plugins install https://github.com/MAHDI-AQ/antigravity-hermes-bridge --yes-deps --enable
+  ```
+  *(Note: installing the Hermes plugin alone adds `swarm_*` tools and lifecycle hooks inside Hermes; pairing it with Antigravity IDE + `packages/mcp-server` from this repo provides the full bridge.)*
 
 ### What `install.py` Does Automatically
 1. Copies `packages/mcp-server` into `~/.local/share/hermes-swarm/mcp-server` (or `$HERMES_SWARM_MCP_HOME`), preserving any existing `state/` directory on upgrades.

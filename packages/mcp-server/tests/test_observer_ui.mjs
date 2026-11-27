@@ -3955,7 +3955,7 @@ test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrap
             '| :--- | ---: |',
             '| Markdown | pass |',
             '',
-            'See [safe docs](https://github.com/MAHDI-AQ/hermes-swarm) and [bad](javascript:alert(1)).',
+            'See [safe docs](https://github.com/MAHDI-AQ/antigravity-hermes-bridge) and [bad](javascript:alert(1)).',
             '',
             '```js',
             'const ok = true;',
@@ -4101,7 +4101,7 @@ test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrap
     assert.equal(checks.hasHr, true);
     assert.equal(checks.hasCodeBlock, true);
     assert.equal(checks.codeLang, 'js');
-    assert.deepEqual(checks.links, [{ href: 'https://github.com/MAHDI-AQ/hermes-swarm', text: 'safe docs' }]);
+    assert.deepEqual(checks.links, [{ href: 'https://github.com/MAHDI-AQ/antigravity-hermes-bridge', text: 'safe docs' }]);
     assert.equal(checks.has1970, false, 'Epoch-seconds timestamps must NEVER render as 1970');
     assert.equal(checks.footVisible, true, 'TASK_STATE_WORKING must normalize to working and show live foot');
     assert.equal(checks.footText.includes('[object Object]'), false, 'currentTool object must not render [object Object]');

@@ -1,6 +1,14 @@
 # hermes-swarm-bridge
 
-Native Hermes-side plugin exposing first-class Swarm Board tools for Hermes swarm workers.
+Antigravity ↔ Hermes interoperability plugin exposing first-class Swarm Board tools for Hermes Agent workers collaborating with Antigravity IDE sessions.
+
+> **Companion Requirement:** This Hermes-side plugin pairs with **Antigravity IDE** + the companion Antigravity plugin (`packages/antigravity-plugin`) and local MCP bridge (`packages/mcp-server`) from [antigravity-hermes-bridge](https://github.com/MAHDI-AQ/antigravity-hermes-bridge). When used without an active `HERMES_SWARM_ID` worker session, hooks stay dormant while keeping tool discovery intact.
+
+## Disclosure (Privacy, Network & Storage)
+
+- **Network:** Communicates strictly over loopback (`127.0.0.1`) with the local Swarm HTTP bridge specified by `HERMES_SWARM_HTTP_URL` using the per-swarm Bearer token (`HERMES_SWARM_HTTP_TOKEN` or `HERMES_SWARM_TOKEN_FILE`). Makes zero external network requests.
+- **Local Storage:** Falls back atomically to `board.json`, `board_archive.jsonl`, `board.lock`, and capped `logs/bridge.jsonl` inside `HERMES_SWARM_BOARD_DIR`.
+- **Dependencies:** Pure Python standard library (`zero` pip packages). Does not transmit credentials or prompts off-machine.
 
 ## Registration & Activation Gate
 
