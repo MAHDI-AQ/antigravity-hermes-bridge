@@ -2051,7 +2051,11 @@ class RuntimeWorktreeAndClientTests(unittest.TestCase):
                     kill_res = await rt.kill_worker("orphan-w", reason="test sweep")
                     self.assertTrue(kill_res["killed"])
                     self.assertIn(orphan_cli.pid, kill_res["killedOrphanPids"])
-                    await asyncio.sleep(0.15)
+                    try:
+                        orphan_cli.wait(timeout=2.0)
+                    except Exception:
+                        pass
+                    self.assertIsNotNone(orphan_cli.poll())
                     self.assertFalse(_pid_running(orphan_cli.pid))
 
                     rm_res = await worktree_mod.remove_worktree(self.repo_dir, wt_dir, branch="a2a/orphan-w")
@@ -2076,12 +2080,13 @@ class RuntimeWorktreeAndClientTests(unittest.TestCase):
 
     def test_canonical_workspace_never_mutated_to_worktree(self) -> None:
         self.assertEqual(
-            Path(runtime_mod._canonical_workspace_path(str(self.repo_dir / ".worktrees" / "a2a-coder")) or ""),
-            self.repo_dir.resolve() if False else self.repo_dir,
+            Path(runtime_mod._canonical_workspace_path(str(self.repo_dir / ".worktrees" / "a2a-coder")) or "").resolve(),
+            self.repo_dir.resolve(),
         )
+        sample_root = "C:/proj/repo" if os.name == "nt" else "/proj/repo"
         self.assertEqual(
-            runtime_mod._canonical_workspace_path("C:/proj/repo/.worktrees/a2a-coder/sub"),
-            str(Path("C:/proj/repo")),
+            runtime_mod._canonical_workspace_path(f"{sample_root}/.worktrees/a2a-coder/sub"),
+            str(Path(sample_root)),
         )
 
         async def _run() -> None:
@@ -2282,10 +2287,16 @@ class RuntimeWorktreeAndClientTests(unittest.TestCase):
     def test_hermes_swarm_env_injection_and_live_bridge_plugin_e2e(self) -> None:
         import importlib.util
 
-        plugin_dir = Path(os.environ.get("HERMES_HOME") or (Path.home() / "AppData" / "Local" / "hermes")) / "plugins" / "hermes-swarm-bridge"
-        if not (plugin_dir / "__init__.py").is_file():
-            plugin_dir = Path.home() / "AppData" / "Local" / "hermes" / "plugins" / "hermes-swarm-bridge"
-        self.assertTrue((plugin_dir / "__init__.py").is_file(), f"Missing hermes-swarm-bridge plugin at {plugin_dir}")
+        sibling_plugin_dir = Path(__file__).resolve().parents[2] / "hermes-bridge"
+        env_hermes_home = Path(os.environ["HERMES_HOME"]) / "plugins" / "hermes-swarm-bridge" if os.environ.get("HERMES_HOME") else None
+        candidates = [
+            sibling_plugin_dir,
+            *( [env_hermes_home] if env_hermes_home is not None else [] ),
+            Path.home() / ".hermes" / "plugins" / "hermes-swarm-bridge",
+            Path.home() / "AppData" / "Local" / "hermes" / "plugins" / "hermes-swarm-bridge",
+        ]
+        plugin_dir = next((cand for cand in candidates if (cand / "__init__.py").is_file()), sibling_plugin_dir)
+        self.assertTrue((plugin_dir / "__init__.py").is_file(), f"Missing hermes-swarm-bridge plugin in {candidates}")
 
         spec = importlib.util.spec_from_file_location(
             "hermes_swarm_bridge_live_test",
@@ -4720,7 +4731,8 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
         try:
             win_launcher._install_safe_socketpair()
             af_unix = getattr(win_launcher.socket, "AF_UNIX", None)
-            for fam in (None, win_launcher.socket.AF_INET, af_unix):
+            families = (None, win_launcher.socket.AF_INET, af_unix) if sys.platform == "win32" else (None, af_unix)
+            for fam in families:
                 kwargs = {"family": fam} if fam is not None else {}
                 s1, s2 = win_launcher.socket.socketpair(**kwargs)
                 try:
