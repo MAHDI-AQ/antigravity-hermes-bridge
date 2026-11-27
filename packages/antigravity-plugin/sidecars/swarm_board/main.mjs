@@ -195,6 +195,9 @@ export function normalizeWorkspacePath(rawPath) {
     text = `${wsl[1].toUpperCase()}:${wsl[2] || '/'}`;
   }
   text = text.replace(/\\/g, '/').replace(/\/+$/, '');
+  if (/^\/[a-zA-Z]:(?:\/|$)/.test(text)) {
+    text = text.slice(1);
+  }
   if (/^[a-zA-Z]:/.test(text) || process.platform === 'win32') {
     return text.toLowerCase();
   }
