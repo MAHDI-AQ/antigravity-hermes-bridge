@@ -30,6 +30,16 @@ const SIDECAR_JSON_PATH = join(SIDECAR_DIR, 'sidecar.json');
 const PACKAGE_JSON_PATH = join(SIDECAR_DIR, 'package.json');
 const BOARD_UI_DIR = join(BRIDGE_DIR, 'board_ui');
 
+if (!process.env.HERMES_SWARM_SIDECAR_SDK_PATH) {
+  const sdkCandidates = [
+    resolve(SIDECAR_DIR, '../../../../../antigravity/lib/node_modules/sidecar_sdk/index.mjs'),
+    join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk', 'index.mjs'),
+  ];
+  if (!sdkCandidates.some((candidate) => existsSync(candidate))) {
+    process.env.HERMES_SWARM_SIDECAR_SDK_PATH = join(__dirname, 'mock_sidecar_sdk.mjs');
+  }
+}
+
 const sidecar = await import(pathToFileURL(MAIN_MJS_PATH).href);
 const wakeup = await import(pathToFileURL(WAKEUP_BRIDGE_PATH).href);
 

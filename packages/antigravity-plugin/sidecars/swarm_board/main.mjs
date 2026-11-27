@@ -144,10 +144,12 @@ export async function loadSidecarSdk() {
   try {
     return await import('sidecar_sdk');
   } catch {
-    for (const candidate of [
+    const candidates = [
+      process.env.HERMES_SWARM_SIDECAR_SDK_PATH,
       resolve(__dirname, '../../../../../antigravity/lib/node_modules/sidecar_sdk/index.mjs'),
       join(homedir(), '.gemini', 'antigravity', 'lib', 'node_modules', 'sidecar_sdk', 'index.mjs'),
-    ]) {
+    ].filter(Boolean);
+    for (const candidate of candidates) {
       if (existsSync(candidate)) {
         return await import(pathToFileURL(candidate).href);
       }

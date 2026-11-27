@@ -2121,7 +2121,7 @@ class RuntimeWorktreeAndClientTests(unittest.TestCase):
                 await rt.resume_worker("wt-coder", "Continue in worktree", return_immediately=False)
 
                 meta_after = mgr.store.read_meta(sid)
-                self.assertEqual(Path(meta_after["workspace"]), self.repo_dir)
+                self.assertEqual(Path(meta_after["workspace"]).resolve(), self.repo_dir.resolve())
                 self.assertNotIn(".worktrees", meta_after["workspace"])
 
                 # Even if meta.workspace was polluted with a .worktrees path, send_message heals it
@@ -2132,7 +2132,7 @@ class RuntimeWorktreeAndClientTests(unittest.TestCase):
                     return_immediately=False,
                 )
                 healed = mgr.store.read_meta(sid)
-                self.assertEqual(Path(healed["workspace"]), self.repo_dir)
+                self.assertEqual(Path(healed["workspace"]).resolve(), self.repo_dir.resolve())
 
             # MCP server tools also canonicalize worktree paths
             orig_mgr = mcp_srv._swarm_mgr
@@ -2142,8 +2142,8 @@ class RuntimeWorktreeAndClientTests(unittest.TestCase):
                 wt_sub = self.repo_dir / ".worktrees" / "a2a-wt-coder"
                 wt_sub.mkdir(parents=True, exist_ok=True)
                 ws_res = json.loads(await mcp_srv.swarm_workspace("set", workdir=str(wt_sub), swarm_id=sid))
-                self.assertEqual(Path(ws_res["workdir"]), self.repo_dir)
-                self.assertEqual(Path(ws_res["meta"]["workspace"]), self.repo_dir)
+                self.assertEqual(Path(ws_res["workdir"]).resolve(), self.repo_dir.resolve())
+                self.assertEqual(Path(ws_res["meta"]["workspace"]).resolve(), self.repo_dir.resolve())
             finally:
                 mcp_srv._swarm_mgr = orig_mgr
                 mcp_srv._session_workdir = orig_wd
