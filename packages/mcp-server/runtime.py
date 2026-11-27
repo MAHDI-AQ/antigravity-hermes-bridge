@@ -1,0 +1,4229 @@
+"""Tier-2 Hermes A2A worker runtime, process lifecycle, Tier-3 subagent tracking, and SwarmManager."""
+
+from __future__ import annotations
+
+import asyncio
+import atexit
+from datetime import datetime, timezone
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import sqlite3
+import sys
+import threading
+import time
+from typing import Any, Awaitable, Callable, TypeVar
+
+import yaml
+
+import board as board_mod
+import models
+import store
+import wakeup as wakeup_mod
+import win_launcher
+import worktree as worktree_mod
+
+_T = TypeVar("_T")
+
+MAX_PERSISTED_TASKS = 200
+_TOOL_TRACE_LIMIT = 80
+_RECENT_TOOLS_LIMIT = 12
+_SUBAGENT_RECENT_TOOLS_LIMIT = 5
+_LIVE_TRANSCRIPT_MAX_CHARS = 32_768
+_SUBPROCESS_STREAM_LIMIT = 8 * 1024 * 1024
+
+
+async def _iter_stream_lines(
+    stream: asyncio.StreamReader,
+    *,
+    max_line_bytes: int = _SUBPROCESS_STREAM_LIMIT,
+    chunk_size: int = 65536,
+):
+    """Yield `(line_bytes, was_truncated)` without raising `asyncio.LimitOverrunError`."""
+    buf = bytearray()
+    draining = False
+    truncated_prefix = b""
+    while True:
+        chunk = await stream.read(chunk_size)
+        if not chunk:
+            if draining:
+                yield truncated_prefix, True
+            elif buf:
+                yield bytes(buf), False
+            break
+        if draining:
+            nl = chunk.find(b"\n")
+            if nl != -1:
+                draining = False
+                yield truncated_prefix, True
+                truncated_prefix = b""
+                buf.extend(chunk[nl + 1 :])
+            else:
+                continue
+        else:
+            buf.extend(chunk)
+        while True:
+            nl = buf.find(b"\n")
+            if nl != -1:
+                line = bytes(buf[:nl])
+                del buf[: nl + 1]
+                yield line, False
+                continue
+            if len(buf) > max_line_bytes:
+                truncated_prefix = bytes(buf[: min(len(buf), 16384)])
+                buf.clear()
+                draining = True
+            break
+_DELEG_ID_RE = re.compile(r"\b(deleg_[A-Za-z0-9_-]+)\b")
+QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|quota|\b429\b|exhausted your capacity|rate.?limit", re.I)
+_SERVER_BOOT_TS = time.time()
+_SECRET_INPUT_KEYS = frozenset({"token", "secret", "password", "passwd", "api_key", "apikey", "authorization", "auth"})
+_PREVIEW_KEY_ORDER = (
+    "path",
+    "file_path",
+    "target_path",
+    "command",
+    "cmd",
+    "query",
+    "pattern",
+    "url",
+    "goal",
+    "task",
+    "scope",
+    "summary",
+    "action",
+    "name",
+)
+_CONTEXT_YAML_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
+_CONTEXT_YAML_LOCK = threading.Lock()
+_DEFAULT_CONTEXT_LIMITS: tuple[tuple[str, int], ...] = (
+    ("900k", 900_000),
+    ("1m", 1_000_000),
+    ("gpt-6", 272_000),
+    ("gpt-5", 272_000),
+    ("claude-", 200_000),
+    ("gemini-", 1_000_000),
+    ("deepseek-v4", 1_000_000),
+    ("deepseek", 131_072),
+    ("qwen", 131_072),
+    ("llama", 131_072),
+    ("glm", 131_072),
+    ("minimax", 204_800),
+    ("step", 256_000),
+)
+
+
+def _sanitize_tool_input(raw_input: Any) -> Any:
+    if isinstance(raw_input, str):
+        return raw_input[:1500] + ("...[truncated]" if len(raw_input) > 1500 else "")
+    if isinstance(raw_input, dict):
+        out: dict[str, Any] = {}
+        for k, v in list(raw_input.items())[:25]:
+            if isinstance(v, str) and len(v) > 1000:
+                out[k] = v[:1000] + "...[truncated]"
+            else:
+                out[k] = v
+        return out
+    return raw_input
+
+
+def _enqueue_nowait(q: asyncio.Queue[Any], item: Any) -> None:
+    try:
+        q.put_nowait(item)
+    except asyncio.QueueFull:
+        pass
+
+
+def _enqueue_drop_oldest(q: asyncio.Queue[Any], item: Any) -> None:
+    try:
+        q.put_nowait(item)
+    except asyncio.QueueFull:
+        try:
+            q.get_nowait()
+            q.put_nowait(item)
+        except Exception:
+            pass
+
+
+def _is_worktree_subpath(raw_path: str | None) -> bool:
+    if not raw_path:
+        return False
+    norm = store.normalize_local_path(str(raw_path))
+    if not norm:
+        return False
+    return any(part.lower() == ".worktrees" for part in Path(norm).parts)
+
+
+def _canonical_workspace_path(raw_path: str | None) -> str | None:
+    """Normalize a workspace path and strip any `.worktrees/<name>` suffix back to the repo root."""
+    if not raw_path or not str(raw_path).strip():
+        return None
+    norm = store.normalize_local_path(str(raw_path))
+    if not norm:
+        return None
+    p = Path(norm)
+    parts_low = [part.lower() for part in p.parts]
+    if ".worktrees" in parts_low:
+        idx = parts_low.index(".worktrees")
+        if idx > 0:
+            return str(Path(*p.parts[:idx]))
+    return norm
+
+
+def _elapsed_ms(start_iso: str | None, *, ended_at: str | None = None) -> int:
+    if not start_iso:
+        return 0
+    try:
+        dt_start = datetime.fromisoformat(str(start_iso).replace("Z", "+00:00"))
+        dt_end = (
+            datetime.fromisoformat(str(ended_at).replace("Z", "+00:00"))
+            if ended_at
+            else datetime.now(timezone.utc)
+        )
+        return max(0, int((dt_end - dt_start).total_seconds() * 1000))
+    except Exception:
+        return 0
+
+
+def _duration_seconds(start_iso: str | None, *, ended_at: str | None = None) -> int | None:
+    if not start_iso:
+        return None
+    return _elapsed_ms(start_iso, ended_at=ended_at) // 1000
+
+
+def _read_yaml_cached(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        st = path.stat()
+        mtime_ns = int(st.st_mtime_ns)
+    except OSError:
+        return {}
+    key = str(path)
+    with _CONTEXT_YAML_LOCK:
+        cached = _CONTEXT_YAML_CACHE.get(key)
+        if cached and cached[0] == mtime_ns:
+            return cached[1]
+    try:
+        parsed = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
+        data = parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        data = {}
+    with _CONTEXT_YAML_LOCK:
+        _CONTEXT_YAML_CACHE[key] = (mtime_ns, data)
+    return data
+
+
+def _resolve_context_limit(
+    model: str | None,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> int:
+    """Resolve model context limit cleanly from local Hermes caches/config without network calls."""
+    model_str = str(model or "").strip()
+    model_low = model_str.lower()
+    base_clean = str(base_url or "").strip().rstrip("/").lower()
+    hhome = store.default_hermes_home()
+
+    cache_doc = _read_yaml_cached(hhome / "context_length_cache.yaml")
+    ctx_map = cache_doc.get("context_lengths") if isinstance(cache_doc.get("context_lengths"), dict) else {}
+    if model_low and ctx_map:
+        if base_clean:
+            for k, v in ctx_map.items():
+                if str(k).rstrip("/").lower() == f"{model_low}@{base_clean}":
+                    try:
+                        return max(0, int(v))
+                    except (TypeError, ValueError):
+                        pass
+        for k, v in ctx_map.items():
+            kl = str(k).lower()
+            head = kl.split("@", 1)[0]
+            if head == model_low or head.endswith(f"/{model_low}"):
+                try:
+                    return max(0, int(v))
+                except (TypeError, ValueError):
+                    pass
+
+    cfg_doc = _read_yaml_cached(hhome / "config.yaml")
+    if isinstance(cfg_doc, dict):
+        for cp in cfg_doc.get("custom_providers") or []:
+            if not isinstance(cp, dict):
+                continue
+            models_dict = cp.get("models")
+            if isinstance(models_dict, dict):
+                for mk, mv in models_dict.items():
+                    if str(mk).lower() == model_low and isinstance(mv, dict) and mv.get("context_length"):
+                        try:
+                            return max(0, int(mv["context_length"]))
+                        except (TypeError, ValueError):
+                            pass
+        m_sec = cfg_doc.get("model")
+        if isinstance(m_sec, dict):
+            m_providers = m_sec.get("providers")
+            prov_entries: list[dict[str, Any]] = []
+            if isinstance(m_providers, dict):
+                for pk, pv in m_providers.items():
+                    if isinstance(pv, dict):
+                        prov_entries.append(pv)
+                        if str(pk).lower() == model_low and pv.get("context_length"):
+                            try:
+                                return max(0, int(pv["context_length"]))
+                            except (TypeError, ValueError):
+                                pass
+            elif isinstance(m_providers, list):
+                prov_entries.extend(p for p in m_providers if isinstance(p, dict))
+            for pv in prov_entries:
+                models_dict = pv.get("models")
+                if isinstance(models_dict, dict):
+                    for mk, mv in models_dict.items():
+                        if str(mk).lower() == model_low and isinstance(mv, dict) and mv.get("context_length"):
+                            try:
+                                return max(0, int(mv["context_length"]))
+                            except (TypeError, ValueError):
+                                pass
+                if pv.get("context_length") and str(pv.get("default") or "").strip().lower() == model_low:
+                    try:
+                        return max(0, int(pv["context_length"]))
+                    except (TypeError, ValueError):
+                        pass
+            if m_sec.get("context_length"):
+                def_m = str(m_sec.get("default") or "").strip().lower()
+                if not model_low or not def_m or def_m == model_low:
+                    try:
+                        return max(0, int(m_sec["context_length"]))
+                    except (TypeError, ValueError):
+                        pass
+
+    if model_low:
+        for pat, limit in _DEFAULT_CONTEXT_LIMITS:
+            if pat in model_low:
+                return limit
+    return 0
+
+
+def _normalize_tokens_dict(
+    raw: dict[str, Any] | None,
+    *,
+    context_used: int = 0,
+    context_limit: int = 0,
+) -> dict[str, Any]:
+    """Normalize stream-json / SQLite / legacy token dicts into canonical telemetry shape."""
+    src = raw if isinstance(raw, dict) else {}
+
+    def _int_of(*keys: str) -> int:
+        for k in keys:
+            val = src.get(k)
+            if val is not None and not isinstance(val, bool):
+                try:
+                    return max(0, int(val))
+                except (TypeError, ValueError):
+                    pass
+        return 0
+
+    raw_inp = _int_of("input", "input_tokens", "prompt_tokens")
+    out = _int_of("output", "output_tokens", "completion_tokens")
+    cache_read = _int_of("cachedInput", "cacheRead", "cache_read", "cache_read_tokens")
+    if cache_read == 0:
+        for det_key in ("prompt_tokens_details", "input_tokens_details"):
+            det = src.get(det_key)
+            if isinstance(det, dict):
+                val = det.get("cached_tokens") or det.get("cache_read_tokens")
+                if val is not None and not isinstance(val, bool):
+                    try:
+                        cache_read = max(0, int(val))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+    cache_write = _int_of("cacheWrite", "cache_write", "cache_write_tokens")
+    reasoning = _int_of("reasoning", "reasoning_tokens")
+    if reasoning == 0:
+        for det_key in ("completion_tokens_details", "output_tokens_details"):
+            det = src.get(det_key)
+            if isinstance(det, dict):
+                val = det.get("reasoning_tokens")
+                if val is not None and not isinstance(val, bool):
+                    try:
+                        reasoning = max(0, int(val))
+                        break
+                    except (TypeError, ValueError):
+                        pass
+    explicit_uncached_keys = ("pureInput", "pure_input", "uncachedInput", "uncached_input", "uncached_input_tokens")
+    has_explicit_uncached = any(
+        src.get(k) is not None and not isinstance(src.get(k), bool)
+        for k in explicit_uncached_keys
+    )
+    if has_explicit_uncached:
+        inp = _int_of(*explicit_uncached_keys)
+    elif cache_read > 0 and raw_inp >= cache_read:
+        inp = raw_inp - cache_read
+    else:
+        inp = raw_inp
+    new_tokens = inp + out
+    total_processed = inp + cache_read + cache_write + out
+
+    raw_ctx_used = _int_of("contextUsed", "context_used")
+    ctx_used = raw_ctx_used if raw_ctx_used > 0 else max(0, int(context_used or 0))
+    raw_ctx_limit = _int_of("contextLimit", "context_limit")
+    ctx_limit = raw_ctx_limit if raw_ctx_limit > 0 else max(0, int(context_limit or 0))
+
+    raw_pct = src.get("contextPct") if src.get("contextPct") is not None else src.get("context_pct")
+    if ctx_used > 0 and ctx_limit > 0:
+        ctx_pct = round(min(100.0, (ctx_used / ctx_limit) * 100.0), 1)
+    elif raw_pct is not None:
+        try:
+            ctx_pct = round(float(raw_pct), 1)
+        except (TypeError, ValueError):
+            ctx_pct = 0.0
+    else:
+        ctx_pct = 0.0
+
+    return {
+        "input": inp,
+        "pureInput": inp,
+        "uncachedInput": inp,
+        "output": out,
+        "cacheRead": cache_read,
+        "cachedInput": cache_read,
+        "cacheWrite": cache_write,
+        "reasoning": reasoning,
+        "total": total_processed,
+        "totalProcessed": total_processed,
+        "new": new_tokens,
+        "contextUsed": ctx_used,
+        "contextLimit": ctx_limit,
+        "contextPct": ctx_pct,
+    }
+
+
+def _compute_tps(output_tokens: int, elapsed_ms: int) -> float:
+    if output_tokens <= 0 or elapsed_ms <= 0:
+        return 0.0
+    return round(float(output_tokens) / (float(elapsed_ms) / 1000.0), 1)
+
+
+def _format_tool_preview(tool_name: str, raw_input: Any) -> str:
+    """Build a short, secret-free argument preview for `currentTool` and `recentTools`."""
+    if raw_input is None:
+        return ""
+    val: Any = None
+    if isinstance(raw_input, dict):
+        if isinstance(raw_input.get("targets"), dict) and raw_input["targets"]:
+            raw_input = raw_input["targets"]
+        if tool_name == "delegate_task" and isinstance(raw_input.get("tasks"), list):
+            tasks = raw_input["tasks"]
+            first_goal = ""
+            if tasks and isinstance(tasks[0], dict):
+                first_goal = str(tasks[0].get("goal") or tasks[0].get("task") or "").strip()
+            txt = f"{len(tasks)} tasks" + (f": {first_goal}" if first_goal else "")
+            return re.sub(r"\s+", " ", txt)[:77] + ("..." if len(txt) > 80 else "")
+        chosen_key = ""
+        for k in _PREVIEW_KEY_ORDER:
+            if k in raw_input and raw_input[k] not in (None, "", [], {}):
+                chosen_key = k
+                val = raw_input[k]
+                break
+        if val is None:
+            for k, v in raw_input.items():
+                if str(k).lower() in _SECRET_INPUT_KEYS or v in (None, "", [], {}):
+                    continue
+                chosen_key = str(k)
+                val = v
+                break
+        if isinstance(val, (dict, list)):
+            s = json.dumps(val, ensure_ascii=False)
+        else:
+            s = str(val or "")
+        s = re.sub(r"\s+", " ", s).strip()
+        if chosen_key in ("path", "file_path", "target_path") and ("/" in s or "\\" in s):
+            parts = [p for p in s.replace("\\", "/").split("/") if p]
+            if len(parts) >= 2:
+                s = "/".join(parts[-2:])
+            elif parts:
+                s = parts[-1]
+    else:
+        s = re.sub(r"\s+", " ", str(raw_input)).strip()
+    if len(s) > 80:
+        return s[:77] + "..."
+    return s
+
+
+def _parse_delegate_task_results(raw_output: str) -> list[dict[str, Any]]:
+    """Parse structured JSON entries returned by Hermes `delegate_task`."""
+    txt = str(raw_output or "").strip()
+    if not txt or not txt.startswith(("{", "[")):
+        return []
+    try:
+        parsed = json.loads(txt)
+    except Exception:
+        return []
+    if isinstance(parsed, dict):
+        items = parsed.get("results")
+        if isinstance(items, list):
+            return [x for x in items if isinstance(x, dict)]
+        if "status" in parsed or "task_index" in parsed:
+            return [parsed]
+        return []
+    if isinstance(parsed, list):
+        return [x for x in parsed if isinstance(x, dict)]
+    return []
+
+
+def _query_hermes_session_stats(
+    session_id: str,
+    *,
+    model: str | None = None,
+    provider: str | None = None,
+    base_url: str | None = None,
+) -> tuple[dict[str, Any], float | None, dict[str, Any]]:
+    """Read token counts, context usage, tool/message counts, and cost for one Hermes session from state.db."""
+    if not session_id:
+        return {}, None, {}
+    db_path = store.default_hermes_home() / "state.db"
+    if not db_path.is_file():
+        return {}, None, {}
+    con: sqlite3.Connection | None = None
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=2.0)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
+            "reasoning_tokens, estimated_cost_usd, actual_cost_usd, model, model_config, "
+            "message_count, tool_call_count, started_at, ended_at, billing_provider, billing_base_url "
+            "FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            return {}, None, {}
+        d = dict(row)
+        ctx_used = 0
+        raw_mc = d.get("model_config")
+        if isinstance(raw_mc, str) and raw_mc.strip():
+            try:
+                mc = json.loads(raw_mc)
+                anchor = mc.get("_usage_anchor") if isinstance(mc, dict) else None
+                if isinstance(anchor, dict):
+                    ctx_used = int(anchor.get("prompt_tokens") or 0) + int(anchor.get("completion_tokens") or 0)
+            except Exception:
+                pass
+        eff_model = str(d.get("model") or model or "").strip() or None
+        eff_prov = str(d.get("billing_provider") or provider or "").strip() or None
+        eff_base = str(d.get("billing_base_url") or base_url or "").strip() or None
+        ctx_limit = _resolve_context_limit(eff_model, eff_prov, eff_base)
+        tokens = _normalize_tokens_dict(
+            {
+                "input_tokens": int(d.get("input_tokens") or 0),
+                "uncachedInput": int(d.get("input_tokens") or 0),
+                "output_tokens": int(d.get("output_tokens") or 0),
+                "cache_read_tokens": int(d.get("cache_read_tokens") or 0),
+                "cache_write_tokens": int(d.get("cache_write_tokens") or 0),
+                "reasoning_tokens": int(d.get("reasoning_tokens") or 0),
+            },
+            context_used=ctx_used,
+            context_limit=ctx_limit,
+        )
+        actual = d.get("actual_cost_usd")
+        est = d.get("estimated_cost_usd")
+        actual_f: float | None = None
+        est_f: float | None = None
+        if actual is not None:
+            try:
+                actual_f = float(actual)
+            except (TypeError, ValueError):
+                actual_f = None
+        if est is not None:
+            try:
+                est_f = float(est)
+            except (TypeError, ValueError):
+                est_f = None
+        if actual_f is not None and actual_f > 0.0:
+            cost = round(actual_f, 6)
+        elif est_f is not None and est_f > 0.0:
+            cost = round(est_f, 6)
+        elif (eff_prov or "").lower() == "custom":
+            cost = None
+        elif actual_f is not None:
+            cost = round(actual_f, 6)
+        else:
+            cost = None
+        extra = {
+            "model": eff_model,
+            "billingProvider": eff_prov,
+            "messageCount": int(d.get("message_count") or 0),
+            "toolCallCount": int(d.get("tool_call_count") or 0),
+            "startedAtEpoch": d.get("started_at"),
+            "endedAtEpoch": d.get("ended_at"),
+        }
+        return tokens, cost, extra
+    except Exception:
+        return {}, None, {}
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+def _query_hermes_subagent_sessions(parent_session_id: str) -> list[dict[str, Any]]:
+    """Read live Tier-3 subagent session rows from state.db for `parent_session_id` (read-only)."""
+    if not parent_session_id:
+        return []
+    db_path = store.default_hermes_home() / "state.db"
+    if not db_path.is_file():
+        return []
+    con: sqlite3.Connection | None = None
+    try:
+        uri = f"{db_path.resolve().as_uri()}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=2.0)
+        con.row_factory = sqlite3.Row
+        rows = con.execute(
+            "SELECT id, model, started_at, ended_at, message_count, tool_call_count, "
+            "input_tokens, output_tokens, model_config "
+            "FROM sessions WHERE parent_session_id = ? AND source = 'subagent' ORDER BY started_at ASC",
+            (parent_session_id,),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        now_s = time.time()
+        for r in rows:
+            d = dict(r)
+            sub_id = ""
+            raw_mc = d.get("model_config")
+            if isinstance(raw_mc, str) and raw_mc.strip():
+                try:
+                    mc = json.loads(raw_mc)
+                    if isinstance(mc, dict):
+                        sub_id = str(mc.get("_subagent_id") or "")
+                except Exception:
+                    pass
+            started = float(d.get("started_at") or now_s)
+            ended = float(d.get("ended_at") or now_s)
+            elapsed_ms = max(0, int((ended - started) * 1000))
+            in_tok = int(d.get("input_tokens") or 0)
+            out_tok = int(d.get("output_tokens") or 0)
+            msg_cnt = int(d.get("message_count") or 0)
+            tc_cnt = int(d.get("tool_call_count") or 0)
+            out.append({
+                "sessionId": d.get("id"),
+                "subagentId": sub_id,
+                "model": d.get("model"),
+                "toolCalls": tc_cnt,
+                "steps": max(1 if (msg_cnt > 0 or tc_cnt > 0) else 0, (msg_cnt + 1) // 3),
+                "tokens": {"input": in_tok, "output": out_tok, "total": in_tok + out_tok},
+                "elapsedMs": elapsed_ms,
+                "tps": _compute_tps(out_tok, elapsed_ms),
+                "done": d.get("ended_at") is not None,
+                "startedAt": started,
+            })
+        return out
+    except Exception:
+        return []
+    finally:
+        if con is not None:
+            try:
+                con.close()
+            except Exception:
+                pass
+
+
+def build_worker_preamble(
+    cfg: models.WorkerConfig,
+    *,
+    swarm_id: str,
+    task_id: str,
+    context_id: str,
+    board_dir: Path,
+    http_url: str | None = None,
+    token_file: Path | None = None,
+    conversation_id: str | None = None,
+) -> str:
+    """Build the native-tool-first and 3-tier reporting preamble for a Tier-2 Hermes worker."""
+    role = models.validate_worker_role(cfg.role)
+    name = cfg.worker_name or f"{role}-{task_id[-6:]}"
+    py_posix = Path(sys.executable).as_posix()
+    cli_posix = (Path(__file__).resolve().parent / "board_cli.py").as_posix()
+    bdir_posix = board_dir.as_posix()
+
+    tool_ctx_parts = [
+        f'swarm_id="{swarm_id}"',
+        f'agent="{name}"',
+        f'board_dir="{bdir_posix}"',
+    ]
+    if http_url:
+        tool_ctx_parts.append(f'http_url="{http_url}"')
+    if conversation_id:
+        tool_ctx_parts.append(f'conversation_id="{conversation_id}"')
+    if token_file is not None:
+        tool_ctx_parts.append(f'token_file="{token_file.as_posix()}"')
+    tool_ctx_args = ", ".join(tool_ctx_parts)
+
+    cmd_parts = [
+        f'"{py_posix}"',
+        f'"{cli_posix}"',
+        f'--board-dir "{bdir_posix}"',
+        f'--swarm "{swarm_id}"',
+        f'--agent "{name}"',
+        f'--role "{role}"',
+        f'--task-id "{task_id}"',
+        f'--context-id "{context_id}"',
+    ]
+    if http_url:
+        cmd_parts.append(f'--http-url "{http_url}"')
+    if token_file is not None:
+        cmd_parts.append(f'--token-file "{token_file.as_posix()}"')
+    board_cmd = " ".join(cmd_parts)
+
+    channels_str = ", ".join(board_mod.channel_display_name(c) for c in (cfg.channels or [models.DEFAULT_CHANNEL]))
+    parent_note = ""
+    if cfg.fork_from:
+        parent_note = f"\nForked From: @{cfg.fork_from}"
+    elif cfg.parent_worker:
+        parent_note = f"\nParent Worker: @{cfg.parent_worker}"
+
+    if role == models.Role.NARRATOR.value:
+        return (
+            f"[TIER-2 SWARM NARRATOR ({name}) | SWARM_DIR={bdir_posix}]\n"
+            "Rules:\n"
+            "- Never edit repository files, never run builds/tests, and NEVER call `swarm_post` or `board_cli.py post`.\n"
+            f"- Your ONLY output is `{bdir_posix}/view.json` (under 64 KB, written atomically via temp file + rename)"
+            " and optional `{bdir_posix}/view.html` if explicitly requested.\n".format(bdir_posix=bdir_posix)
+            + f"- Use native `swarm_read` and `swarm_wait` tools FIRST on every call passing: {tool_ctx_args}\n"
+            "- Read posts via `swarm_read(since=0, limit=200, ...)` and wait via `swarm_wait(since=<LAST_SEQ>, mentions_only=false, timeout_seconds=300, ...)`.\n"
+            f"- Emergency fallback ONLY if `swarm_read`/`swarm_wait` is unavailable: {board_cmd} read --since 0 --limit 200 | {board_cmd} wait --since <LAST_SEQ> --mentions-only false --timeout 300\n"
+            "- Group `threads` by outcome (1 to 6 threads), cite `#seq` refs on every workstream/milestone/risk, "
+            "and only mark workstreams done once confirmed by worker/verifier posts."
+        )
+
+    if role == models.Role.MONITOR.value:
+        return (
+            f"[TIER-2 SWARM MONITOR ({name}) | SWARM_DIR={bdir_posix}]\n"
+            "Rules:\n"
+            "- Never do technical work (no repo edits, no builds, no code reviews, no user replies).\n"
+            "- Post ONLY to break a genuine stall (1 concise post per stall, citing `#seq` and member/task states). "
+            "Address `@coordinator` or the single stalled peer. Never use `@all`, never `@primary`, never message `narrator`.\n"
+            f"- Use native `swarm_read`, `swarm_status`, `swarm_wait`, `swarm_post` tools FIRST passing: {tool_ctx_args}\n"
+            "- Park & wait via `swarm_wait(since=<LAST_SEQ>, mentions_only=true, timeout_seconds=300, ...)`.\n"
+            f"- Emergency fallback ONLY if `swarm_post`/`swarm_wait` is unavailable: {board_cmd} status | {board_cmd} wait --since <LAST_SEQ> --mentions-only true --timeout 300 | {board_cmd} post --channel main --kind post --summary \"@coordinator [stall] ...\""
+        )
+
+    role_guidance = {
+        models.Role.WORKER.value: (
+            "Own your assigned lane cleanly inside the active workspace/worktree. "
+            "Delegate focused leaf discovery, isolated edits, or test runs to Tier-3 Hermes subagents via `delegate_task` "
+            "(synchronous/batched `delegate_task`; avoid leaving detached background subagents past turn end)."
+        ),
+        models.Role.VERIFIER.value: (
+            "Independently verify claims against actual files, diffs, and live command/test outputs. "
+            "Report PASS/FAIL with exact observed counts and file citations."
+        ),
+        models.Role.RESEARCHER.value: (
+            "Investigate the assigned codebase or technical question thoroughly and return cited file/line/doc findings."
+        ),
+    }.get(role, "Execute your assigned task cleanly and verify your work.")
+
+    return (
+        f"[TIER-2 HERMES {role.upper()} ({name}) — REPORTS TO @coordinator | Channels: {channels_str}]{parent_note}\n"
+        f"1. {role_guidance}\n"
+        "2. 3-Tier Reporting Law: Report results, handoffs, blockers, and questions to `@coordinator` or the next acting peer `@<name>` "
+        "on the Swarm Board. Never claim to be primary or coordinator.\n"
+        "3. Anti-Ping-Pong Rule: NEVER `@mention` a peer or `@coordinator` merely to say accepted, confirmed, thanks, acknowledged, or "
+        "already-answered — `@name` is strictly a wakeup doorbell when the target must perform NEW work. If no further work is needed, "
+        "end your turn without posting an `@mention`.\n"
+        "4. Native Swarm Board Tools FIRST (use `swarm_post`, `swarm_read`, `swarm_claim`, `swarm_release`, `swarm_status`, `swarm_wait` "
+        "with these explicit arguments on every call so they work cleanly even inside persistent `hermes-gateway`):\n"
+        f"   - Required context args on every native `swarm_*` call: {tool_ctx_args}\n"
+        f'   - Post update / handoff / [done]: swarm_post({tool_ctx_args}, channel="main", kind="post|question|handoff|escalation", summary="@coordinator [done] ...", details="...", files=["a.py"])\n'
+        f'   - Wake a peer: swarm_post({tool_ctx_args}, channel="main", kind="handoff", summary="@<peer> ...", details="...")\n'
+        f'   - Read / status / wait: swarm_read({tool_ctx_args}, since=0) | swarm_status({tool_ctx_args}) | swarm_wait({tool_ctx_args}, since=<LAST_SEQ>, mentions_only=true, timeout_seconds=120)\n'
+        f'   - Claim / release scope: swarm_claim({tool_ctx_args}, scope="path/or/lane", notes="...") | swarm_release({tool_ctx_args}, scope="path/or/lane")\n'
+        f"5. Emergency fallback ONLY if native `swarm_post`/`swarm_wait` is unavailable: {board_cmd} post --channel main --kind <post|question|handoff|escalation> --summary \"@coordinator [done] ...\" --details \"...\"\n"
+        "6. If blocked waiting on `@coordinator`, post a `question`/`escalation` on the board AND end your turn with a line starting with `[INPUT_REQUIRED]`."
+    )
+
+
+class SwarmRuntime:
+    """Manages A2A v1.0 Tasks and Tier-2 Hermes worker subprocesses for a single swarm."""
+
+    def __init__(
+        self,
+        *,
+        swarm_id: str = "default",
+        board_service: board_mod.BoardService,
+        mention_router: wakeup_mod.MentionRouter,
+        state_dir: Path | None = None,
+        http_url: str | None = None,
+        token_file_provider: Callable[[], Path | None] | None = None,
+        on_board_event: Callable[[str, str, dict[str, Any]], None] | None = None,
+        on_bind_loop: Callable[[asyncio.AbstractEventLoop], None] | None = None,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        self.swarm_id = store.sanitize_swarm_id(swarm_id) or "default"
+        self._board = board_service
+        self._router = mention_router
+        self._state_dir = state_dir
+        self._token_file_provider = token_file_provider
+        self._on_board_event = on_board_event
+        self._on_bind_loop = on_bind_loop
+        self._loop: asyncio.AbstractEventLoop | None = loop
+        self.http_url: str | None = http_url
+
+        self._state_rlock = store.get_swarm_thread_lock(self.swarm_id)
+        self._async_lock = asyncio.Lock()
+        self._async_lock_loop: asyncio.AbstractEventLoop | None = loop
+
+        self._tasks: dict[str, dict[str, Any]] = {}
+        self._context_sessions: dict[str, str] = {}
+        self._procs: dict[str, asyncio.subprocess.Process] = {}
+        self._bg_jobs: dict[str, asyncio.Task[None]] = {}
+        self._events: dict[str, asyncio.Event] = {}
+        self._subscribers: dict[str, list[tuple[asyncio.Queue[dict[str, Any] | None], asyncio.AbstractEventLoop | None]]] = {}
+        self._live_buffers: dict[str, dict[str, Any]] = {}
+        self._last_progress_save = 0.0
+        self._last_active_worker_count = 0
+        self._killed_workers: set[str] = set()
+        self._suppress_all_finished_wake = False
+
+        self._load_state()
+        try:
+            b_init = self._board.read_board(self.swarm_id)
+            for mname, mrec in (b_init.get("members") or {}).items():
+                if isinstance(mrec, dict) and (
+                    mrec.get("killed") or str(mrec.get("state") or "").strip().lower() == models.MemberState.KILLED.value
+                ):
+                    self._killed_workers.add(str(mname).strip().lower())
+        except Exception:
+            pass
+        with self._state_rlock:
+            self._last_active_worker_count = self._count_active_workers_unlocked()
+        if self._loop is not None and not self._loop.is_closed() and self._loop.is_running():
+            self._router.start_watcher(self._loop)
+        atexit.register(self._cleanup_on_exit)
+
+    def _paths(self) -> store.SwarmPaths:
+        return store.resolve_swarm_paths(self.swarm_id, state_dir=self._state_dir)
+
+    def _count_active_workers_unlocked(self) -> int:
+        count = 0
+        for t in self._tasks.values():
+            st = str(((t.get("status") or {}).get("state")) or "")
+            if st not in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value):
+                continue
+            wcfg = (t.get("metadata") or {}).get("workerConfig") or {}
+            if str(wcfg.get("role") or "").strip().lower() == models.Role.SUBAGENT.value:
+                continue
+            wname = str(wcfg.get("worker_name") or "").strip().lower()
+            if wname and wname in self._killed_workers:
+                continue
+            count += 1
+        return count
+
+    def get_active_worker_count(self) -> int:
+        with self._state_rlock:
+            return self._count_active_workers_unlocked()
+
+    def bind_loop(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
+        target = loop
+        if target is None:
+            try:
+                target = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        self._loop = target
+        if not target.is_closed() and target.is_running():
+            if self._on_bind_loop is not None:
+                try:
+                    self._on_bind_loop(target)
+                except Exception:
+                    pass
+            self._router.start_watcher(target)
+
+    def _ensure_async_lock(self, cur_loop: asyncio.AbstractEventLoop) -> None:
+        if self._async_lock_loop is not cur_loop:
+            self._async_lock = asyncio.Lock()
+            self._async_lock_loop = cur_loop
+
+    async def run_on_loop(self, coro_fn: Callable[..., Awaitable[_T]], *args: Any, **kwargs: Any) -> _T:
+        cur_loop = asyncio.get_running_loop()
+        target_loop = self._loop
+        if target_loop is not None and not target_loop.is_closed() and target_loop.is_running() and target_loop is not cur_loop:
+            cfut = asyncio.run_coroutine_threadsafe(coro_fn(*args, **kwargs), target_loop)
+            return await asyncio.wrap_future(cfut)
+        self.bind_loop(cur_loop)
+        self._ensure_async_lock(cur_loop)
+        return await coro_fn(*args, **kwargs)
+
+    def _cleanup_on_exit(self) -> None:
+        for proc in list(self._procs.values()):
+            if proc.returncode is None and proc.pid:
+                win_launcher.kill_process_tree_sync(proc.pid, timeout=2.0)
+
+    def _load_state(self) -> None:
+        tfile = self._paths().tasks_file
+        if not tfile.is_file():
+            return
+        raw = store.read_json_safe(tfile, None)
+        if not isinstance(raw, dict):
+            return
+        tasks = raw.get("tasks") or {}
+        ctx_map = raw.get("context_sessions") or {}
+        reset_workers: list[str] = []
+        with self._state_rlock:
+            if isinstance(tasks, dict):
+                for tid, task in tasks.items():
+                    if not isinstance(task, dict):
+                        continue
+                    st = ((task.get("status") or {}).get("state")) or ""
+                    if st not in models.TERMINAL_STATES and st not in models.INTERRUPTED_STATES:
+                        task["status"] = {
+                            "state": models.TaskState.FAILED.value,
+                            "message": models.new_message(
+                                "ROLE_AGENT",
+                                [models.text_part("Worker process ended because the server restarted.")],
+                                context_id=task.get("contextId"),
+                                task_id=tid,
+                            ),
+                            "timestamp": models.now_iso(),
+                        }
+                        wcfg = (task.get("metadata") or {}).get("workerConfig") or {}
+                        wname = str(wcfg.get("worker_name") or "").strip()
+                        if wname and wname not in reset_workers:
+                            reset_workers.append(wname)
+                    self._tasks[tid] = task
+            if isinstance(ctx_map, dict):
+                self._context_sessions.update({str(k): str(v) for k, v in ctx_map.items()})
+        if reset_workers:
+            try:
+                board = self._board.read_board(self.swarm_id)
+                members = board.get("members") or {}
+                for wname in reset_workers:
+                    mem = members.get(wname)
+                    if isinstance(mem, dict) and not mem.get("killed") and str(mem.get("state") or "").lower() == models.MemberState.WORKING.value:
+                        self._board.upsert_member(
+                            wname,
+                            role=str(mem.get("role") or models.Role.WORKER.value),
+                            state=models.MemberState.STOPPED.value,
+                            swarm_id=self.swarm_id,
+                        )
+            except Exception:
+                pass
+
+    def _snapshot_state_payload(self) -> tuple[Any, dict[str, Any]]:
+        paths = self._paths()
+        with self._state_rlock:
+            ordered = sorted(
+                self._tasks.items(),
+                key=lambda kv: ((kv[1].get("status") or {}).get("timestamp") or ""),
+                reverse=True,
+            )[:MAX_PERSISTED_TASKS]
+            payload = {
+                "tasks": dict(ordered),
+                "context_sessions": dict(self._context_sessions),
+            }
+        return paths, payload
+
+    @staticmethod
+    def _write_state_payload_sync(paths: Any, payload: dict[str, Any]) -> None:
+        with store.atomic_file_lock(paths.tasks_lock):
+            store.atomic_write_json(paths.tasks_file, payload)
+
+    def _save_state(self) -> None:
+        paths, payload = self._snapshot_state_payload()
+        self._write_state_payload_sync(paths, payload)
+
+    async def _save_state_async(self) -> None:
+        paths, payload = self._snapshot_state_payload()
+        await asyncio.to_thread(self._write_state_payload_sync, paths, payload)
+
+    async def _flush_progress_save(self) -> None:
+        try:
+            async with self._async_lock:
+                await self._save_state_async()
+        except Exception:
+            pass
+
+    def _maybe_save_progress(self, min_interval_s: float = 3.0) -> None:
+        now_m = time.monotonic()
+        if (now_m - self._last_progress_save) >= min_interval_s:
+            self._last_progress_save = now_m
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            if loop is not None and not loop.is_closed():
+                prev = getattr(self, "_progress_save_task", None)
+                if prev is None or prev.done():
+                    self._progress_save_task = loop.create_task(self._flush_progress_save())
+                return
+            try:
+                self._save_state()
+            except Exception:
+                pass
+
+    def _emit_observer_event(self, event_type: str, payload: dict[str, Any]) -> None:
+        if self._on_board_event is not None:
+            try:
+                self._on_board_event(self.swarm_id, event_type, payload)
+            except Exception:
+                pass
+
+    def _publish_stream_event(self, task_id: str, event: dict[str, Any] | None) -> None:
+        try:
+            cur_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cur_loop = None
+        for q, sub_loop in list(self._subscribers.get(task_id) or []):
+            if sub_loop is not None and not sub_loop.is_closed() and sub_loop.is_running() and sub_loop is not cur_loop:
+                try:
+                    sub_loop.call_soon_threadsafe(_enqueue_nowait, q, event)
+                except RuntimeError:
+                    pass
+            else:
+                _enqueue_nowait(q, event)
+
+    def subscribe(self, task_id: str) -> asyncio.Queue[dict[str, Any] | None]:
+        q: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=256)
+        try:
+            sub_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            sub_loop = None
+        self._subscribers.setdefault(task_id, []).append((q, sub_loop))
+        return q
+
+    def unsubscribe(self, task_id: str, q: asyncio.Queue[dict[str, Any] | None]) -> None:
+        subs = self._subscribers.get(task_id)
+        if not subs:
+            return
+        self._subscribers[task_id] = [item for item in subs if item[0] is not q]
+        if not self._subscribers[task_id]:
+            self._subscribers.pop(task_id, None)
+
+    def _append_live_transcript(self, task_id: str, delta: str) -> None:
+        if not delta:
+            return
+        with self._state_rlock:
+            buf = self._live_buffers.setdefault(task_id, {"liveTranscript": "", "liveToolTrace": []})
+            txt = buf["liveTranscript"] + delta
+            if len(txt) > _LIVE_TRANSCRIPT_MAX_CHARS:
+                txt = txt[-_LIVE_TRANSCRIPT_MAX_CHARS:]
+            buf["liveTranscript"] = txt
+
+    def _append_live_tool_trace(self, task_id: str, entry: dict[str, Any]) -> None:
+        with self._state_rlock:
+            buf = self._live_buffers.setdefault(task_id, {"liveTranscript": "", "liveToolTrace": []})
+            trace: list[dict[str, Any]] = buf["liveToolTrace"]
+            trace.append(entry)
+            if len(trace) > _TOOL_TRACE_LIMIT:
+                del trace[: len(trace) - _TOOL_TRACE_LIMIT]
+
+    def _enrich_view_telemetry_unlocked(self, view: dict[str, Any]) -> None:
+        meta = view.setdefault("metadata", {})
+        act = meta.get("liveActivity")
+        if not isinstance(act, dict):
+            return
+        st = str((view.get("status") or {}).get("state") or "")
+        is_terminal = st in models.TERMINAL_STATES
+        ended = act.get("endedAt") or ((view.get("status") or {}).get("timestamp") if is_terminal else None)
+        started_at = act.get("startedAt") or meta.get("createdAt")
+        elapsed_ms = int(act.get("elapsedMs") or 0)
+        if not is_terminal or elapsed_ms <= 0:
+            computed_ms = _elapsed_ms(started_at, ended_at=ended)
+            if computed_ms > 0:
+                elapsed_ms = computed_ms
+        act["elapsedMs"] = elapsed_ms
+        act["elapsedSeconds"] = elapsed_ms // 1000
+        act["idleSinceEventSeconds"] = _duration_seconds(
+            act.get("lastEventAt") or started_at, ended_at=ended
+        )
+        if is_terminal:
+            act["currentTool"] = None
+        wcfg = meta.get("workerConfig") or {}
+        raw_tok = meta.get("tokens")
+        if isinstance(raw_tok, dict) and raw_tok:
+            norm_tok = _normalize_tokens_dict(
+                raw_tok,
+                context_limit=_resolve_context_limit(wcfg.get("model"), wcfg.get("provider"), wcfg.get("base_url")),
+            )
+            meta["tokens"] = norm_tok
+            llm_ms = int(act.get("llmActiveMs") or 0)
+            tps_ms = llm_ms if llm_ms >= 250 else elapsed_ms
+            turn_out = act.get("turnOutputTokens")
+            tps_tokens = int(turn_out) if turn_out is not None else norm_tok["output"]
+            if tps_tokens > 0:
+                act["tps"] = _compute_tps(tps_tokens, tps_ms)
+                act["tpsEstimated"] = False
+            else:
+                streamed_chars = int(act.get("streamedChars") or 0)
+                if streamed_chars > 0 and tps_ms > 200:
+                    act["tps"] = round(max(1, streamed_chars // 4) / (tps_ms / 1000.0), 1)
+                    act["tpsEstimated"] = True
+                elif act.get("tpsEstimated") and float(act.get("tps") or 0.0) > 0.0:
+                    act["tps"] = float(act.get("tps") or 0.0)
+                else:
+                    act["tps"] = 0.0
+                    act["tpsEstimated"] = False
+        else:
+            act["tps"] = float(act.get("tps") or 0.0)
+
+    def get_task_snapshots(self) -> list[dict[str, Any]]:
+        """Thread-safe shallow copy of persisted/in-memory tasks for cross-thread HTTP observers."""
+        with self._state_rlock:
+            out: list[dict[str, Any]] = []
+            for tid, task in self._tasks.items():
+                view = models.format_task_view(task, include_artifacts=True)
+                buf = self._live_buffers.get(tid)
+                meta = view.setdefault("metadata", {})
+                if buf:
+                    meta["liveTranscript"] = str(buf.get("liveTranscript") or "")
+                    meta["liveToolTrace"] = [dict(x) for x in (buf.get("liveToolTrace") or [])]
+                self._enrich_view_telemetry_unlocked(view)
+                out.append(view)
+            out.sort(key=lambda t: str(((t.get("status") or {}).get("timestamp")) or ""), reverse=True)
+            return out
+
+    def is_worker_busy(self, worker_name: str) -> bool:
+        wlow = str(worker_name or "").strip().lower()
+        if not wlow:
+            return False
+        with self._state_rlock:
+            for t in self._tasks.values():
+                wcfg = (t.get("metadata") or {}).get("workerConfig") or {}
+                if str(wcfg.get("worker_name") or "").strip().lower() != wlow:
+                    continue
+                st = str(((t.get("status") or {}).get("state")) or "")
+                if st in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value):
+                    return True
+        return False
+
+    def find_latest_worker_task(self, worker_name: str) -> dict[str, Any] | None:
+        wlow = str(worker_name or "").strip().lower()
+        if not wlow:
+            return None
+        with self._state_rlock:
+            matches = [
+                t for t in self._tasks.values()
+                if str((((t.get("metadata") or {}).get("workerConfig") or {}).get("worker_name") or "")).strip().lower() == wlow
+            ]
+            if not matches:
+                return None
+            matches.sort(
+                key=lambda t: str(((t.get("status") or {}).get("timestamp")) or ((t.get("metadata") or {}).get("createdAt")) or ""),
+                reverse=True,
+            )
+            return dict(matches[0])
+
+    def _resolve_resume_target(self, context_id: str) -> str | None:
+        with self._state_rlock:
+            if context_id in self._context_sessions:
+                return self._context_sessions[context_id]
+        if context_id.startswith("local-"):
+            return context_id
+        return None
+
+    def _build_hermes_command(
+        self,
+        cfg: models.WorkerConfig,
+        *,
+        resume_session_id: str | None = None,
+        query_file: str = "-",
+        effective_workdir: str | None = None,
+    ) -> tuple[list[str], str | None]:
+        hermes_args: list[str] = []
+        if cfg.profile and cfg.profile != "default":
+            hermes_args.extend(["-p", cfg.profile])
+
+        hermes_args.extend(["chat", "--query-file", query_file, "-Q", "--format", "stream-json"])
+
+        if resume_session_id:
+            hermes_args.extend(["--resume", resume_session_id])
+        else:
+            if cfg.model:
+                hermes_args.extend(["-m", cfg.model])
+            if cfg.provider:
+                hermes_args.extend(["--provider", cfg.provider])
+            if cfg.base_url:
+                hermes_args.extend(["--base-url", cfg.base_url])
+            if cfg.reasoning:
+                hermes_args.extend(["--reasoning", cfg.reasoning])
+            if cfg.toolsets:
+                ts = ",".join(cfg.toolsets) if isinstance(cfg.toolsets, list) else str(cfg.toolsets)
+                if ts.strip():
+                    hermes_args.extend(["-t", ts.strip()])
+            if cfg.skills:
+                sk = ",".join(cfg.skills) if isinstance(cfg.skills, list) else str(cfg.skills)
+                if sk.strip():
+                    hermes_args.extend(["-s", sk.strip()])
+            if cfg.max_turns is not None:
+                hermes_args.extend(["--max-turns", str(int(cfg.max_turns))])
+            if cfg.accept_hooks:
+                hermes_args.append("--accept-hooks")
+            if cfg.checkpoints:
+                hermes_args.append("--checkpoints")
+            if cfg.pass_session_id:
+                hermes_args.append("--pass-session-id")
+            if cfg.ignore_rules:
+                hermes_args.append("--ignore-rules")
+            if cfg.ignore_user_config:
+                hermes_args.append("--ignore-user-config")
+            if cfg.safe_mode:
+                hermes_args.append("--safe-mode")
+
+        raw_dir = effective_workdir or cfg.workdir
+        norm_workdir = store.normalize_local_path(raw_dir) if raw_dir else None
+        if norm_workdir:
+            hermes_args.extend(["--in", norm_workdir])
+        if cfg.source:
+            hermes_args.extend(["--source", cfg.source])
+
+        cmd = win_launcher.build_hermes_worker_argv(
+            hermes_args,
+            hermes_home=store.default_hermes_home(),
+            hermes_exe=store.default_hermes_exe(),
+        )
+        return cmd, norm_workdir
+
+    def _build_fork_seed_context(self, fork_from: str) -> str:
+        """Build concise context seed when branching a new worker from an existing worker or coordinator."""
+        if str(fork_from or "").strip().lower() == models.Role.COORDINATOR.value:
+            chunks: list[str] = ["[FORKED CONTEXT FROM @coordinator]"]
+            try:
+                meta = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir) or {}
+                if meta.get("goal"):
+                    chunks.append(f"Swarm goal: {str(meta['goal'])[:500]}")
+                board = self._board.read_board(self.swarm_id)
+                plan = board.get("plan")
+                if isinstance(plan, dict) and plan.get("tasks"):
+                    plan_lines = [f"- {t.get('title', t.get('id', 'task'))} [{t.get('state', 'pending')}]" for t in plan["tasks"][:12] if isinstance(t, dict)]
+                    if plan_lines:
+                        chunks.append("Current plan:\n" + "\n".join(plan_lines))
+                coord_posts = [
+                    m for m in (board.get("messages") or [])
+                    if isinstance(m, dict)
+                    and not isinstance(m.get("control"), dict)
+                    and str(m.get("sender") or "").lower() == models.Role.COORDINATOR.value
+                ][-5:]
+                if coord_posts:
+                    chunks.append("Recent @coordinator posts:\n" + "\n".join(f"- #{m.get('seq')}: {str(m.get('summary') or '')[:240]}" for m in coord_posts))
+            except Exception:
+                pass
+            return "\n".join(chunks) if len(chunks) > 1 else ""
+
+        src_task = self.find_latest_worker_task(fork_from)
+        if not src_task:
+            return ""
+        chunks: list[str] = [f"[FORKED CONTEXT FROM @{fork_from} (task={src_task.get('id')}, context={src_task.get('contextId')})]"]
+        meta = src_task.get("metadata") or {}
+        if meta.get("worktreePath"):
+            chunks.append(f"Source worktree: {meta['worktreePath']} (branch {meta.get('worktreeBranch')})")
+        for art in reversed(src_task.get("artifacts") or []):
+            if str(art.get("name") or "").startswith("response"):
+                for part in art.get("parts") or []:
+                    if isinstance(part, dict) and part.get("text"):
+                        chunks.append("Latest output from source worker:\n" + str(part["text"])[-3000:])
+                        return "\n".join(chunks)
+        live = str(meta.get("liveTranscript") or "")
+        if live:
+            chunks.append("Recent transcript tail:\n" + live[-2000:])
+        return "\n".join(chunks)
+
+    async def send_message(
+        self,
+        *,
+        message_parts: list[dict[str, Any]],
+        context_id: str | None = None,
+        task_id: str | None = None,
+        config: models.WorkerConfig | None = None,
+        config_overrides: dict[str, Any] | None = None,
+        return_immediately: bool = False,
+        wait_seconds: float = 300.0,
+        history_length: int | None = None,
+        preserve_assignment: bool = False,
+        defer_channel_subscribe: bool = False,
+        allow_unkill: bool = False,
+    ) -> dict[str, Any]:
+        """Create or resume an A2A Task backed by a Tier-2 Hermes worker subprocess."""
+        cur_loop = asyncio.get_running_loop()
+        if self._loop is not None and not self._loop.is_closed() and self._loop.is_running() and self._loop is not cur_loop:
+            return await self.run_on_loop(
+                self.send_message,
+                message_parts=message_parts,
+                context_id=context_id,
+                task_id=task_id,
+                config=config,
+                config_overrides=config_overrides,
+                return_immediately=return_immediately,
+                wait_seconds=wait_seconds,
+                history_length=history_length,
+                preserve_assignment=preserve_assignment,
+                defer_channel_subscribe=defer_channel_subscribe,
+                allow_unkill=allow_unkill,
+            )
+        self.bind_loop(cur_loop)
+        self._ensure_async_lock(cur_loop)
+
+        prompt_body = models.extract_text_from_parts(message_parts).strip()
+        if not prompt_body:
+            raise ValueError("Message parts produced an empty prompt.")
+
+        async with self._async_lock:
+            task_id_out, done_event = await self._send_message_locked(
+                message_parts=message_parts,
+                prompt_body=prompt_body,
+                context_id=context_id,
+                task_id=task_id,
+                config=config,
+                config_overrides=config_overrides,
+                preserve_assignment=preserve_assignment,
+                defer_channel_subscribe=defer_channel_subscribe,
+                allow_unkill=allow_unkill,
+            )
+
+        if not return_immediately:
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=max(1.0, float(wait_seconds)))
+            except asyncio.TimeoutError:
+                pass
+
+        return await self.get_task(task_id_out, history_length=history_length, include_artifacts=True)
+
+    async def _send_message_locked(
+        self,
+        *,
+        message_parts: list[dict[str, Any]],
+        prompt_body: str,
+        context_id: str | None = None,
+        task_id: str | None = None,
+        config: models.WorkerConfig | None = None,
+        config_overrides: dict[str, Any] | None = None,
+        preserve_assignment: bool = False,
+        defer_channel_subscribe: bool = False,
+        allow_unkill: bool = False,
+    ) -> tuple[str, asyncio.Event]:
+        """Must be called with `self._async_lock` held."""
+        cfg = config or models.WorkerConfig()
+        is_new_task = not bool(task_id)
+
+        with self._state_rlock:
+            if task_id:
+                existing = self._tasks.get(task_id)
+                if not existing:
+                    raise KeyError(f"TaskNotFoundError: task '{task_id}' does not exist.")
+                cur_state = (existing.get("status") or {}).get("state")
+                if cur_state in models.TERMINAL_STATES:
+                    raise RuntimeError(
+                        f"UnsupportedOperationError: task '{task_id}' is already {cur_state}. "
+                        "Start a new task with the same contextId to continue the session."
+                    )
+                if cur_state not in models.INTERRUPTED_STATES:
+                    raise RuntimeError(
+                        f"Task '{task_id}' is currently {cur_state}; wait or cancel before sending another turn."
+                    )
+                resolved_context_id = context_id or existing["contextId"]
+                task = existing
+                prev_cfg = dict((task.get("metadata") or {}).get("workerConfig") or {})
+                if config_overrides is not None:
+                    ovr = {k: v for k, v in config_overrides.items() if v is not None}
+                elif config is not None:
+                    ovr = config.to_resume_overrides()
+                else:
+                    ovr = {}
+                cfg = models.WorkerConfig.from_dict({**prev_cfg, **ovr})
+                worker_name_cand = cfg.worker_name or f"{cfg.role}-{task_id[-6:]}"
+                if self._is_worker_killed(worker_name_cand):
+                    raise RuntimeError(f"Worker '{worker_name_cand}' has been killed and cannot be resumed.")
+                task.setdefault("metadata", {})["workerConfig"] = cfg.to_metadata()
+            else:
+                resolved_context_id = context_id or models.new_id("ctx-")
+                task_id = models.new_id("task-")
+                worker_name_cand = cfg.worker_name or f"{cfg.role}-{task_id[-6:]}"
+                if self._is_worker_killed(worker_name_cand):
+                    if allow_unkill:
+                        self._killed_workers.discard(worker_name_cand.strip().lower())
+                    else:
+                        raise RuntimeError(f"Worker '{worker_name_cand}' has been killed and cannot be messaged.")
+                if cfg.workdir:
+                    cfg.workdir = store.normalize_local_path(cfg.workdir)
+                meta_block: dict[str, Any] = {
+                    "createdAt": models.now_iso(),
+                    "swarmId": self.swarm_id,
+                    "workerConfig": cfg.to_metadata(),
+                    "tokens": _normalize_tokens_dict(
+                        {},
+                        context_limit=_resolve_context_limit(cfg.model, cfg.provider, cfg.base_url),
+                    ),
+                    "liveActivity": {
+                        "startedAt": models.now_iso(),
+                        "steps": 0,
+                        "toolCalls": 0,
+                        "lastTool": None,
+                        "currentTool": None,
+                        "recentTools": [],
+                        "lastTextPreview": "",
+                        "lastEventAt": models.now_iso(),
+                        "streamedChars": 0,
+                        "elapsedMs": 0,
+                        "tps": 0.0,
+                        "hermesSessionId": self._resolve_resume_target(resolved_context_id),
+                    },
+                }
+                if cfg.parent_task_id:
+                    meta_block["parentTaskId"] = cfg.parent_task_id
+                if cfg.parent_worker:
+                    meta_block["parentWorker"] = cfg.parent_worker
+                task = {
+                    "id": task_id,
+                    "contextId": resolved_context_id,
+                    "status": {
+                        "state": models.TaskState.SUBMITTED.value,
+                        "timestamp": models.now_iso(),
+                    },
+                    "artifacts": [],
+                    "history": [],
+                    "metadata": meta_block,
+                }
+                self._tasks[task_id] = task
+
+            self._live_buffers.setdefault(task_id, {"liveTranscript": "", "liveToolTrace": []})
+
+            worker_name = cfg.worker_name or f"{cfg.role}-{task_id[-6:]}"
+            cfg.worker_name = worker_name
+            task["metadata"]["workerConfig"] = cfg.to_metadata()
+
+            token_file = self._token_file_provider() if self._token_file_provider else None
+            swarm_meta_doc = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir) or {}
+            swarm_conv_id = str(
+                swarm_meta_doc.get("primaryConversationId")
+                or swarm_meta_doc.get("coordinatorConversationId")
+                or ""
+            ).strip() or None
+            preamble = build_worker_preamble(
+                cfg,
+                swarm_id=self.swarm_id,
+                task_id=task_id,
+                context_id=resolved_context_id,
+                board_dir=self._paths().swarm_dir,
+                http_url=self.http_url,
+                token_file=token_file,
+                conversation_id=swarm_conv_id,
+            )
+            fork_seed = self._build_fork_seed_context(cfg.fork_from) if (cfg.fork_from and is_new_task) else ""
+            header_blocks = [b for b in (preamble, (cfg.role_prompt or "").strip(), fork_seed) if b]
+            if header_blocks:
+                full_prompt = f"[SYSTEM / ROLE]\n" + "\n\n".join(header_blocks) + f"\n\n[TASK]\n{prompt_body}"
+            else:
+                full_prompt = prompt_body
+
+            user_msg = models.new_message(
+                "ROLE_USER",
+                message_parts,
+                context_id=resolved_context_id,
+                task_id=task_id,
+            )
+            task.setdefault("history", []).append(user_msg)
+            task["status"] = {
+                "state": models.TaskState.WORKING.value,
+                "message": models.new_message(
+                    "ROLE_AGENT",
+                    [models.text_part("Hermes worker started.")],
+                    context_id=resolved_context_id,
+                    task_id=task_id,
+                ),
+                "timestamp": models.now_iso(),
+            }
+            done_event = asyncio.Event()
+            self._events[task_id] = done_event
+            act_cur = task.setdefault("metadata", {}).setdefault("liveActivity", {})
+            if isinstance(act_cur, dict):
+                act_cur.pop("endedAt", None)
+                act_cur.setdefault("startedAt", models.now_iso())
+                act_cur["currentTool"] = None
+            if allow_unkill and not preserve_assignment and worker_name:
+                self._killed_workers.discard(worker_name.strip().lower())
+            self._suppress_all_finished_wake = False
+            self._last_active_worker_count = self._count_active_workers_unlocked()
+
+        existing_meta = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir)
+        existing_ws = (existing_meta or {}).get("workspace")
+        cand_ws = _canonical_workspace_path(cfg.workdir)
+        meta_ws_update: str | None = None
+        if cand_ws and (not existing_ws or _is_worktree_subpath(existing_ws)):
+            meta_ws_update = cand_ws
+        store.upsert_swarm_meta(self.swarm_id, workspace=meta_ws_update, state_dir=self._state_dir)
+        await self._save_state_async()
+
+        assignment_val: str | None = None
+        if is_new_task and not preserve_assignment:
+            try:
+                cur_board = self._board.read_board(self.swarm_id)
+                cur_mem = (cur_board.get("members") or {}).get(worker_name)
+                cur_assign = str((cur_mem or {}).get("assignment") or "").strip() if isinstance(cur_mem, dict) else ""
+                if not cur_assign:
+                    assignment_val = prompt_body[:240]
+            except Exception:
+                assignment_val = prompt_body[:240]
+
+        try:
+            self._board.upsert_member(
+                worker_name,
+                role=cfg.role,
+                tier=2,
+                runtime="hermes",
+                state=models.MemberState.WORKING.value,
+                assignment=assignment_val,
+                channels=None if defer_channel_subscribe else cfg.channels,
+                parent=cfg.parent_worker or "coordinator",
+                parent_task_id=cfg.parent_task_id,
+                task_id=task_id,
+                context_id=resolved_context_id,
+                model=cfg.model,
+                provider=cfg.provider,
+                workdir=cfg.workdir,
+                killed=False if allow_unkill and not preserve_assignment else None,
+                swarm_id=self.swarm_id,
+            )
+        except Exception:
+            pass
+
+        self._emit_observer_event("task_created" if is_new_task else "task_resumed", {"taskId": task_id, "contextId": resolved_context_id})
+
+        resume_sid = self._resolve_resume_target(resolved_context_id)
+        job = asyncio.create_task(self._execute_worker(task_id, full_prompt, cfg, resume_sid))
+        self._bg_jobs[task_id] = job
+        return task_id, done_event
+
+    async def _execute_worker(
+        self,
+        task_id: str,
+        full_prompt: str,
+        cfg: models.WorkerConfig,
+        resume_session_id: str | None,
+    ) -> None:
+        swarm_dir = self._paths().swarm_dir
+        swarm_dir.mkdir(parents=True, exist_ok=True)
+        prompt_path = swarm_dir / f"prompt-{task_id}.txt"
+        worktree_path: str | None = None
+        worktree_branch: str | None = None
+        worker_name = cfg.worker_name or f"{cfg.role}-{task_id[-6:]}"
+
+        try:
+            if cfg.worktree:
+                try:
+                    wt_info = await worktree_mod.create_worktree(cfg.workdir or "", worker_name or task_id)
+                    worktree_path = wt_info.worktree_path
+                    worktree_branch = wt_info.branch
+                    with self._state_rlock:
+                        t = self._tasks.get(task_id)
+                        if t:
+                            t["metadata"]["worktreePath"] = worktree_path
+                            t["metadata"]["worktreeBranch"] = worktree_branch
+                    self._board.upsert_member(
+                        worker_name,
+                        role=cfg.role,
+                        state=models.MemberState.WORKING.value,
+                        task_id=task_id,
+                        workdir=cfg.workdir,
+                        worktree_path=worktree_path,
+                        worktree_branch=worktree_branch,
+                        swarm_id=self.swarm_id,
+                    )
+                    self._emit_observer_event("task_progress", {"taskId": task_id, "worktreePath": worktree_path})
+                except Exception as exc:
+                    await self._finalize_failure(task_id, f"Worktree setup failed: {exc}", [])
+                    return
+
+            prompt_path.write_text(full_prompt, encoding="utf-8")
+            cmd, cwd = self._build_hermes_command(
+                cfg,
+                resume_session_id=resume_session_id,
+                query_file=str(prompt_path),
+                effective_workdir=worktree_path,
+            )
+
+            env = dict(os.environ)
+            env["PYTHONUTF8"] = "1"
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["HERMES_A2A_NO_AUTO_HTTP"] = "1"
+            env["HERMES_A2A_STATE_DIR"] = str(self._board.state_dir)
+            env["HERMES_A2A_SWARM_ID"] = self.swarm_id
+            env["HERMES_A2A_SWARM_BOARD_DIR"] = str(swarm_dir)
+            env["HERMES_A2A_TASK_ID"] = task_id
+            with self._state_rlock:
+                context_id_val = str((self._tasks.get(task_id) or {}).get("contextId") or "")
+            env["HERMES_A2A_CONTEXT_ID"] = context_id_val
+            role_val = str(cfg.role or models.Role.WORKER.value)
+            env["HERMES_A2A_WORKER_ROLE"] = role_val
+            env["HERMES_A2A_WORKER_NAME"] = worker_name
+            if self.http_url:
+                env["HERMES_A2A_HTTP_URL"] = str(self.http_url)
+            token_file = self._token_file_provider() if self._token_file_provider else None
+            if token_file is not None:
+                env["HERMES_A2A_TOKEN_FILE"] = str(token_file)
+            env["HERMES_SWARM_ID"] = self.swarm_id
+            env["HERMES_SWARM_AGENT"] = worker_name
+            env["HERMES_SWARM_ROLE"] = role_val
+            env["HERMES_SWARM_BOARD_DIR"] = str(swarm_dir)
+            if self.http_url:
+                env["HERMES_SWARM_HTTP_URL"] = str(self.http_url)
+            if token_file is not None:
+                env["HERMES_SWARM_TOKEN_FILE"] = str(token_file)
+            swarm_meta_doc = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir) or {}
+            swarm_conv_id = str(
+                swarm_meta_doc.get("primaryConversationId")
+                or swarm_meta_doc.get("coordinatorConversationId")
+                or ""
+            ).strip()
+            if swarm_conv_id:
+                env["HERMES_SWARM_CONVERSATION_ID"] = swarm_conv_id
+            else:
+                env.pop("HERMES_SWARM_CONVERSATION_ID", None)
+            if cfg.auto_approve and not resume_session_id:
+                env["HERMES_YOLO_MODE"] = "1"
+
+            text_chunks: list[str] = []
+            tool_trace: list[dict[str, Any]] = []
+            stderr_lines: list[str] = []
+            result_event: dict[str, Any] | None = None
+            hermes_session_id = resume_session_id or ""
+            init_model = cfg.model or ""
+            last_board_emit = 0.0
+            last_db_poll = 0.0
+            turn_started_mono = time.monotonic()
+            turn_started_wall = time.time()
+            with self._state_rlock:
+                t_init = self._tasks.get(task_id)
+                act_init = (t_init.get("metadata") or {}).get("liveActivity") if isinstance(t_init, dict) else {}
+                prior_steps = int(act_init.get("steps") or 0) if isinstance(act_init, dict) else 0
+                prior_recent = list(act_init.get("recentTools") or []) if isinstance(act_init, dict) else []
+                prior_output_tokens = int(((t_init.get("metadata") or {}).get("tokens") or {}).get("output") or 0) if isinstance(t_init, dict) else 0
+                if isinstance(act_init, dict):
+                    act_init["streamedChars"] = 0
+                    act_init["turnOutputTokens"] = 0
+                    act_init["tps"] = 0.0
+                    act_init["tpsEstimated"] = False
+            if resume_session_id:
+                prior_db_toks, _, _ = await asyncio.to_thread(
+                    _query_hermes_session_stats,
+                    resume_session_id,
+                    model=cfg.model,
+                    provider=cfg.provider,
+                    base_url=cfg.base_url,
+                )
+                if prior_db_toks:
+                    prior_output_tokens = max(prior_output_tokens, int(prior_db_toks.get("output") or 0))
+            streamed_chars = 0
+            steps_count = max(1, prior_steps + 1)
+            saw_tool_result = False
+            active_tools: dict[str, dict[str, Any]] = {}
+            recent_entries: list[tuple[str, dict[str, Any]]] = [("", dict(r)) for r in prior_recent if isinstance(r, dict)][-_RECENT_TOOLS_LIMIT:]
+            active_subagents: dict[str, dict[str, Any]] = {}
+            subagent_start_mono: dict[str, float] = {}
+            spawned_delegate_tc_ids: set[str] = set()
+            llm_active_ms_acc = 0.0
+            llm_span_start_mono: float | None = None
+            db_poll_in_flight = False
+
+            def _current_llm_active_ms(now_m: float) -> int:
+                extra_ms = (now_m - llm_span_start_mono) * 1000.0 if llm_span_start_mono is not None else 0.0
+                return max(0, int(round(llm_active_ms_acc + extra_ms)))
+
+            def _sync_current_tool_unlocked(act: dict[str, Any]) -> None:
+                if active_tools:
+                    last_active = list(active_tools.values())[-1]
+                    act["currentTool"] = {
+                        "name": last_active["name"],
+                        "preview": last_active["preview"],
+                        "startedAt": last_active["startedAt"],
+                    }
+                else:
+                    act["currentTool"] = None
+
+            async def _refresh_live_db_stats(*, force: bool = False) -> bool:
+                nonlocal last_db_poll, db_poll_in_flight
+                if not hermes_session_id or db_poll_in_flight:
+                    return False
+                now_m = time.monotonic()
+                if not force and (now_m - last_db_poll) < 1.5:
+                    return False
+                last_db_poll = now_m
+                db_poll_in_flight = True
+                try:
+                    db_toks, db_cost, _ = await asyncio.to_thread(
+                        _query_hermes_session_stats,
+                        hermes_session_id,
+                        model=init_model or cfg.model,
+                        provider=cfg.provider,
+                        base_url=cfg.base_url,
+                    )
+                    changed = False
+                    if db_toks or db_cost is not None:
+                        now_m = time.monotonic()
+                        with self._state_rlock:
+                            t = self._tasks.get(task_id)
+                            if t:
+                                meta = t.setdefault("metadata", {})
+                                act = meta.setdefault("liveActivity", {})
+                                el_ms = max(0, int((now_m - turn_started_mono) * 1000))
+                                cur_llm_ms = _current_llm_active_ms(now_m)
+                                act["elapsedMs"] = el_ms
+                                act["llmActiveMs"] = cur_llm_ms
+                                if db_toks:
+                                    prev_tot = (meta.get("tokens") or {}).get("total")
+                                    prev_ctx = (meta.get("tokens") or {}).get("contextUsed")
+                                    meta["tokens"] = db_toks
+                                    turn_out = max(0, int(db_toks.get("output", 0)) - prior_output_tokens)
+                                    act["turnOutputTokens"] = turn_out
+                                    tps_ms = cur_llm_ms if cur_llm_ms >= 250 else el_ms
+                                    if turn_out > 0:
+                                        act["tps"] = _compute_tps(turn_out, tps_ms)
+                                        act["tpsEstimated"] = False
+                                    elif cur_llm_ms > 200 and streamed_chars > 0:
+                                        act["tps"] = round(max(1, streamed_chars // 4) / (cur_llm_ms / 1000.0), 1)
+                                        act["tpsEstimated"] = True
+                                    else:
+                                        act["tps"] = 0.0
+                                        act["tpsEstimated"] = False
+                                    if prev_tot != db_toks.get("total") or prev_ctx != db_toks.get("contextUsed"):
+                                        act["lastEventAt"] = models.now_iso()
+                                        changed = True
+                                if db_cost is not None:
+                                    meta["costUsd"] = db_cost
+                    running_subs = [
+                        (sid, rec) for sid, rec in active_subagents.items()
+                        if str(rec.get("status") or rec.get("state") or "") == "working"
+                    ]
+                    if running_subs:
+                        child_rows = await asyncio.to_thread(_query_hermes_subagent_sessions, hermes_session_id)
+                        if child_rows:
+                            used_row_indices: set[int] = set()
+                            updated_subs: list[dict[str, Any]] = []
+                            for sid, rec in running_subs:
+                                matched_idx: int | None = None
+                                rec_id = str(rec.get("id") or "")
+                                rec_sess = str(rec.get("sessionId") or "")
+                                for r_idx, crow in enumerate(child_rows):
+                                    if r_idx in used_row_indices:
+                                        continue
+                                    c_sub = str(crow.get("subagentId") or "")
+                                    c_sess = str(crow.get("sessionId") or "")
+                                    if (c_sub and (c_sub == rec_id or c_sub == sid)) or (rec_sess and c_sess == rec_sess):
+                                        matched_idx = r_idx
+                                        break
+                                if matched_idx is None:
+                                    rec_started_mono = subagent_start_mono.get(sid)
+                                    target_wall = (
+                                        turn_started_wall + (rec_started_mono - turn_started_mono)
+                                        if rec_started_mono is not None
+                                        else turn_started_wall
+                                    )
+                                    best_delta: float | None = None
+                                    for r_idx, crow in enumerate(child_rows):
+                                        if r_idx in used_row_indices or crow.get("done"):
+                                            continue
+                                        c_started = float(crow.get("startedAt") or 0.0)
+                                        if c_started < (turn_started_wall - 2.0):
+                                            continue
+                                        delta = abs(c_started - target_wall)
+                                        if best_delta is None or delta < best_delta:
+                                            best_delta = delta
+                                            matched_idx = r_idx
+                                if matched_idx is None:
+                                    continue
+                                used_row_indices.add(matched_idx)
+                                crow = child_rows[matched_idx]
+                                if crow.get("sessionId"):
+                                    rec["sessionId"] = crow["sessionId"]
+                                rec["steps"] = max(int(rec.get("steps") or 0), int(crow.get("steps") or 0))
+                                rec["toolCalls"] = max(int(rec.get("toolCalls") or 0), int(crow.get("toolCalls") or 0))
+                                rec["tokens"] = dict(crow.get("tokens") or rec.get("tokens") or {"input": 0, "output": 0, "total": 0})
+                                rec["elapsedMs"] = max(int(rec.get("elapsedMs") or 0), int(crow.get("elapsedMs") or 0))
+                                rec["tps"] = float(crow.get("tps") or 0.0)
+                                rec["updatedAt"] = models.now_iso()
+                                updated_subs.append(rec)
+                            if updated_subs:
+                                try:
+                                    await asyncio.to_thread(
+                                        self._board.upsert_subagents,
+                                        worker_name,
+                                        updated_subs,
+                                        swarm_id=self.swarm_id,
+                                    )
+                                    with self._state_rlock:
+                                        t_sub = self._tasks.get(task_id)
+                                        if t_sub:
+                                            t_sub.setdefault("metadata", {}).setdefault("liveActivity", {})["lastEventAt"] = models.now_iso()
+                                    changed = True
+                                except Exception:
+                                    pass
+                    return changed
+                finally:
+                    db_poll_in_flight = False
+
+            def _throttled_progress() -> None:
+                nonlocal last_board_emit
+                now_m = time.monotonic()
+                if (now_m - last_board_emit) >= 0.4:
+                    last_board_emit = now_m
+                    self._emit_observer_event("task_progress", {"taskId": task_id})
+
+            proc: asyncio.subprocess.Process | None = None
+            try:
+                proc = await win_launcher.spawn_hermes_subprocess(
+                    cmd,
+                    cwd=cwd,
+                    env=env,
+                    stream_limit=_SUBPROCESS_STREAM_LIMIT,
+                    hidden=True,
+                    new_process_group=True,
+                )
+                self._procs[task_id] = proc
+
+                async def _read_stderr() -> None:
+                    nonlocal hermes_session_id
+                    assert proc is not None and proc.stderr is not None
+                    async for raw_line, was_truncated in _iter_stream_lines(proc.stderr):
+                        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if was_truncated:
+                            line = f"{line[:500]} ... [stderr line truncated]"
+                        if not line:
+                            continue
+                        stderr_lines.append(line)
+                        if len(stderr_lines) > 60:
+                            stderr_lines.pop(0)
+                        if line.startswith("Session: "):
+                            sid = line.split("Session: ", 1)[1].strip()
+                            if sid:
+                                hermes_session_id = sid
+                        with self._state_rlock:
+                            t = self._tasks.get(task_id)
+                            if t:
+                                act = t["metadata"]["liveActivity"]
+                                act["stderrTail"] = stderr_lines[-10:]
+                                if hermes_session_id:
+                                    act["hermesSessionId"] = hermes_session_id
+
+                async def _read_stdout() -> None:
+                    nonlocal init_model, hermes_session_id, result_event, steps_count, saw_tool_result
+                    nonlocal llm_active_ms_acc, llm_span_start_mono, streamed_chars
+                    assert proc is not None and proc.stdout is not None
+                    async for raw_line, was_truncated in _iter_stream_lines(proc.stdout):
+                        if was_truncated:
+                            stderr_lines.append("[stdout line exceeded stream limit and was truncated]")
+                            if len(stderr_lines) > 60:
+                                stderr_lines.pop(0)
+                            continue
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(ev, dict):
+                            continue
+
+                        ev_type = ev.get("type")
+                        if ev_type == "system" and ev.get("subtype") == "init":
+                            init_model = ev.get("model") or init_model
+                            hermes_session_id = ev.get("session_id") or hermes_session_id
+                            if llm_span_start_mono is None:
+                                llm_span_start_mono = time.monotonic()
+                            with self._state_rlock:
+                                t = self._tasks.get(task_id)
+                                if t:
+                                    act = t["metadata"]["liveActivity"]
+                                    act["lastEventAt"] = models.now_iso()
+                                    act["steps"] = max(int(act.get("steps") or 0), steps_count)
+                                    if hermes_session_id:
+                                        act["hermesSessionId"] = hermes_session_id
+                            self._emit_observer_event("task_progress", {"taskId": task_id})
+
+                        elif ev_type == "text":
+                            delta = str(ev.get("text") or "")
+                            if delta:
+                                if llm_span_start_mono is None:
+                                    llm_span_start_mono = time.monotonic()
+                                text_chunks.append(delta)
+                                self._append_live_transcript(task_id, delta)
+                                if saw_tool_result:
+                                    steps_count += 1
+                                    saw_tool_result = False
+                                streamed_chars += len(delta)
+                                with self._state_rlock:
+                                    t = self._tasks.get(task_id)
+                                    if t:
+                                        now_text_m = time.monotonic()
+                                        cur_llm_ms = _current_llm_active_ms(now_text_m)
+                                        act = t["metadata"]["liveActivity"]
+                                        act["lastEventAt"] = models.now_iso()
+                                        act["steps"] = max(int(act.get("steps") or 0), steps_count)
+                                        act["streamedChars"] = streamed_chars
+                                        act["lastTextPreview"] = "".join(text_chunks)[-280:]
+                                        act["elapsedMs"] = max(0, int((now_text_m - turn_started_mono) * 1000))
+                                        act["llmActiveMs"] = cur_llm_ms
+                                        if int(act.get("turnOutputTokens") or 0) == 0 and cur_llm_ms > 200:
+                                            act["tps"] = round(max(1, streamed_chars // 4) / (cur_llm_ms / 1000.0), 1)
+                                            act["tpsEstimated"] = True
+                                self._publish_stream_event(
+                                    task_id,
+                                    {
+                                        "artifactUpdate": {
+                                            "taskId": task_id,
+                                            "contextId": context_id_val,
+                                            "artifact": models.new_artifact("response", [models.text_part(delta)]),
+                                            "append": True,
+                                            "lastChunk": False,
+                                        }
+                                    },
+                                )
+                                _throttled_progress()
+
+                        elif ev_type == "tool_use":
+                            now_tool_m = time.monotonic()
+                            if llm_span_start_mono is not None:
+                                llm_active_ms_acc += max(0.0, (now_tool_m - llm_span_start_mono) * 1000.0)
+                                llm_span_start_mono = None
+                            tname = str(ev.get("name") or "unknown")
+                            tc_id = str(ev.get("tool_call_id") or models.new_id("tc-"))
+                            tinput = ev.get("input")
+                            preview = _format_tool_preview(tname, tinput)
+                            now_iso = models.now_iso()
+                            if saw_tool_result:
+                                steps_count += 1
+                                saw_tool_result = False
+                            entry = {
+                                "event": "tool_use",
+                                "name": tname,
+                                "tool_call_id": tc_id,
+                                "input": _sanitize_tool_input(tinput),
+                                "timestamp": ev.get("timestamp") or now_iso,
+                            }
+                            if len(tool_trace) < _TOOL_TRACE_LIMIT:
+                                tool_trace.append(entry)
+                            self._append_live_tool_trace(task_id, entry)
+                            active_tools[tc_id] = {
+                                "name": tname,
+                                "preview": preview,
+                                "startedAt": now_iso,
+                                "startedMono": time.monotonic(),
+                            }
+                            recent_item = {
+                                "name": tname,
+                                "preview": preview,
+                                "status": "running",
+                                "durationMs": 0,
+                                "at": now_iso,
+                            }
+                            recent_entries.append((tc_id, recent_item))
+                            if len(recent_entries) > _RECENT_TOOLS_LIMIT:
+                                del recent_entries[: len(recent_entries) - _RECENT_TOOLS_LIMIT]
+                            with self._state_rlock:
+                                t = self._tasks.get(task_id)
+                                if t:
+                                    act = t["metadata"]["liveActivity"]
+                                    act["lastEventAt"] = now_iso
+                                    act["steps"] = max(int(act.get("steps") or 0), steps_count)
+                                    act["toolCalls"] = act.get("toolCalls", 0) + 1
+                                    act["lastTool"] = tname
+                                    act["elapsedMs"] = max(0, int((time.monotonic() - turn_started_mono) * 1000))
+                                    if hermes_session_id:
+                                        act["hermesSessionId"] = hermes_session_id
+                                    _sync_current_tool_unlocked(act)
+                                    act["recentTools"] = [dict(item) for _, item in recent_entries]
+                                    self._maybe_save_progress()
+
+                            if tname == "delegate_task":
+                                deleg_action = str(tinput.get("action") or "").strip().lower() if isinstance(tinput, dict) else ""
+                                is_deleg_spawn = (not deleg_action) or deleg_action in ("spawn", "run", "start", "create", "delegate")
+                                if is_deleg_spawn:
+                                    spawned_delegate_tc_ids.add(tc_id)
+                                sub_recs: list[dict[str, Any]] = []
+                                now_mono_sub = time.monotonic()
+                                if is_deleg_spawn and isinstance(tinput, dict) and isinstance(tinput.get("tasks"), list):
+                                    for idx, item in enumerate(tinput["tasks"]):
+                                        if not isinstance(item, dict):
+                                            continue
+                                        sid = f"{tc_id}-{idx}"
+                                        goal_str = str(item.get("goal") or item.get("task") or f"subagent-{idx + 1}")
+                                        rec = models.new_subagent_record(
+                                            sid,
+                                            parent_worker=worker_name,
+                                            parent_task_id=task_id,
+                                            label=goal_str[:120],
+                                            state=models.MemberState.WORKING.value,
+                                            model=item.get("model") or cfg.model,
+                                        )
+                                        rec.update({
+                                            "name": f"subagent-{idx + 1}",
+                                            "task": goal_str[:180],
+                                            "status": models.MemberState.WORKING.value,
+                                            "steps": 0,
+                                            "toolCalls": 0,
+                                            "recentTools": [],
+                                            "tokens": {"input": 0, "output": 0, "total": 0},
+                                            "tps": 0.0,
+                                            "elapsedMs": 0,
+                                        })
+                                        active_subagents[sid] = rec
+                                        subagent_start_mono[sid] = now_mono_sub
+                                        sub_recs.append(rec)
+                                elif is_deleg_spawn:
+                                    goal_txt = ""
+                                    sub_model = cfg.model
+                                    if isinstance(tinput, dict):
+                                        goal_txt = str(tinput.get("goal") or tinput.get("task") or "")
+                                        sub_model = tinput.get("model") or cfg.model
+                                    rec = models.new_subagent_record(
+                                        tc_id,
+                                        parent_worker=worker_name,
+                                        parent_task_id=task_id,
+                                        label=(goal_txt or "delegate_task")[:120],
+                                        state=models.MemberState.WORKING.value,
+                                        model=sub_model,
+                                    )
+                                    rec.update({
+                                        "name": "subagent",
+                                        "task": (goal_txt or "delegate_task")[:180],
+                                        "status": models.MemberState.WORKING.value,
+                                        "steps": 0,
+                                        "toolCalls": 0,
+                                        "recentTools": [],
+                                        "tokens": {"input": 0, "output": 0, "total": 0},
+                                        "tps": 0.0,
+                                        "elapsedMs": 0,
+                                    })
+                                    active_subagents[tc_id] = rec
+                                    subagent_start_mono[tc_id] = now_mono_sub
+                                    sub_recs.append(rec)
+                                if sub_recs:
+                                    try:
+                                        self._board.upsert_subagents(worker_name, sub_recs, swarm_id=self.swarm_id)
+                                    except Exception:
+                                        pass
+
+                            self._publish_stream_event(
+                                task_id,
+                                {
+                                    "statusUpdate": {
+                                        "taskId": task_id,
+                                        "contextId": context_id_val,
+                                        "status": {
+                                            "state": models.TaskState.WORKING.value,
+                                            "message": models.new_message(
+                                                "ROLE_AGENT",
+                                                [models.text_part(f"Running tool: {tname}")],
+                                                context_id=context_id_val,
+                                                task_id=task_id,
+                                            ),
+                                            "timestamp": now_iso,
+                                        },
+                                    }
+                                },
+                            )
+                            last_board_emit = time.monotonic()
+                            self._emit_observer_event("task_progress", {"taskId": task_id})
+
+                        elif ev_type == "tool_result":
+                            tname = str(ev.get("name") or "tool")
+                            tc_id = str(ev.get("tool_call_id") or "")
+                            is_err = bool(ev.get("is_error", False))
+                            raw_output = str(ev.get("output") or "")
+                            out_preview = raw_output[:600]
+                            saw_tool_result = True
+
+                            matched_active = active_tools.pop(tc_id, None)
+                            if matched_active is None:
+                                for ak, av in reversed(list(active_tools.items())):
+                                    if av.get("name") == tname:
+                                        matched_active = active_tools.pop(ak, None)
+                                        break
+                            raw_dur = ev.get("duration_ms")
+                            if raw_dur is not None:
+                                try:
+                                    dur_ms = max(0, int(raw_dur))
+                                except (TypeError, ValueError):
+                                    dur_ms = 0
+                            elif matched_active is not None:
+                                dur_ms = max(0, int((time.monotonic() - float(matched_active["startedMono"])) * 1000))
+                            else:
+                                dur_ms = 0
+
+                            entry = {
+                                "event": "tool_result",
+                                "name": tname,
+                                "tool_call_id": tc_id,
+                                "duration_ms": dur_ms,
+                                "is_error": is_err,
+                                "output_preview": out_preview,
+                            }
+                            if len(tool_trace) < _TOOL_TRACE_LIMIT:
+                                tool_trace.append(entry)
+                            self._append_live_tool_trace(task_id, entry)
+
+                            matched_recent = False
+                            if tc_id:
+                                for r_tc, r_item in reversed(recent_entries):
+                                    if r_tc == tc_id:
+                                        r_item["status"] = "error" if is_err else "ok"
+                                        r_item["durationMs"] = dur_ms
+                                        matched_recent = True
+                                        break
+                            if not matched_recent:
+                                for _, r_item in reversed(recent_entries):
+                                    if r_item.get("name") == tname and r_item.get("status") == "running":
+                                        r_item["status"] = "error" if is_err else "ok"
+                                        r_item["durationMs"] = dur_ms
+                                        break
+
+                            with self._state_rlock:
+                                t = self._tasks.get(task_id)
+                                if t:
+                                    act = t["metadata"]["liveActivity"]
+                                    act["lastEventAt"] = models.now_iso()
+                                    act["elapsedMs"] = max(0, int((time.monotonic() - turn_started_mono) * 1000))
+                                    _sync_current_tool_unlocked(act)
+                                    act["recentTools"] = [dict(item) for _, item in recent_entries]
+                                    self._maybe_save_progress()
+
+                            if tname == "delegate_task" and tc_id in spawned_delegate_tc_ids:
+                                parsed_results = _parse_delegate_task_results(raw_output)
+                                updated_recs: list[dict[str, Any]] = []
+                                sub_state_default = models.MemberState.FAILED.value if is_err else models.MemberState.DONE.value
+                                matching_subs = [
+                                    (sid, rec) for sid, rec in active_subagents.items()
+                                    if sid == tc_id or sid.startswith(f"{tc_id}-")
+                                ]
+                                for idx, (sid, rec) in enumerate(matching_subs):
+                                    res_item = None
+                                    if parsed_results:
+                                        for cand in parsed_results:
+                                            if cand.get("task_index") == idx or (
+                                                cand.get("subagent_id") and cand.get("subagent_id") == rec.get("id")
+                                            ):
+                                                res_item = cand
+                                                break
+                                        if res_item is None and idx < len(parsed_results):
+                                            res_item = parsed_results[idx]
+
+                                    if isinstance(res_item, dict):
+                                        r_st = str(res_item.get("status") or "").strip().lower()
+                                        sub_st = (
+                                            models.MemberState.FAILED.value
+                                            if r_st in ("failed", "error", "timeout", "interrupted")
+                                            else models.MemberState.DONE.value
+                                        )
+                                        sub_tok = res_item.get("tokens") if isinstance(res_item.get("tokens"), dict) else {}
+                                        in_t = int(sub_tok.get("input") or sub_tok.get("input_tokens") or 0)
+                                        out_t = int(sub_tok.get("output") or sub_tok.get("output_tokens") or 0)
+                                        tot_t = int(sub_tok.get("total") or sub_tok.get("total_tokens") or (in_t + out_t))
+                                        if res_item.get("duration_seconds") is not None:
+                                            sub_el = max(0, int(round(float(res_item["duration_seconds"]) * 1000)))
+                                        else:
+                                            sub_el = max(0, int((time.monotonic() - subagent_start_mono.get(sid, turn_started_mono)) * 1000))
+                                        raw_trace = res_item.get("tool_trace") if isinstance(res_item.get("tool_trace"), list) else []
+                                        sub_recent: list[dict[str, Any]] = []
+                                        for tr in raw_trace[-_SUBAGENT_RECENT_TOOLS_LIMIT:]:
+                                            if not isinstance(tr, dict):
+                                                continue
+                                            tr_name = str(tr.get("tool") or tr.get("name") or "tool")
+                                            tr_prev = _format_tool_preview(tr_name, tr.get("input_summary") or tr.get("args"))
+                                            tr_st = str(tr.get("status") or "ok").lower()
+                                            sub_recent.append({
+                                                "name": tr_name,
+                                                "preview": tr_prev,
+                                                "status": "error" if tr_st in ("error", "failed") else "ok",
+                                                "durationMs": int(tr.get("duration_ms") or 0),
+                                                "at": models.now_iso(),
+                                            })
+                                        rec["state"] = sub_st
+                                        rec["status"] = sub_st
+                                        rec["model"] = res_item.get("model") or rec.get("model")
+                                        rec["steps"] = int(res_item.get("api_calls") or rec.get("steps") or 1)
+                                        rec["toolCalls"] = max(int(rec.get("toolCalls") or 0), len(raw_trace))
+                                        rec["recentTools"] = sub_recent
+                                        rec["tokens"] = {"input": in_t, "output": out_t, "total": tot_t}
+                                        rec["elapsedMs"] = sub_el
+                                        rec["tps"] = _compute_tps(out_t, sub_el)
+                                        rec["summary"] = str(res_item.get("summary") or res_item.get("error") or out_preview)[:240]
+                                        rec["updatedAt"] = models.now_iso()
+                                    else:
+                                        sub_el = max(0, dur_ms or int((time.monotonic() - subagent_start_mono.get(sid, turn_started_mono)) * 1000))
+                                        rec["state"] = sub_state_default
+                                        rec["status"] = sub_state_default
+                                        rec["elapsedMs"] = max(int(rec.get("elapsedMs") or 0), sub_el)
+                                        rec["summary"] = out_preview[:240]
+                                        rec["updatedAt"] = models.now_iso()
+                                    updated_recs.append(rec)
+
+                                if not updated_recs and tc_id:
+                                    fallback_rec = models.new_subagent_record(
+                                        tc_id,
+                                        parent_worker=worker_name,
+                                        parent_task_id=task_id,
+                                        label="delegate_task",
+                                        state=sub_state_default,
+                                        model=cfg.model,
+                                        summary=out_preview[:240],
+                                    )
+                                    fallback_rec.update({
+                                        "name": "subagent",
+                                        "task": "delegate_task",
+                                        "status": sub_state_default,
+                                        "steps": 1,
+                                        "toolCalls": 0,
+                                        "recentTools": [],
+                                        "tokens": {"input": 0, "output": 0, "total": 0},
+                                        "tps": 0.0,
+                                        "elapsedMs": dur_ms,
+                                    })
+                                    updated_recs.append(fallback_rec)
+                                if updated_recs:
+                                    try:
+                                        self._board.upsert_subagents(worker_name, updated_recs, swarm_id=self.swarm_id)
+                                    except Exception:
+                                        pass
+
+                            await _refresh_live_db_stats()
+                            if not active_tools and llm_span_start_mono is None:
+                                llm_span_start_mono = time.monotonic()
+                            self._publish_stream_event(
+                                task_id,
+                                {
+                                    "statusUpdate": {
+                                        "taskId": task_id,
+                                        "contextId": context_id_val,
+                                        "status": {
+                                            "state": models.TaskState.WORKING.value,
+                                            "message": models.new_message(
+                                                "ROLE_AGENT",
+                                                [models.text_part(f"Tool finished: {tname}")],
+                                                context_id=context_id_val,
+                                                task_id=task_id,
+                                                metadata={"toolResult": entry},
+                                            ),
+                                            "timestamp": models.now_iso(),
+                                        },
+                                    },
+                                    "toolResult": entry,
+                                },
+                            )
+                            last_board_emit = time.monotonic()
+                            self._emit_observer_event("task_progress", {"taskId": task_id})
+
+                        elif ev_type == "result":
+                            if llm_span_start_mono is not None:
+                                llm_active_ms_acc += max(0.0, (time.monotonic() - llm_span_start_mono) * 1000.0)
+                                llm_span_start_mono = None
+                            active_tools.clear()
+                            result_event = ev
+                            hermes_session_id = ev.get("session_id") or hermes_session_id
+
+                async def _live_ticker() -> None:
+                    while True:
+                        await asyncio.sleep(1.5)
+                        try:
+                            if await _refresh_live_db_stats():
+                                self._emit_observer_event("task_progress", {"taskId": task_id})
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            pass
+
+                stderr_task = asyncio.create_task(_read_stderr())
+                stdout_task = asyncio.create_task(_read_stdout())
+                ticker_task = asyncio.create_task(_live_ticker())
+                try:
+                    if cfg.run_budget_seconds is not None and int(cfg.run_budget_seconds) > 0:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(stderr_task, stdout_task),
+                                timeout=float(int(cfg.run_budget_seconds) + 15),
+                            )
+                            rc = await proc.wait()
+                        except asyncio.TimeoutError:
+                            await win_launcher.kill_process_tree(proc)
+                            await self._finalize_failure(
+                                task_id,
+                                f"Worker exceeded run_budget_seconds={int(cfg.run_budget_seconds)}s.",
+                                stderr_lines,
+                            )
+                            return
+                    else:
+                        await asyncio.gather(stderr_task, stdout_task)
+                        rc = await proc.wait()
+                finally:
+                    for pump in (ticker_task, stderr_task, stdout_task):
+                        if not pump.done():
+                            pump.cancel()
+                    await asyncio.gather(ticker_task, stderr_task, stdout_task, return_exceptions=True)
+
+            except asyncio.CancelledError:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        await win_launcher.kill_process_tree(proc)
+                    except Exception:
+                        pass
+                raise
+            except Exception as exc:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        await win_launcher.kill_process_tree(proc)
+                    except Exception:
+                        pass
+                await self._finalize_failure(task_id, f"Failed to run Hermes worker: {exc}", stderr_lines)
+                return
+            finally:
+                self._procs.pop(task_id, None)
+                try:
+                    prompt_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            wt_diff: dict[str, str] = {}
+            if worktree_path:
+                wt_diff = await worktree_mod.capture_worktree_summary(worktree_path)
+
+            raw_result_tokens: dict[str, Any] = dict((result_event or {}).get("tokens") or {})
+            cost_usd: float | None = None
+            for ckey in ("cost_usd", "total_cost_usd"):
+                if (result_event or {}).get(ckey) is not None:
+                    try:
+                        cost_usd = round(float((result_event or {})[ckey]), 6)
+                        break
+                    except Exception:
+                        pass
+
+            db_toks: dict[str, Any] = {}
+            db_cost: float | None = None
+            db_extra: dict[str, Any] = {}
+            if hermes_session_id:
+                db_toks, db_cost, db_extra = await asyncio.to_thread(
+                    _query_hermes_session_stats,
+                    hermes_session_id,
+                    model=init_model or cfg.model,
+                    provider=cfg.provider,
+                    base_url=cfg.base_url,
+                )
+            eff_prov_final = str(db_extra.get("billingProvider") or cfg.provider or "").strip().lower()
+            if cost_usd == 0.0 and (eff_prov_final == "custom" or db_cost is None):
+                cost_usd = None
+            if cost_usd is None and db_cost is not None:
+                cost_usd = db_cost
+
+            ctx_limit_final = _resolve_context_limit(init_model or cfg.model, cfg.provider, cfg.base_url)
+            if raw_result_tokens and any(raw_result_tokens.values()):
+                merged_tok = dict(raw_result_tokens)
+                raw_had_cache_read = any(
+                    raw_result_tokens.get(k) not in (None, 0, False)
+                    for k in ("cacheRead", "cache_read", "cache_read_tokens")
+                )
+                if db_toks:
+                    for fk in ("cacheRead", "cacheWrite", "reasoning", "contextUsed", "contextLimit", "contextPct"):
+                        if not merged_tok.get(fk) and db_toks.get(fk):
+                            merged_tok[fk] = db_toks[fk]
+                if (
+                    not raw_had_cache_read
+                    and "uncachedInput" not in merged_tok
+                    and "uncached_input" not in merged_tok
+                    and "uncached_input_tokens" not in merged_tok
+                ):
+                    raw_in_val = merged_tok.get("input") or merged_tok.get("input_tokens") or merged_tok.get("prompt_tokens")
+                    if raw_in_val is not None:
+                        merged_tok["uncachedInput"] = raw_in_val
+                tokens_out = _normalize_tokens_dict(merged_tok, context_limit=ctx_limit_final)
+            elif db_toks:
+                tokens_out = db_toks
+            else:
+                tokens_out = _normalize_tokens_dict({}, context_limit=ctx_limit_final)
+
+            final_duration_ms = (result_event or {}).get("duration_ms")
+            if final_duration_ms is not None:
+                try:
+                    final_elapsed_ms = max(0, int(final_duration_ms))
+                except (TypeError, ValueError):
+                    final_elapsed_ms = max(0, int((time.monotonic() - turn_started_mono) * 1000))
+            else:
+                final_elapsed_ms = max(0, int((time.monotonic() - turn_started_mono) * 1000))
+            final_llm_ms = _current_llm_active_ms(time.monotonic())
+            tps_ms = final_llm_ms if final_llm_ms >= 250 else final_elapsed_ms
+            turn_output_tokens = max(0, int(tokens_out.get("output", 0)) - prior_output_tokens)
+            if turn_output_tokens > 0:
+                final_tps = _compute_tps(turn_output_tokens, tps_ms)
+                final_tps_estimated = False
+            elif streamed_chars > 0 and tps_ms > 200:
+                final_tps = round(max(1, streamed_chars // 4) / (tps_ms / 1000.0), 1)
+                final_tps_estimated = True
+            else:
+                final_tps = 0.0
+                final_tps_estimated = False
+
+            async with self._async_lock:
+                with self._state_rlock:
+                    task = self._tasks.get(task_id)
+                    if not task:
+                        return
+                    if (
+                        (task.get("status") or {}).get("state") == models.TaskState.CANCELED.value
+                        or self._is_worker_killed(worker_name)
+                    ):
+                        if (task.get("status") or {}).get("state") not in models.TERMINAL_STATES:
+                            task["status"] = {
+                                "state": models.TaskState.CANCELED.value,
+                                "message": models.new_message(
+                                    "ROLE_AGENT",
+                                    [models.text_part("Killed by coordinator.")],
+                                    context_id=task["contextId"],
+                                    task_id=task_id,
+                                ),
+                                "timestamp": models.now_iso(),
+                            }
+                        self._last_active_worker_count = self._count_active_workers_unlocked()
+                        ev = self._events.pop(task_id, None)
+                        if ev:
+                            ev.set()
+                        self._publish_stream_event(task_id, None)
+                        self._emit_observer_event("task_updated", {"taskId": task_id, "state": models.TaskState.CANCELED.value})
+                        return
+
+                    final_text = ""
+                    if result_event and result_event.get("text"):
+                        final_text = str(result_event["text"])
+                    elif text_chunks:
+                        final_text = "".join(text_chunks)
+
+                    result_rc = int((result_event or {}).get("exit_code", rc or 0))
+                    err_msg = str((result_event or {}).get("error") or "")
+
+                    if hermes_session_id:
+                        self._context_sessions[task["contextId"]] = hermes_session_id
+
+                    has_input_req = any(ln.lstrip().startswith("[INPUT_REQUIRED]") for ln in final_text.splitlines())
+                    if result_rc == 3 or has_input_req:
+                        state = models.TaskState.INPUT_REQUIRED.value
+                        prompt_msg = final_text or err_msg or "Hermes worker requested additional input."
+                    elif result_rc == 0 and not err_msg:
+                        state = models.TaskState.COMPLETED.value
+                        prompt_msg = "Task completed."
+                    else:
+                        state = models.TaskState.FAILED.value
+                        real_errs = [l for l in stderr_lines if not l.startswith(("Session: ", "session_id: "))]
+                        prompt_msg = err_msg or "\n".join(real_errs[-8:]) or f"Hermes exited with code {result_rc}."
+
+                    turn_num = max(
+                        1,
+                        sum(1 for m in (task.get("history") or []) if isinstance(m, dict) and m.get("role") == "ROLE_USER"),
+                    )
+
+                    preserved: list[dict[str, Any]] = []
+                    for prev_art in task.get("artifacts") or []:
+                        if not isinstance(prev_art, dict):
+                            continue
+                        art_copy = dict(prev_art)
+                        aname = str(art_copy.get("name") or "")
+                        if aname in ("response", "tool_trace", "usage_and_session", "worktree_diff"):
+                            prev_meta = dict(art_copy.get("metadata") or {})
+                            prev_turn = prev_meta.get("turn") or max(1, turn_num - 1)
+                            prev_meta.setdefault("originalName", aname)
+                            prev_meta.setdefault("turn", prev_turn)
+                            art_copy["metadata"] = prev_meta
+                            art_copy["name"] = f"{aname}_turn_{prev_turn}"
+                        preserved.append(art_copy)
+
+                    new_arts: list[dict[str, Any]] = []
+                    if final_text:
+                        new_arts.append(
+                            models.new_artifact(
+                                "response",
+                                [models.text_part(final_text)],
+                                description="Final text output from Hermes worker",
+                                metadata={"turn": turn_num},
+                            )
+                        )
+                    if tool_trace:
+                        new_arts.append(
+                            models.new_artifact(
+                                "tool_trace",
+                                [models.data_part({"toolCalls": len([x for x in tool_trace if x.get("event") == "tool_use"]), "events": tool_trace})],
+                                description="Structured trace of tools invoked by the Hermes worker",
+                                metadata={"turn": turn_num},
+                            )
+                        )
+                    usage_payload = {
+                        "hermesSessionId": hermes_session_id or None,
+                        "model": init_model or cfg.model,
+                        "provider": cfg.provider,
+                        "exitCode": result_rc,
+                        "tokens": tokens_out,
+                        "costUsd": cost_usd,
+                        "durationMs": (result_event or {}).get("duration_ms"),
+                        "workdir": cfg.workdir,
+                        "worktree": cfg.worktree,
+                        "worktreePath": worktree_path,
+                        "worktreeBranch": worktree_branch,
+                        "worktreeDiffStat": wt_diff.get("diffStat") if worktree_path else None,
+                        "turn": turn_num,
+                    }
+                    if worktree_path and (wt_diff.get("status") or wt_diff.get("diffStat")):
+                        new_arts.append(
+                            models.new_artifact(
+                                "worktree_diff",
+                                [models.data_part({"worktreePath": worktree_path, "worktreeBranch": worktree_branch, **wt_diff})],
+                                description="Git status and diff stat in isolated worker worktree",
+                                metadata={"turn": turn_num},
+                            )
+                        )
+                    new_arts.append(
+                        models.new_artifact(
+                            "usage_and_session",
+                            [models.data_part(usage_payload)],
+                            description="Token usage, timing, and session/worktree metadata",
+                            metadata={"turn": turn_num},
+                        )
+                    )
+
+                    task["artifacts"] = [*preserved, *new_arts]
+                    task.setdefault("history", []).append(
+                        models.new_message(
+                            "ROLE_AGENT",
+                            [models.text_part(final_text if final_text else prompt_msg)],
+                            context_id=task["contextId"],
+                            task_id=task_id,
+                        )
+                    )
+                    done_ts = models.now_iso()
+                    task["status"] = {
+                        "state": state,
+                        "message": models.new_message(
+                            "ROLE_AGENT",
+                            [models.text_part(prompt_msg if state != models.TaskState.COMPLETED.value else "Completed")],
+                            context_id=task["contextId"],
+                            task_id=task_id,
+                        ),
+                        "timestamp": done_ts,
+                    }
+                    act = task["metadata"]["liveActivity"]
+                    act["hermesSessionId"] = hermes_session_id or act.get("hermesSessionId")
+                    act["currentTool"] = None
+                    act["steps"] = max(int(act.get("steps") or 0), steps_count)
+                    act["elapsedMs"] = final_elapsed_ms
+                    act["llmActiveMs"] = final_llm_ms
+                    act["turnOutputTokens"] = turn_output_tokens
+                    act["tps"] = final_tps
+                    act["tpsEstimated"] = final_tps_estimated
+                    final_status_str = "error" if state == models.TaskState.FAILED.value else "ok"
+                    final_recent: list[dict[str, Any]] = []
+                    for _, r_item in recent_entries[-_RECENT_TOOLS_LIMIT:]:
+                        rcopy = dict(r_item)
+                        if rcopy.get("status") == "running":
+                            rcopy["status"] = final_status_str
+                        final_recent.append(rcopy)
+                    act["recentTools"] = final_recent
+                    if state in models.TERMINAL_STATES:
+                        act["endedAt"] = done_ts
+                    if state == models.TaskState.FAILED.value:
+                        err_summary = (err_msg or prompt_msg or "")[:300]
+                        act["lastError"] = err_summary
+                        is_quota = bool(QUOTA_RE.search(err_summary) or any(QUOTA_RE.search(s) for s in stderr_lines[-10:]))
+                        task["metadata"]["failure"] = {
+                            "kind": "quota" if is_quota else "error",
+                            "text": err_summary,
+                            "since": done_ts,
+                        }
+                    task["metadata"]["tokens"] = tokens_out
+                    if cost_usd is not None:
+                        task["metadata"]["costUsd"] = cost_usd
+                    if worktree_path:
+                        task["metadata"]["worktreePath"] = worktree_path
+                        task["metadata"]["worktreeBranch"] = worktree_branch
+                        if wt_diff.get("diffStat"):
+                            task["metadata"]["worktreeDiffStat"] = wt_diff["diffStat"]
+                    if stderr_lines and state == models.TaskState.FAILED.value:
+                        task["metadata"]["stderrTail"] = stderr_lines[-10:]
+
+                self._save_state()
+                self._publish_stream_event(
+                    task_id,
+                    {
+                        "statusUpdate": {
+                            "taskId": task_id,
+                            "contextId": task["contextId"],
+                            "status": task["status"],
+                        }
+                    },
+                )
+                self._publish_stream_event(task_id, None)
+                ev = self._events.pop(task_id, None) if state in models.TERMINAL_STATES else self._events.get(task_id)
+                if ev:
+                    ev.set()
+
+            roster_state = (
+                models.MemberState.INPUT_REQUIRED.value
+                if state == models.TaskState.INPUT_REQUIRED.value
+                else (models.MemberState.WAITING.value if state == models.TaskState.COMPLETED.value else models.MemberState.FAILED.value)
+            )
+            try:
+                self._board.upsert_member(
+                    worker_name,
+                    role=cfg.role,
+                    state=roster_state,
+                    task_id=task_id,
+                    context_id=task["contextId"],
+                    session_id=hermes_session_id or None,
+                    model=init_model or cfg.model,
+                    provider=cfg.provider,
+                    workdir=cfg.workdir,
+                    worktree_path=worktree_path,
+                    worktree_branch=worktree_branch,
+                    swarm_id=self.swarm_id,
+                )
+                if (
+                    str(cfg.role or "").strip().lower() == models.Role.NARRATOR.value
+                    or worker_name.lower().startswith("narrator")
+                ) and state in (models.TaskState.COMPLETED.value, models.TaskState.INPUT_REQUIRED.value):
+                    cur_board_after = self._board.read_board(self.swarm_id)
+                    cur_head = self._board.head_seq(cur_board_after)
+                    if cur_head > 0:
+                        self._board.mark_member_read(worker_name, cur_head, swarm_id=self.swarm_id)
+            except Exception:
+                pass
+
+            # Replay queued @mentions that arrived while this worker was busy.
+            if state != models.TaskState.CANCELED.value and not self._is_worker_killed(worker_name):
+                try:
+                    await self._router.flush_pending_for_worker(self.swarm_id, worker_name)
+                except Exception:
+                    pass
+
+            self._emit_observer_event("task_updated", {"taskId": task_id, "state": state, "worker": worker_name})
+            self._emit_task_wake_if_needed(
+                task_id=task_id,
+                worker_name=worker_name,
+                worker_role=str(cfg.role or models.Role.WORKER.value),
+                state=state,
+                error_text=err_msg or (prompt_msg if state == models.TaskState.FAILED.value else ""),
+            )
+        finally:
+            self._bg_jobs.pop(task_id, None)
+
+    def _emit_task_wake_if_needed(
+        self,
+        *,
+        task_id: str,
+        worker_name: str,
+        worker_role: str,
+        state: str,
+        error_text: str = "",
+    ) -> None:
+        role_low = str(worker_role or models.Role.WORKER.value).strip().lower()
+        if role_low == models.Role.SUBAGENT.value:
+            return
+        wlow = str(worker_name or "").strip().lower()
+        is_killed_board = self._is_member_killed_on_board(worker_name)
+        is_canceled = state == models.TaskState.CANCELED.value
+        with self._state_rlock:
+            is_killed = is_killed_board or (bool(wlow) and wlow in self._killed_workers)
+            cur_active = self._count_active_workers_unlocked()
+            dropped_to_zero = (
+                (not is_killed)
+                and (not is_canceled)
+                and (not self._suppress_all_finished_wake)
+                and self._last_active_worker_count > 0
+                and cur_active == 0
+            )
+            self._last_active_worker_count = cur_active
+            if cur_active == 0:
+                self._suppress_all_finished_wake = False
+
+        if is_killed or is_canceled:
+            return
+
+        is_attention_state = state in (models.TaskState.FAILED.value, models.TaskState.INPUT_REQUIRED.value)
+        if not is_attention_state and not dropped_to_zero:
+            return
+
+        is_quota = bool(
+            state == models.TaskState.FAILED.value
+            and QUOTA_RE.search(error_text or "")
+        )
+        if state == models.TaskState.FAILED.value:
+            kind = models.MessageType.ESCALATION.value
+            detail = f": {error_text.strip()[:140]}" if error_text.strip() else ""
+            summary = f"@{worker_name} entered {state} ({task_id}){detail}"
+        elif state == models.TaskState.INPUT_REQUIRED.value:
+            kind = models.MessageType.QUESTION.value
+            summary = f"@{worker_name} paused in {state} ({task_id})"
+        else:
+            kind = models.MessageType.POST.value
+            summary = f"All active Tier-2 workers in swarm '{self.swarm_id}' finished (latest: @{worker_name} -> {state})."
+
+        payload: dict[str, Any] = {
+            "swarmId": self.swarm_id,
+            "synthetic": True,
+            "seq": 0,
+            "worker": worker_name,
+            "workerRole": role_low,
+            "state": state,
+            "kind": kind,
+            "summary": summary,
+            "task": {
+                "taskId": task_id,
+                "workerName": worker_name,
+                "state": state,
+                "activeWorkerCount": cur_active,
+            },
+        }
+        if is_quota:
+            payload["reason"] = "quota"
+        self._emit_observer_event("coordinator_wake", payload)
+
+    async def _finalize_failure(self, task_id: str, error_text: str, stderr_lines: list[str]) -> None:
+        worker_name = ""
+        ctx_id: str | None = None
+        wcfg: dict[str, Any] = {}
+        async with self._async_lock:
+            with self._state_rlock:
+                task = self._tasks.get(task_id)
+                if not task:
+                    return
+                wcfg = dict((task.get("metadata") or {}).get("workerConfig") or {})
+                ctx_id = task.get("contextId")
+                worker_name = str(wcfg.get("worker_name") or "")
+                if (
+                    (task.get("status") or {}).get("state") == models.TaskState.CANCELED.value
+                    or self._is_worker_killed(worker_name)
+                ):
+                    self._last_active_worker_count = self._count_active_workers_unlocked()
+                    ev = self._events.pop(task_id, None)
+                    if ev:
+                        ev.set()
+                    self._publish_stream_event(task_id, None)
+                    return
+
+                done_ts = models.now_iso()
+                task["status"] = {
+                    "state": models.TaskState.FAILED.value,
+                    "message": models.new_message(
+                        "ROLE_AGENT",
+                        [models.text_part(error_text)],
+                        context_id=task["contextId"],
+                        task_id=task_id,
+                    ),
+                    "timestamp": done_ts,
+                }
+                if stderr_lines:
+                    task["metadata"]["stderrTail"] = stderr_lines[-10:]
+                is_quota_fail = bool(QUOTA_RE.search(error_text or "") or any(QUOTA_RE.search(s) for s in stderr_lines[-10:]))
+                task["metadata"]["failure"] = {
+                    "kind": "quota" if is_quota_fail else "error",
+                    "text": error_text[:300],
+                    "since": done_ts,
+                }
+                act = (task.get("metadata") or {}).get("liveActivity")
+                if isinstance(act, dict):
+                    act["lastError"] = error_text[:300]
+                    act["endedAt"] = done_ts
+                    act["currentTool"] = None
+                    act["elapsedMs"] = _elapsed_ms(act.get("startedAt") or (task.get("metadata") or {}).get("createdAt"), ended_at=done_ts)
+                    recent = []
+                    for r_item in list(act.get("recentTools") or []):
+                        if isinstance(r_item, dict):
+                            rcopy = dict(r_item)
+                            if rcopy.get("status") == "running":
+                                rcopy["status"] = "error"
+                            recent.append(rcopy)
+                    act["recentTools"] = recent[-_RECENT_TOOLS_LIMIT:]
+
+            self._save_state()
+            self._publish_stream_event(task_id, None)
+            ev = self._events.pop(task_id, None)
+            if ev:
+                ev.set()
+
+        if worker_name:
+            if not self._is_worker_killed(worker_name):
+                try:
+                    self._board.upsert_member(
+                        worker_name,
+                        role=str(wcfg.get("role") or models.Role.WORKER.value),
+                        state=models.MemberState.FAILED.value,
+                        task_id=task_id,
+                        context_id=ctx_id,
+                        model=wcfg.get("model"),
+                        workdir=wcfg.get("workdir"),
+                        swarm_id=self.swarm_id,
+                    )
+                except Exception:
+                    pass
+                try:
+                    await self._router.flush_pending_for_worker(self.swarm_id, worker_name)
+                except Exception:
+                    pass
+
+        self._emit_observer_event("task_updated", {"taskId": task_id, "state": models.TaskState.FAILED.value})
+        self._emit_task_wake_if_needed(
+            task_id=task_id,
+            worker_name=worker_name or task_id,
+            worker_role=str(wcfg.get("role") or models.Role.WORKER.value),
+            state=models.TaskState.FAILED.value,
+            error_text=error_text,
+        )
+
+    async def get_task(
+        self,
+        task_id: str,
+        *,
+        history_length: int | None = None,
+        include_artifacts: bool = True,
+        wait_seconds: float = 0.0,
+    ) -> dict[str, Any]:
+        cur_loop = asyncio.get_running_loop()
+        if self._loop is not None and not self._loop.is_closed() and self._loop.is_running() and self._loop is not cur_loop:
+            return await self.run_on_loop(
+                self.get_task,
+                task_id,
+                history_length=history_length,
+                include_artifacts=include_artifacts,
+                wait_seconds=wait_seconds,
+            )
+        self.bind_loop(cur_loop)
+        self._ensure_async_lock(cur_loop)
+
+        if wait_seconds and wait_seconds > 0:
+            ev = self._events.get(task_id)
+            if ev and not ev.is_set():
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=float(wait_seconds))
+                except asyncio.TimeoutError:
+                    pass
+
+        with self._state_rlock:
+            task = self._tasks.get(task_id)
+            if not task:
+                raise KeyError(f"TaskNotFoundError: task '{task_id}' does not exist.")
+            view = models.format_task_view(task, history_length=history_length, include_artifacts=include_artifacts)
+            buf = self._live_buffers.get(task_id)
+            meta = view.setdefault("metadata", {})
+            if buf:
+                meta["liveTranscript"] = str(buf.get("liveTranscript") or "")
+                meta["liveToolTrace"] = [dict(x) for x in (buf.get("liveToolTrace") or [])]
+            self._enrich_view_telemetry_unlocked(view)
+            return view
+
+    async def list_tasks(
+        self,
+        *,
+        context_id: str | None = None,
+        state: str | None = None,
+        include_artifacts: bool = False,
+        history_length: int | None = None,
+        page_size: int = 50,
+        page_token: str = "",
+        include_live: bool = False,
+    ) -> dict[str, Any]:
+        with self._state_rlock:
+            items = list(self._tasks.values())
+            if context_id:
+                items = [t for t in items if t.get("contextId") == context_id]
+            if state:
+                items = [t for t in items if ((t.get("status") or {}).get("state") == state)]
+            items.sort(key=lambda t: ((t.get("status") or {}).get("timestamp") or ""), reverse=True)
+            total_size = len(items)
+            offset = int(page_token) if page_token.isdigit() else 0
+            limit = max(1, min(100, int(page_size)))
+            page = items[offset : offset + limit]
+            next_token = str(offset + limit) if (offset + limit) < total_size else ""
+            views: list[dict[str, Any]] = []
+            for t in page:
+                v = models.format_task_view(t, history_length=history_length, include_artifacts=include_artifacts)
+                if include_live or ((v.get("status") or {}).get("state") == models.TaskState.WORKING.value):
+                    buf = self._live_buffers.get(str(v.get("id") or ""))
+                    if buf:
+                        v.setdefault("metadata", {})["liveTranscript"] = str(buf.get("liveTranscript") or "")
+                        v.setdefault("metadata", {})["liveToolTrace"] = [dict(x) for x in (buf.get("liveToolTrace") or [])]
+                self._enrich_view_telemetry_unlocked(v)
+                views.append(v)
+            return {
+                "tasks": views,
+                "nextPageToken": next_token,
+                "pageSize": limit,
+                "totalSize": total_size,
+            }
+
+    async def cancel_task(self, task_id: str, reason: str = "Canceled by coordinator.") -> dict[str, Any]:
+        cur_loop = asyncio.get_running_loop()
+        if self._loop is not None and not self._loop.is_closed() and self._loop.is_running() and self._loop is not cur_loop:
+            return await self.run_on_loop(self.cancel_task, task_id, reason=reason)
+        self.bind_loop(cur_loop)
+        self._ensure_async_lock(cur_loop)
+
+        async with self._async_lock:
+            with self._state_rlock:
+                task = self._tasks.get(task_id)
+                if not task:
+                    raise KeyError(f"TaskNotFoundError: task '{task_id}' does not exist.")
+                cur_state = (task.get("status") or {}).get("state")
+                if cur_state in models.TERMINAL_STATES:
+                    raise RuntimeError(f"TaskNotCancelableError: task '{task_id}' is already {cur_state}.")
+
+                done_ts = models.now_iso()
+                task["status"] = {
+                    "state": models.TaskState.CANCELED.value,
+                    "message": models.new_message(
+                        "ROLE_AGENT",
+                        [models.text_part(reason)],
+                        context_id=task["contextId"],
+                        task_id=task_id,
+                    ),
+                    "timestamp": done_ts,
+                }
+                act = (task.get("metadata") or {}).get("liveActivity")
+                if isinstance(act, dict):
+                    act["endedAt"] = done_ts
+                    act["currentTool"] = None
+                    act["elapsedMs"] = _elapsed_ms(act.get("startedAt") or (task.get("metadata") or {}).get("createdAt"), ended_at=done_ts)
+                    recent = []
+                    for r_item in list(act.get("recentTools") or []):
+                        if isinstance(r_item, dict):
+                            rcopy = dict(r_item)
+                            if rcopy.get("status") == "running":
+                                rcopy["status"] = "error"
+                            recent.append(rcopy)
+                    act["recentTools"] = recent[-_RECENT_TOOLS_LIMIT:]
+                proc = self._procs.get(task_id)
+                wcfg = dict((task.get("metadata") or {}).get("workerConfig") or {})
+                ctx_id = task.get("contextId")
+                hermes_sid = str((act.get("hermesSessionId") if isinstance(act, dict) else "") or self._context_sessions.get(ctx_id) or "").strip()
+                self._last_active_worker_count = self._count_active_workers_unlocked()
+            self._save_state()
+
+        if hermes_sid:
+            try:
+                await win_launcher.interrupt_hermes_gateway_session(hermes_sid)
+            except Exception:
+                pass
+
+        if proc:
+            await win_launcher.kill_process_tree(proc)
+
+        self._publish_stream_event(task_id, None)
+        ev = self._events.pop(task_id, None)
+        if ev:
+            ev.set()
+
+        wname = str(wcfg.get("worker_name") or "")
+        if wname:
+            try:
+                self._board.upsert_member(
+                    wname,
+                    role=str(wcfg.get("role") or models.Role.WORKER.value),
+                    state=models.MemberState.CANCELED.value,
+                    task_id=task_id,
+                    context_id=ctx_id,
+                    swarm_id=self.swarm_id,
+                )
+            except Exception:
+                pass
+
+        self._emit_observer_event("task_updated", {"taskId": task_id, "state": models.TaskState.CANCELED.value})
+        return await self.get_task(task_id, include_artifacts=True)
+
+    async def spawn_workers(
+        self,
+        *,
+        name: str,
+        prompt: str,
+        role: str = models.Role.WORKER.value,
+        tasks: list[str] | None = None,
+        n: int | None = None,
+        fork_from: str | None = None,
+        workdir: str | None = None,
+        worktree: bool = False,
+        channels: list[str] | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        base_url: str | None = None,
+        profile: str = "default",
+        reasoning: str | None = None,
+        toolsets: list[str] | None = None,
+        skills: list[str] | None = None,
+        max_turns: int | None = None,
+        run_budget_seconds: int | None = None,
+        role_prompt: str | None = None,
+        return_immediately: bool = True,
+        wait_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        """Spawn a single worker or a sharded group (`<name>-1..k`) cleanly."""
+        clean_base = store.sanitize_swarm_id(name)
+        if not clean_base or clean_base in (models.Role.COORDINATOR.value, models.Role.PRIMARY.value, "all"):
+            raise ValueError(f"Invalid worker name: {name!r}")
+        validated_role = models.validate_worker_role(role)
+
+        specs: list[tuple[str, str]] = []
+        if tasks and len(tasks) > 0:
+            for idx, slice_item in enumerate(tasks, start=1):
+                wname = f"{clean_base}-{idx}"
+                wprompt = f"{prompt.strip()}\n\n[ASSIGNED SLICE {idx}/{len(tasks)}]\n{str(slice_item).strip()}"
+                specs.append((wname, wprompt))
+        elif n is not None and int(n) > 1:
+            count = int(n)
+            for idx in range(1, count + 1):
+                wname = f"{clean_base}-{idx}"
+                wprompt = f"{prompt.strip()}\n\n[SHARD INSTANCE {idx}/{count}]"
+                specs.append((wname, wprompt))
+        else:
+            specs.append((clean_base, prompt.strip()))
+
+        async def _launch_one(wname: str, wprompt: str) -> dict[str, Any]:
+            wcfg = models.WorkerConfig(
+                model=model,
+                provider=provider,
+                base_url=base_url,
+                profile=profile or "default",
+                reasoning=reasoning,
+                workdir=workdir,
+                worktree=bool(worktree),
+                toolsets=toolsets,
+                skills=skills,
+                max_turns=max_turns,
+                run_budget_seconds=run_budget_seconds,
+                role=validated_role,
+                role_prompt=role_prompt,
+                worker_name=wname,
+                channels=channels or [models.DEFAULT_CHANNEL],
+                parent_worker=fork_from or models.Role.COORDINATOR.value,
+                fork_from=fork_from,
+            )
+            return await self.send_message(
+                message_parts=[models.text_part(wprompt)],
+                config=wcfg,
+                return_immediately=return_immediately,
+                wait_seconds=wait_seconds,
+                defer_channel_subscribe=bool(channels),
+                allow_unkill=True,
+            )
+
+        launched = await asyncio.gather(*(_launch_one(wn, wp) for wn, wp in specs))
+        if channels:
+            worker_names = [wn for wn, _ in specs]
+            for raw_ch in channels:
+                norm_ch = models.normalize_channel_name(raw_ch)
+                if norm_ch not in (models.DEFAULT_CHANNEL, "*"):
+                    try:
+                        self._board.channel_action(
+                            "subscribe",
+                            channel=norm_ch,
+                            members=worker_names,
+                            actor=models.Role.COORDINATOR.value,
+                            swarm_id=self.swarm_id,
+                        )
+                    except Exception:
+                        pass
+        return {
+            "swarmId": self.swarm_id,
+            "count": len(launched),
+            "workers": [
+                {
+                    "name": wn,
+                    "role": validated_role,
+                    "taskId": t.get("id"),
+                    "contextId": t.get("contextId"),
+                    "state": (t.get("status") or {}).get("state"),
+                    "worktreePath": (t.get("metadata") or {}).get("worktreePath"),
+                }
+                for (wn, _), t in zip(specs, launched)
+            ],
+            "tasks": launched,
+        }
+
+    def _is_worker_killed(self, worker_name: str) -> bool:
+        wlow = str(worker_name or "").strip().lower()
+        if wlow:
+            with self._state_rlock:
+                if wlow in self._killed_workers:
+                    return True
+        return self._is_member_killed_on_board(worker_name)
+
+    def _is_member_killed_on_board(self, worker_name: str) -> bool:
+        try:
+            board = self._board.read_board(self.swarm_id)
+            members = board.get("members") if isinstance(board.get("members"), dict) else {}
+            mem = members.get(worker_name)
+            if not isinstance(mem, dict):
+                wlow = str(worker_name or "").strip().lower()
+                for mname, mrec in members.items():
+                    if mname.lower() == wlow and isinstance(mrec, dict):
+                        mem = mrec
+                        break
+            if isinstance(mem, dict):
+                return bool(mem.get("killed")) or str(mem.get("state") or "").strip().lower() == models.MemberState.KILLED.value
+        except Exception:
+            pass
+        return False
+
+    def _find_worker_tasks(self, worker_name: str) -> list[dict[str, Any]]:
+        wlow = str(worker_name or "").strip().lower()
+        if not wlow:
+            return []
+        with self._state_rlock:
+            matches = [
+                t for t in self._tasks.values()
+                if str((((t.get("metadata") or {}).get("workerConfig") or {}).get("worker_name") or "")).strip().lower() == wlow
+            ]
+            matches.sort(
+                key=lambda t: str(((t.get("status") or {}).get("timestamp")) or ((t.get("metadata") or {}).get("createdAt")) or ""),
+                reverse=True,
+            )
+            return [dict(m) for m in matches]
+
+    async def resume_worker(
+        self,
+        name: str,
+        prompt: str,
+        *,
+        return_immediately: bool = True,
+        wait_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        """Resume an idle/interrupted worker preserving its `contextId` and worktree."""
+        cur_loop = asyncio.get_running_loop()
+        if self._loop is not None and not self._loop.is_closed() and self._loop.is_running() and self._loop is not cur_loop:
+            return await self.run_on_loop(
+                self.resume_worker,
+                name,
+                prompt,
+                return_immediately=return_immediately,
+                wait_seconds=wait_seconds,
+            )
+        self.bind_loop(cur_loop)
+        self._ensure_async_lock(cur_loop)
+
+        parts = [models.text_part(prompt)]
+        prompt_body = models.extract_text_from_parts(parts).strip()
+        if not prompt_body:
+            raise ValueError("Message parts produced an empty prompt.")
+
+        async with self._async_lock:
+            if self._is_worker_killed(name):
+                raise RuntimeError(f"Worker '{name}' has been killed and cannot be resumed.")
+            latest = self.find_latest_worker_task(name)
+            if not latest:
+                raise KeyError(f"Worker '{name}' not found in swarm '{self.swarm_id}'.")
+            cur_state = ((latest.get("status") or {}).get("state")) or ""
+            if cur_state in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value):
+                raise RuntimeError(f"Worker '{name}' is already active ({cur_state}).")
+
+            meta = latest.get("metadata") or {}
+            prev_cfg = dict(meta.get("workerConfig") or {})
+            wt_path = str(meta.get("worktreePath") or "").strip()
+            if wt_path and Path(wt_path).is_dir():
+                prev_cfg["workdir"] = wt_path
+                prev_cfg["worktree"] = False
+            wcfg = models.WorkerConfig.from_dict(prev_cfg)
+            resume_tid = latest["id"] if cur_state in models.INTERRUPTED_STATES else None
+            task_id_out, done_event = await self._send_message_locked(
+                message_parts=parts,
+                prompt_body=prompt_body,
+                context_id=latest.get("contextId"),
+                task_id=resume_tid,
+                config=wcfg,
+                preserve_assignment=True,
+                allow_unkill=False,
+            )
+
+        if not return_immediately:
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=max(1.0, float(wait_seconds)))
+            except asyncio.TimeoutError:
+                pass
+        return await self.get_task(task_id_out, include_artifacts=True)
+
+    async def switch_model(
+        self,
+        name: str,
+        *,
+        model: str | None = None,
+        provider: str | None = None,
+        reasoning: str | None = None,
+        prompt: str | None = None,
+        return_immediately: bool = True,
+        wait_seconds: float = 300.0,
+    ) -> dict[str, Any]:
+        """Switch a waiting worker's (or coordinator's) model/provider/reasoning while preserving its A2A `contextId`."""
+        clean_name = str(name or "").strip().lstrip("@")
+        if clean_name.lower() == models.Role.COORDINATOR.value:
+            self._board.upsert_member(
+                models.Role.COORDINATOR.value,
+                role=models.Role.COORDINATOR.value,
+                model=model,
+                provider=provider,
+                swarm_id=self.swarm_id,
+            )
+            return {
+                "switched": True,
+                "worker": models.Role.COORDINATOR.value,
+                "model": model,
+                "provider": provider,
+                "reasoning": reasoning,
+                "note": "Coordinator model preference updated on board.",
+            }
+
+        cur_loop = asyncio.get_running_loop()
+        if self._loop is not None and not self._loop.is_closed() and self._loop.is_running() and self._loop is not cur_loop:
+            return await self.run_on_loop(
+                self.switch_model,
+                name,
+                model=model,
+                provider=provider,
+                reasoning=reasoning,
+                prompt=prompt,
+                return_immediately=return_immediately,
+                wait_seconds=wait_seconds,
+            )
+        self.bind_loop(cur_loop)
+        self._ensure_async_lock(cur_loop)
+
+        async with self._async_lock:
+            with self._state_rlock:
+                if self._is_worker_killed(clean_name):
+                    raise RuntimeError(f"Worker '{clean_name}' has been killed and cannot switch models.")
+                latest = self.find_latest_worker_task(clean_name)
+                if not latest:
+                    raise KeyError(f"Worker '{clean_name}' not found in swarm '{self.swarm_id}'.")
+                cur_state = ((latest.get("status") or {}).get("state")) or ""
+                if cur_state in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value):
+                    raise RuntimeError(f"Cannot switch model while worker '{clean_name}' is {cur_state}; wait or stop it first.")
+
+                meta = latest.get("metadata") or {}
+                prev_cfg = dict(meta.get("workerConfig") or {})
+                old_model = prev_cfg.get("model")
+                old_provider = prev_cfg.get("provider")
+                old_reasoning = prev_cfg.get("reasoning")
+                if model is not None:
+                    prev_cfg["model"] = model
+                if provider is not None:
+                    prev_cfg["provider"] = provider
+                if reasoning is not None:
+                    prev_cfg["reasoning"] = reasoning
+
+                wt_path = str(meta.get("worktreePath") or "").strip()
+                if wt_path and Path(wt_path).is_dir():
+                    prev_cfg["workdir"] = wt_path
+                    prev_cfg["worktree"] = False
+                wcfg = models.WorkerConfig.from_dict(prev_cfg)
+                ctx_id = str(latest.get("contextId") or models.new_id("ctx-"))
+
+                route_changed = (
+                    (model is not None and model != old_model)
+                    or (provider is not None and provider != old_provider)
+                    or (reasoning is not None and reasoning != old_reasoning)
+                )
+                carry_note = ""
+                if route_changed:
+                    self._context_sessions.pop(ctx_id, None)
+                    carry_note = self._build_fork_seed_context(clean_name)
+
+            if route_changed:
+                await self._save_state_async()
+
+            self._board.upsert_member(
+                clean_name,
+                role=wcfg.role,
+                model=wcfg.model,
+                provider=wcfg.provider,
+                context_id=ctx_id,
+                swarm_id=self.swarm_id,
+            )
+
+            resume_msg = (prompt or "").strip() or (
+                f"Your model has been switched to model={wcfg.model or 'default'} "
+                f"(provider={wcfg.provider or 'default'}). Resume your unfinished assignment and report on the Swarm Board."
+            )
+            if carry_note:
+                resume_msg = f"{carry_note}\n\n{resume_msg}"
+
+            parts = [models.text_part(resume_msg)]
+            task_id_out, done_event = await self._send_message_locked(
+                message_parts=parts,
+                prompt_body=resume_msg,
+                context_id=ctx_id,
+                task_id=None,
+                config=wcfg,
+                preserve_assignment=True,
+                allow_unkill=False,
+            )
+
+        if not return_immediately:
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=max(1.0, float(wait_seconds)))
+            except asyncio.TimeoutError:
+                pass
+        task = await self.get_task(task_id_out, include_artifacts=True)
+        return {
+            "switched": True,
+            "worker": clean_name,
+            "contextId": ctx_id,
+            "model": wcfg.model,
+            "provider": wcfg.provider,
+            "reasoning": wcfg.reasoning,
+            "task": task,
+        }
+
+    async def kill_worker(
+        self,
+        name: str,
+        *,
+        reason: str = "Killed by coordinator.",
+    ) -> dict[str, Any]:
+        """Permanently terminate a worker (or `<name>-1..k` group), mark killed on board, and release claims."""
+        clean_name = str(name or "").strip().lstrip("@")
+        wlow = clean_name.lower()
+        board = self._board.read_board(self.swarm_id)
+        members_map = board.get("members") or {}
+        all_tasks = self._find_worker_tasks(clean_name)
+        if clean_name not in members_map and not all_tasks and wlow:
+            prefix = f"{wlow}-"
+            group_targets = [
+                mname for mname in members_map
+                if mname.lower().startswith(prefix) and mname[len(prefix):].isdigit()
+            ]
+            if group_targets:
+                with self._state_rlock:
+                    for gm in group_targets:
+                        self._killed_workers.add(gm.strip().lower())
+                    self._suppress_all_finished_wake = True
+                results = [await self._kill_single_worker(m, reason=reason) for m in sorted(group_targets)]
+                return {"killed": True, "group": clean_name, "count": len(results), "members": results}
+        return await self._kill_single_worker(clean_name, reason=reason)
+
+    async def _kill_single_worker(
+        self,
+        name: str,
+        *,
+        reason: str = "Killed by coordinator.",
+    ) -> dict[str, Any]:
+        """Permanently terminate a single worker, mark it killed on the board, and release its scope claims."""
+        wlow = str(name or "").strip().lower()
+        with self._state_rlock:
+            if wlow:
+                self._killed_workers.add(wlow)
+            self._last_active_worker_count = self._count_active_workers_unlocked()
+            if self._last_active_worker_count <= 1:
+                self._suppress_all_finished_wake = True
+
+        all_tasks = self._find_worker_tasks(name)
+        latest = all_tasks[0] if all_tasks else None
+
+        board = self._board.read_board(self.swarm_id)
+        existing_mem = (board.get("members") or {}).get(name)
+        role_val = (
+            (((latest.get("metadata") or {}).get("workerConfig") or {}).get("role") if latest else None)
+            or (existing_mem.get("role") if isinstance(existing_mem, dict) else None)
+            or models.Role.WORKER.value
+        )
+        wt_path = (
+            ((latest.get("metadata") or {}).get("worktreePath") if latest else None)
+            or (existing_mem.get("worktreePath") if isinstance(existing_mem, dict) else None)
+        )
+
+        # Atomically mark killed and clear queued mentions FIRST so no router/observer
+        # race sees a non-killed window or dispatches pending wakeups while canceling.
+        self._board.upsert_member(
+            name,
+            role=role_val,
+            state=models.MemberState.KILLED.value,
+            killed=True,
+            swarm_id=self.swarm_id,
+        )
+        self._board.drain_pending_mentions(name, swarm_id=self.swarm_id)
+
+        canceled_task: dict[str, Any] | None = None
+        for t in all_tasks:
+            tid = str(t.get("id") or "")
+            if not tid:
+                continue
+            st = ((t.get("status") or {}).get("state")) or ""
+            if st not in models.TERMINAL_STATES:
+                try:
+                    res_task = await self.cancel_task(tid, reason=reason)
+                    if canceled_task is None:
+                        canceled_task = res_task
+                except RuntimeError:
+                    with self._state_rlock:
+                        cur_t = self._tasks.get(tid)
+                        if cur_t and canceled_task is None:
+                            canceled_task = dict(cur_t)
+            elif canceled_task is None:
+                canceled_task = t
+
+            job = self._bg_jobs.get(tid)
+            if job is not None and not job.done():
+                job.cancel()
+                try:
+                    await asyncio.wait_for(job, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError, Exception):
+                    pass
+
+        # Sweep lingering `win_launcher.py` / `board_cli.py wait` / worktree-locked subprocesses so Windows releases handles & orphans.
+        hermes_sids: list[str] = []
+        worker_task_ids: list[str] = []
+        with self._state_rlock:
+            for t in all_tasks:
+                tid_str = str(t.get("id") or "").strip()
+                if tid_str:
+                    worker_task_ids.append(tid_str)
+                md = t.get("metadata") or {}
+                act = md.get("liveActivity") or {}
+                cid = str(t.get("contextId") or "").strip()
+                hsid = str(act.get("hermesSessionId") or (self._context_sessions.get(cid) if cid else "") or "").strip()
+                if hsid and hsid not in hermes_sids:
+                    hermes_sids.append(hsid)
+        for hsid in hermes_sids:
+            try:
+                await win_launcher.interrupt_hermes_gateway_session(hsid)
+            except Exception:
+                pass
+        killed_orphans = await win_launcher.find_and_kill_orphan_worker_processes(
+            swarm_id=self.swarm_id,
+            worker_name=name,
+            worktree_path=str(wt_path) if wt_path else None,
+            task_ids=worker_task_ids,
+        )
+        if killed_orphans:
+            await asyncio.sleep(0.05)
+
+        with self._state_rlock:
+            self._last_active_worker_count = self._count_active_workers_unlocked()
+
+        self._board.upsert_member(
+            name,
+            role=role_val,
+            state=models.MemberState.KILLED.value,
+            killed=True,
+            swarm_id=self.swarm_id,
+        )
+        released = self._board.release_scope(holder=name, swarm_id=self.swarm_id)
+        self._emit_observer_event("member_killed", {"worker": name})
+        return {
+            "killed": True,
+            "worker": name,
+            "swarmId": self.swarm_id,
+            "releasedScopes": released.get("released") or [],
+            "killedOrphanPids": killed_orphans,
+            "task": canceled_task,
+        }
+
+    async def diff_worker(
+        self,
+        name_or_task_id: str,
+        *,
+        include_patch: bool = True,
+        max_bytes: int = 200_000,
+    ) -> dict[str, Any]:
+        """Inspect git diff for a worker name or task ID."""
+        with self._state_rlock:
+            task = self._tasks.get(name_or_task_id)
+        if not task:
+            task = self.find_latest_worker_task(name_or_task_id)
+        if not task:
+            raise KeyError(f"Worker or task '{name_or_task_id}' not found in swarm '{self.swarm_id}'.")
+        meta = task.get("metadata") or {}
+        wcfg = meta.get("workerConfig") or {}
+        target_dir = meta.get("worktreePath") or wcfg.get("workdir")
+        res = await worktree_mod.inspect_git_diff(
+            target_dir,
+            include_patch=include_patch,
+            max_bytes=max_bytes,
+            branch_hint=meta.get("worktreeBranch"),
+        )
+        return {"taskId": task.get("id"), "worker": wcfg.get("worker_name"), **res}
+
+    async def wake_worker_from_board(self, worker_name: str, prompt: str) -> bool:
+        """Called by MentionRouter when a board @mention targets an idle Tier-2 Hermes worker."""
+        if self._is_member_killed_on_board(worker_name) or self.is_worker_busy(worker_name):
+            return False
+        latest = self.find_latest_worker_task(worker_name)
+        if not latest:
+            return False
+        cur_state = ((latest.get("status") or {}).get("state")) or ""
+        if cur_state in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value):
+            return False
+        try:
+            await self.resume_worker(worker_name, prompt, return_immediately=True)
+            return True
+        except Exception:
+            return False
+
+    async def clear_finished_tasks(
+        self,
+        *,
+        states: tuple[str, ...] = (
+            models.TaskState.COMPLETED.value,
+            models.TaskState.FAILED.value,
+            models.TaskState.CANCELED.value,
+        ),
+    ) -> dict[str, Any]:
+        removed: list[str] = []
+        async with self._async_lock:
+            with self._state_rlock:
+                for tid, task in list(self._tasks.items()):
+                    st = str(((task.get("status") or {}).get("state")) or "")
+                    if st in states:
+                        self._tasks.pop(tid, None)
+                        self._live_buffers.pop(tid, None)
+                        self._events.pop(tid, None)
+                        self._bg_jobs.pop(tid, None)
+                        self._subscribers.pop(tid, None)
+                        removed.append(tid)
+            if removed:
+                self._save_state()
+        if removed:
+            self._emit_observer_event("tasks_cleared", {"removedTaskIds": removed})
+        return {"swarmId": self.swarm_id, "removedCount": len(removed), "removedTaskIds": removed}
+
+    async def shutdown(self) -> None:
+        """Terminate any live worker subprocesses in parallel cleanly."""
+        procs = list(self._procs.values())
+        if procs:
+            await asyncio.gather(*(win_launcher.kill_process_tree(p, timeout=3.0) for p in procs), return_exceptions=True)
+        for job in list(self._bg_jobs.values()):
+            if not job.done():
+                job.cancel()
+        self._bg_jobs.clear()
+
+
+class SwarmManager:
+    """Coordinator across per-swarm SwarmRuntime, shared BoardService, and MentionRouter."""
+
+    def __init__(
+        self,
+        *,
+        state_dir: Path | str | None = None,
+        http_url: str | None = None,
+        default_workdir_provider: Callable[[], str | None] | None = None,
+    ) -> None:
+        self._state_dir = Path(store.normalize_local_path(str(state_dir))) if state_dir else None
+        self.store = store.SwarmStore(self._state_dir)
+        self.board_service = board_mod.BoardService(self._state_dir)
+        self._runtimes: dict[str, SwarmRuntime] = {}
+        self._lock = threading.RLock()
+        self._host_loop: asyncio.AbstractEventLoop | None = None
+        self.http_url: str | None = http_url
+        self._default_workdir_provider = default_workdir_provider
+        self._board_subscribers: dict[str, list[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]]] = {}
+        self._global_wake_subscribers: list[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]] = []
+        self._wake_history: dict[str, list[dict[str, Any]]] = {}
+        self._wake_seq_by_swarm: dict[str, int] = {}
+        self._internal_token: str | None = None
+        self._internal_token_file: Path | None = None
+
+        self.mention_router = wakeup_mod.MentionRouter(
+            self.board_service,
+            is_worker_busy=self._is_worker_busy,
+            wake_worker=self._wake_worker,
+            emit_event=self._emit_board_event,
+            poll_interval=0.5,
+        )
+        self.board_service.add_listener(self._on_board_service_event)
+
+    def _is_worker_busy(self, swarm_id: str, worker_name: str) -> bool:
+        with self._lock:
+            rt = self._runtimes.get(swarm_id)
+        return rt.is_worker_busy(worker_name) if rt is not None else False
+
+    async def _wake_worker(self, swarm_id: str, worker_name: str, prompt: str) -> bool:
+        rt = self.get_runtime(swarm_id)
+        return await rt.run_on_loop(rt.wake_worker_from_board, worker_name, prompt)
+
+    def _on_board_service_event(self, swarm_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        self._emit_board_event(swarm_id, event_type, payload)
+        if event_type == "board_post" and isinstance(payload.get("message"), dict):
+            msg = payload["message"]
+            loop = self._host_loop
+            if loop is not None and not loop.is_closed() and loop.is_running():
+                try:
+                    cur = asyncio.get_running_loop()
+                except RuntimeError:
+                    cur = None
+                if cur is loop:
+                    loop.create_task(self.mention_router.process_message(swarm_id, msg))
+                else:
+                    asyncio.run_coroutine_threadsafe(self.mention_router.process_message(swarm_id, msg), loop)
+            else:
+                try:
+                    running = asyncio.get_running_loop()
+                    running.create_task(self.mention_router.process_message(swarm_id, msg))
+                except RuntimeError:
+                    pass
+
+    def get_internal_token(self) -> str:
+        """Return the configured Bearer token or a per-stateDir internal secret for CLI -> HTTP posts."""
+        env_tok = os.environ.get("HERMES_A2A_HTTP_TOKEN", "").strip()
+        if env_tok:
+            return env_tok
+        with self._lock:
+            if self._internal_token:
+                return self._internal_token
+            tok_file = self.store.state_dir / "internal_token"
+            tok_file.parent.mkdir(parents=True, exist_ok=True)
+            if tok_file.is_file():
+                existing = tok_file.read_text(encoding="utf-8", errors="replace").strip()
+                if existing:
+                    self._internal_token = existing
+                    self._internal_token_file = tok_file
+                    return existing
+            token = secrets.token_urlsafe(32)
+            tok_file.write_text(token, encoding="utf-8")
+            try:
+                os.chmod(tok_file, 0o600)
+            except OSError:
+                pass
+            self._internal_token = token
+            self._internal_token_file = tok_file
+            return token
+
+    def get_internal_token_file(self) -> Path | None:
+        self.get_internal_token()
+        with self._lock:
+            tok_file = self._internal_token_file or (self.store.state_dir / "internal_token")
+            if tok_file.is_file():
+                return tok_file
+            return None
+
+    def set_host_loop(self, loop: asyncio.AbstractEventLoop | None) -> None:
+        self._host_loop = loop
+        if loop is not None and not loop.is_closed() and loop.is_running():
+            with self._lock:
+                for rt in self._runtimes.values():
+                    rt.bind_loop(loop)
+            self.mention_router.start_watcher(loop)
+
+    def _ensure_host_loop(self, loop: asyncio.AbstractEventLoop | None = None) -> None:
+        target = loop
+        if target is None:
+            try:
+                target = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+        if target.is_closed() or not target.is_running():
+            return
+        if self._host_loop is None or self._host_loop.is_closed() or not self._host_loop.is_running():
+            self.set_host_loop(target)
+
+    def set_http_url(self, url: str | None) -> None:
+        self.http_url = url
+        with self._lock:
+            for rt in self._runtimes.values():
+                rt.http_url = url
+
+    def set_default_workdir_provider(self, provider: Callable[[], str | None] | None) -> None:
+        self._default_workdir_provider = provider
+
+    def get_default_workdir(self, swarm_id: str | None = None) -> str | None:
+        if swarm_id:
+            meta = self.store.read_meta(swarm_id)
+            if meta and meta.get("workspace"):
+                return str(meta["workspace"])
+        if self._default_workdir_provider is not None:
+            wd = self._default_workdir_provider()
+            if wd:
+                return store.normalize_local_path(wd)
+        env_dir = (os.environ.get("HERMES_A2A_DEFAULT_WORKDIR") or "").strip()
+        if env_dir:
+            return store.normalize_local_path(env_dir)
+        return None
+
+    def get_runtime(
+        self,
+        swarm_id: str | None = None,
+        *,
+        conversation_id: str | None = None,
+    ) -> SwarmRuntime:
+        self._ensure_host_loop()
+        sid = self.resolve_swarm_id(swarm_id=swarm_id, conversation_id=conversation_id)
+        with self._lock:
+            rt = self._runtimes.get(sid)
+            if rt is None:
+                rt = SwarmRuntime(
+                    swarm_id=sid,
+                    board_service=self.board_service,
+                    mention_router=self.mention_router,
+                    state_dir=self._state_dir,
+                    http_url=self.http_url,
+                    token_file_provider=self.get_internal_token_file,
+                    on_board_event=self._emit_board_event,
+                    on_bind_loop=self._ensure_host_loop,
+                    loop=self._host_loop,
+                )
+                self._runtimes[sid] = rt
+            elif self.http_url:
+                rt.http_url = self.http_url
+            return rt
+
+    def resolve_swarm_id(
+        self,
+        *,
+        swarm_id: str | None = None,
+        conversation_id: str | None = None,
+        workspace: str | None = None,
+    ) -> str:
+        explicit = store.sanitize_swarm_id(swarm_id)
+        if explicit:
+            return explicit
+        clean_conv = str(conversation_id).strip() if conversation_id and str(conversation_id).strip() else None
+        if clean_conv:
+            matched = self.store.resolve_swarm_for_conversation(clean_conv)
+            if matched:
+                return matched
+            return store.derive_swarm_id(conversation_id=clean_conv)
+        return self.store.resolve_swarm_id(workspace=workspace)
+
+    def get_all_runtime_tasks(self) -> dict[str, list[dict[str, Any]]]:
+        with self._lock:
+            runtimes = list(self._runtimes.items())
+        return {sid: rt.get_task_snapshots() for sid, rt in runtimes}
+
+    def list_swarms(
+        self,
+        *,
+        include_archived: bool = True,
+        conversation_id: str | None = None,
+        workspace: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.store.list_swarms(
+            include_archived=include_archived,
+            current_http_url=self.http_url,
+            runtime_tasks_by_swarm=self.get_all_runtime_tasks(),
+            conversation_id=conversation_id,
+            workspace=workspace,
+        )
+
+    def subscribe_board(self, swarm_id: str) -> asyncio.Queue[dict[str, Any]]:
+        sid = store.sanitize_swarm_id(swarm_id) or "default"
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=128)
+        try:
+            sub_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            sub_loop = None
+        with self._lock:
+            self._board_subscribers.setdefault(sid, []).append((q, sub_loop))
+        return q
+
+    def unsubscribe_board(self, swarm_id: str, q: asyncio.Queue[dict[str, Any]]) -> None:
+        sid = store.sanitize_swarm_id(swarm_id) or "default"
+        with self._lock:
+            subs = self._board_subscribers.get(sid)
+            if not subs:
+                return
+            self._board_subscribers[sid] = [item for item in subs if item[0] is not q]
+            if not self._board_subscribers[sid]:
+                self._board_subscribers.pop(sid, None)
+
+    def subscribe_wake_events(self) -> asyncio.Queue[dict[str, Any]]:
+        q: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=256)
+        try:
+            sub_loop: asyncio.AbstractEventLoop | None = asyncio.get_running_loop()
+        except RuntimeError:
+            sub_loop = None
+        with self._lock:
+            self._global_wake_subscribers.append((q, sub_loop))
+        return q
+
+    def unsubscribe_wake_events(self, q: asyncio.Queue[dict[str, Any]]) -> None:
+        with self._lock:
+            self._global_wake_subscribers = [item for item in self._global_wake_subscribers if item[0] is not q]
+
+    def _active_swarm_ids(self) -> list[str]:
+        candidates: set[str] = set()
+        swarms_dir = self.store.state_dir / "swarms"
+        if swarms_dir.is_dir():
+            try:
+                for entry in swarms_dir.iterdir():
+                    if not entry.is_dir():
+                        continue
+                    sid = store.sanitize_swarm_id(entry.name)
+                    if not sid:
+                        continue
+                    paths = self.store.paths(sid)
+                    if paths.meta_file.is_file() or paths.board_file.is_file() or paths.tasks_file.is_file():
+                        candidates.add(sid)
+            except OSError:
+                pass
+        with self._lock:
+            candidates.update(self._runtimes.keys())
+        return sorted(candidates)
+
+    def list_active_wake_swarms(self) -> list[dict[str, Any]]:
+        """Return active (non-archived) swarms with conversation IDs, head seq, and activeWorkerCount."""
+        out: list[dict[str, Any]] = []
+        for sid in self._active_swarm_ids():
+            meta = self.store.read_meta(sid) or models.default_swarm_meta(sid)
+            if meta.get("archived"):
+                continue
+            board = self.board_service.read_board(sid)
+            head = self.board_service.head_seq(board)
+            rt = self.get_runtime(sid)
+            active_workers = rt.get_active_worker_count()
+            updated_at = max(str(meta.get("updatedAt") or ""), str(board.get("updatedAt") or "")) or str(meta.get("createdAt") or "")
+            out.append({
+                "swarmId": sid,
+                "primaryConversationId": meta.get("primaryConversationId"),
+                "coordinatorConversationId": meta.get("coordinatorConversationId"),
+                "projectId": meta.get("projectId"),
+                "head": head,
+                "updatedAt": updated_at,
+                "activeWorkerCount": active_workers,
+            })
+        out.sort(key=lambda item: str(item.get("updatedAt") or ""), reverse=True)
+        return out
+
+    def _build_wake_event_payload(
+        self,
+        sid: str,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        wake_seq: int,
+        meta: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        resolved_meta = meta if isinstance(meta, dict) else (self.store.read_meta(sid) or {})
+        raw_msg = payload.get("message")
+        msg_in = dict(raw_msg) if isinstance(raw_msg, dict) else None
+        is_synthetic = bool(payload.get("synthetic", False)) or (msg_in is None)
+        raw_seq = payload.get("seq") if payload.get("seq") is not None else ((msg_in or {}).get("seq") or 0)
+        seq_val = max(0, int(raw_seq or 0))
+
+        if msg_in is None:
+            summary_txt = str(payload.get("summary") or f"Task event in {sid}")
+            worker_sender = str(payload.get("worker") or (payload.get("task") or {}).get("workerName") or "runtime")
+            worker_role = str(payload.get("workerRole") or models.Role.WORKER.value)
+            default_kind = (
+                models.MessageType.ESCALATION.value
+                if ("FAILED" in str(payload.get("state") or "") or "INPUT_REQUIRED" in str(payload.get("state") or ""))
+                else models.MessageType.POST.value
+            )
+            msg_kind = str(payload.get("kind") or default_kind)
+            msg_obj: dict[str, Any] = {
+                "seq": seq_val,
+                "wakeSeq": wake_seq,
+                "id": str(payload.get("id") or f"wake-{sid}-{wake_seq}"),
+                "sender": worker_sender,
+                "senderRole": worker_role,
+                "senderTier": 2,
+                "kind": msg_kind,
+                "type": msg_kind,
+                "summary": summary_txt,
+                "text": summary_txt,
+                "mentions": [models.Role.COORDINATOR.value] if event_type == "coordinator_wake" else [models.Role.PRIMARY.value],
+                "status": "open",
+                "synthetic": True,
+            }
+        else:
+            summary_txt = str(msg_in.get("summary") or "")
+            details_txt = str(msg_in.get("details") or "")
+            full_text = str(
+                msg_in.get("text")
+                or (
+                    f"{summary_txt}\n\n{details_txt}"
+                    if (summary_txt and details_txt and details_txt != summary_txt)
+                    else (details_txt or summary_txt)
+                )
+            )
+            msg_kind = str(msg_in.get("kind") or msg_in.get("type") or models.MessageType.POST.value)
+            msg_obj = {
+                "seq": seq_val,
+                "wakeSeq": wake_seq,
+                "id": msg_in.get("id"),
+                "sender": msg_in.get("sender") or "worker",
+                "senderRole": msg_in.get("senderRole") or models.Role.WORKER.value,
+                "senderTier": int(msg_in.get("senderTier") or 2),
+                "kind": msg_kind,
+                "type": str(msg_in.get("type") or msg_kind),
+                "summary": summary_txt,
+                "text": full_text,
+                "mentions": list(msg_in.get("mentions") or []),
+                "status": msg_in.get("status") or "open",
+                "synthetic": is_synthetic,
+            }
+
+        ev: dict[str, Any] = {
+            "type": event_type,
+            "swarmId": sid,
+            "primaryConversationId": payload.get("primaryConversationId") or resolved_meta.get("primaryConversationId"),
+            "coordinatorConversationId": payload.get("coordinatorConversationId") or resolved_meta.get("coordinatorConversationId"),
+            "projectId": payload.get("projectId") or resolved_meta.get("projectId"),
+            "seq": seq_val,
+            "wakeSeq": wake_seq,
+            "synthetic": is_synthetic,
+            "at": models.now_iso(),
+            "message": msg_obj,
+        }
+        if isinstance(payload.get("task"), dict):
+            ev["task"] = dict(payload["task"])
+        return ev
+
+    def get_wake_history(self, swarm_id: str, *, since_seq: int = 0) -> list[dict[str, Any]]:
+        sid = store.sanitize_swarm_id(swarm_id) or "default"
+        with self._lock:
+            hist = list(self._wake_history.get(sid) or [])
+        return [ev for ev in hist if int(ev.get("seq") or 0) > since_seq]
+
+    def get_wake_catchup_events(self, since_map: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """Collect missed `coordinator_wake`/`primary_wake` events across active swarms for `since_map`."""
+        if not isinstance(since_map, dict) or not since_map:
+            return []
+
+        collected: list[dict[str, Any]] = []
+        active_sids = set(self._active_swarm_ids())
+        for raw_sid, raw_cursor in since_map.items():
+            sid = store.sanitize_swarm_id(str(raw_sid))
+            if not sid or sid not in active_sids:
+                continue
+            meta = self.store.read_meta(sid) or models.default_swarm_meta(sid)
+            if meta.get("archived"):
+                continue
+
+            if isinstance(raw_cursor, dict):
+                since_seq = max(0, int(raw_cursor.get("seq") or 0))
+                since_wake_seq = max(0, int(raw_cursor.get("wakeSeq") or 0))
+            else:
+                try:
+                    since_seq = max(0, int(raw_cursor or 0))
+                except (TypeError, ValueError):
+                    since_seq = 0
+                since_wake_seq = 0
+
+            seen_board_keys: set[tuple[str, int]] = set()
+            with self._lock:
+                hist = list(self._wake_history.get(sid) or [])
+            for ev in hist:
+                ev_type = str(ev.get("type") or "")
+                ev_seq = int(ev.get("seq") or 0)
+                ev_wseq = int(ev.get("wakeSeq") or 0)
+                if ev.get("synthetic"):
+                    if ev_wseq > since_wake_seq:
+                        collected.append(ev)
+                elif ev_seq > since_seq:
+                    seen_board_keys.add((ev_type, ev_seq))
+                    collected.append(ev)
+
+            board = self.board_service.read_board(sid)
+            msgs = [m for m in (board.get("messages") or []) if isinstance(m, dict) and int(m.get("seq") or 0) > since_seq]
+            msgs.sort(key=lambda m: int(m.get("seq") or 0))
+            for m in msgs:
+                wkind = wakeup_mod.classify_wake_event(m)
+                if not wkind:
+                    continue
+                mseq = int(m.get("seq") or 0)
+                if (wkind, mseq) in seen_board_keys:
+                    continue
+                seen_board_keys.add((wkind, mseq))
+                collected.append(
+                    self._build_wake_event_payload(
+                        sid,
+                        wkind,
+                        {"swarmId": sid, "seq": mseq, "message": m},
+                        wake_seq=mseq,
+                        meta=meta,
+                    )
+                )
+
+        collected.sort(key=lambda ev: (int(ev.get("seq") or 0), int(ev.get("wakeSeq") or 0)))
+        return collected
+
+    def _emit_board_event(self, swarm_id: str, event_type: str, payload: dict[str, Any]) -> None:
+        sid = store.sanitize_swarm_id(swarm_id) or "default"
+        is_wake = event_type in ("coordinator_wake", "primary_wake")
+        meta = (self.store.read_meta(sid) or {}) if is_wake else None
+
+        global_subs: list[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]] = []
+        wake_seq = self.store.allocate_wake_seq(sid) if is_wake else 0
+        with self._lock:
+            if is_wake:
+                self._wake_seq_by_swarm[sid] = max(self._wake_seq_by_swarm.get(sid, 0), wake_seq)
+                wake_seq = self._wake_seq_by_swarm[sid]
+                ev = self._build_wake_event_payload(sid, event_type, payload or {}, wake_seq=wake_seq, meta=meta)
+                hist = self._wake_history.setdefault(sid, [])
+                hist.append(ev)
+                if len(hist) > 200:
+                    del hist[: len(hist) - 200]
+                global_subs = list(self._global_wake_subscribers)
+            else:
+                ev = {"type": event_type, "swarmId": sid, "at": models.now_iso(), **(payload or {})}
+            subs = list(self._board_subscribers.get(sid) or [])
+
+        try:
+            cur_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cur_loop = None
+
+        for q, sub_loop in subs:
+            if sub_loop is not None and not sub_loop.is_closed() and sub_loop.is_running() and sub_loop is not cur_loop:
+                try:
+                    sub_loop.call_soon_threadsafe(_enqueue_drop_oldest, q, ev)
+                except RuntimeError:
+                    pass
+            else:
+                _enqueue_drop_oldest(q, ev)
+
+        for q, sub_loop in global_subs:
+            if sub_loop is not None and not sub_loop.is_closed() and sub_loop.is_running() and sub_loop is not cur_loop:
+                try:
+                    sub_loop.call_soon_threadsafe(_enqueue_drop_oldest, q, ev)
+                except RuntimeError:
+                    pass
+            else:
+                _enqueue_drop_oldest(q, ev)
+
+    async def shutdown(self) -> None:
+        await self.mention_router.stop_watcher()
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+            board_subs = [sub for subs in self._board_subscribers.values() for sub in subs]
+            global_subs = list(self._global_wake_subscribers)
+            self._board_subscribers.clear()
+            self._global_wake_subscribers.clear()
+
+        try:
+            cur_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cur_loop = None
+
+        for q, sub_loop in [*board_subs, *global_subs]:
+            if sub_loop is not None and not sub_loop.is_closed() and sub_loop.is_running() and sub_loop is not cur_loop:
+                try:
+                    sub_loop.call_soon_threadsafe(_enqueue_drop_oldest, q, None)
+                except RuntimeError:
+                    pass
+            else:
+                _enqueue_drop_oldest(q, None)
+
+        if runtimes:
+            await asyncio.gather(*(rt.shutdown() for rt in runtimes), return_exceptions=True)
+
+
+def _safe_json_loads(raw: Any, default: Any) -> Any:
+    if isinstance(raw, type(default)):
+        return raw
+    if not isinstance(raw, str) or not raw.strip():
+        return default
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, type(default)) else default
+    except Exception:
+        return default
+
+
+def query_member_session_history(
+    state_dir: Path,
+    swarm_id: str,
+    member_name: str,
+    *,
+    after_id: int = 0,
+    limit: int = 100,
+    subagent_session_id: str | None = None,
+) -> dict[str, Any]:
+    """Read paginated message history and live telemetry for a swarm worker (or its Tier-3 subagent)."""
+    clamped_limit = max(1, min(300, int(limit or 100)))
+    since_id = max(0, int(after_id or 0))
+    sid = store.sanitize_swarm_id(swarm_id) or "default"
+    paths = store.resolve_swarm_paths(sid, state_dir=state_dir)
+
+    board = store.read_board_raw(paths.board_file)
+    members = board.get("members") if isinstance(board, dict) else {}
+    member_rec: dict[str, Any] = {}
+    canonical_name = str(member_name or "").strip()
+    if isinstance(members, dict) and canonical_name:
+        hit_name = board_mod.find_member_ci(members, canonical_name)
+        if hit_name and isinstance(members.get(hit_name), dict):
+            canonical_name = hit_name
+            member_rec = members[hit_name]
+
+    raw_tasks_doc = store.read_json_safe(paths.tasks_file, {})
+    tasks_map = raw_tasks_doc.get("tasks") if isinstance(raw_tasks_doc, dict) else {}
+    ctx_sessions = raw_tasks_doc.get("context_sessions") if isinstance(raw_tasks_doc, dict) else {}
+
+    task_rec: dict[str, Any] = {}
+    task_id = str(member_rec.get("taskId") or "").strip()
+    if isinstance(tasks_map, dict):
+        if task_id and isinstance(tasks_map.get(task_id), dict):
+            task_rec = tasks_map[task_id]
+        elif canonical_name:
+            name_low = canonical_name.lower()
+            candidates: list[dict[str, Any]] = []
+            for t in tasks_map.values():
+                if not isinstance(t, dict):
+                    continue
+                wcfg = (t.get("metadata") or {}).get("workerConfig") or {}
+                if str(wcfg.get("worker_name") or "").strip().lower() == name_low:
+                    candidates.append(t)
+            if candidates:
+                candidates.sort(key=lambda t: str((t.get("status") or {}).get("timestamp") or ""), reverse=True)
+                task_rec = candidates[0]
+
+    meta = task_rec.get("metadata") if isinstance(task_rec.get("metadata"), dict) else {}
+    act = meta.get("liveActivity") if isinstance(meta.get("liveActivity"), dict) else {}
+    wcfg = meta.get("workerConfig") if isinstance(meta.get("workerConfig"), dict) else {}
+
+    hermes_session_id = str(act.get("hermesSessionId") or "").strip()
+    if not hermes_session_id:
+        ctx_id = str(task_rec.get("contextId") or member_rec.get("contextId") or "").strip()
+        if ctx_id and isinstance(ctx_sessions, dict):
+            hermes_session_id = str(ctx_sessions.get(ctx_id) or "").strip()
+    if not hermes_session_id:
+        for art in task_rec.get("artifacts") or []:
+            if isinstance(art, dict) and str(art.get("name") or "").startswith("usage_and_session"):
+                for part in art.get("parts") or []:
+                    if isinstance(part, dict) and isinstance(part.get("data"), dict):
+                        cand_sid = str(part["data"].get("hermesSessionId") or "").strip()
+                        if cand_sid:
+                            hermes_session_id = cand_sid
+                            break
+                if hermes_session_id:
+                    break
+
+    tokens = dict(meta.get("tokens") or {})
+    tps = float(act.get("tps") or 0.0)
+    tps_estimated = bool(act.get("tpsEstimated", False))
+    current_tool = act.get("currentTool")
+    worker_state = member_rec.get("state") or (task_rec.get("status") or {}).get("state")
+    worker_model = member_rec.get("model") or wcfg.get("model")
+    board_subs = {
+        str(s.get("sessionId") or ""): s
+        for s in (member_rec.get("subagents") or [])
+        if isinstance(s, dict) and s.get("sessionId")
+    }
+
+    messages: list[dict[str, Any]] = []
+    subagents: list[dict[str, Any]] = []
+    has_more = False
+    total_count = 0
+    last_id = since_id
+    target_session_id: str | None = hermes_session_id or None
+
+    db_path = store.default_hermes_home() / "state.db"
+    if hermes_session_id and db_path.is_file():
+        con: sqlite3.Connection | None = None
+        try:
+            uri = f"{db_path.resolve().as_uri()}?mode=ro"
+            con = sqlite3.connect(uri, uri=True, timeout=2.0)
+            con.row_factory = sqlite3.Row
+
+            sub_rows = con.execute(
+                "SELECT id, model, title, started_at, ended_at, message_count, tool_call_count, model_config "
+                "FROM sessions WHERE parent_session_id = ? AND source = 'subagent' ORDER BY started_at ASC",
+                (hermes_session_id,),
+            ).fetchall()
+            valid_sub_ids: set[str] = set()
+            for sr in sub_rows:
+                sd = dict(sr)
+                s_id = str(sd.get("id") or "")
+                if not s_id:
+                    continue
+                valid_sub_ids.add(s_id)
+                mc = _safe_json_loads(sd.get("model_config"), {})
+                b_sub = board_subs.get(s_id) or {}
+                label = str(b_sub.get("label") or sd.get("title") or mc.get("_subagent_id") or s_id)
+                title = str(sd.get("title") or label)
+                msg_cnt = int(sd.get("message_count") or 0)
+                tc_cnt = int(sd.get("tool_call_count") or 0)
+                steps = max(1 if (msg_cnt > 0 or tc_cnt > 0) else 0, (msg_cnt + 1) // 3)
+                sub_state = str(
+                    b_sub.get("state")
+                    or (models.MemberState.DONE.value if sd.get("ended_at") is not None else models.MemberState.WORKING.value)
+                )
+                subagents.append({
+                    "sessionId": s_id,
+                    "label": label,
+                    "title": title,
+                    "state": sub_state,
+                    "steps": steps,
+                    "model": sd.get("model") or b_sub.get("model"),
+                })
+
+            req_sub = str(subagent_session_id or "").strip()
+            if req_sub:
+                if req_sub in valid_sub_ids:
+                    target_session_id = req_sub
+                else:
+                    target_session_id = None
+
+            if target_session_id:
+                cnt_row = con.execute(
+                    "SELECT COUNT(*) AS cnt FROM messages WHERE session_id = ?",
+                    (target_session_id,),
+                ).fetchone()
+                total_count = int(cnt_row["cnt"]) if cnt_row else 0
+
+                if since_id > 0:
+                    rows = con.execute(
+                        "SELECT id, role, timestamp, content, reasoning, reasoning_content, "
+                        "display_metadata, tool_calls, tool_name, tool_call_id, compacted "
+                        "FROM messages WHERE session_id = ? AND id > ? ORDER BY id ASC LIMIT ?",
+                        (target_session_id, since_id, clamped_limit + 1),
+                    ).fetchall()
+                    has_more = len(rows) > clamped_limit
+                    rows = rows[:clamped_limit]
+                else:
+                    rows = con.execute(
+                        "SELECT id, role, timestamp, content, reasoning, reasoning_content, "
+                        "display_metadata, tool_calls, tool_name, tool_call_id, compacted "
+                        "FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                        (target_session_id, clamped_limit + 1),
+                    ).fetchall()
+                    has_more = len(rows) > clamped_limit
+                    rows = list(reversed(rows[:clamped_limit]))
+
+                for mr in rows:
+                    md = dict(mr)
+                    dmeta = _safe_json_loads(md.get("display_metadata"), {})
+                    r_tok = dmeta.get("reasoning_tokens")
+                    if r_tok is None:
+                        r_tok = dmeta.get("reasoningTokens")
+                    if r_tok is None:
+                        r_tok = dmeta.get("thinking_tokens")
+                    try:
+                        reasoning_tokens = max(0, int(r_tok)) if r_tok is not None and not isinstance(r_tok, bool) else 0
+                    except (TypeError, ValueError):
+                        reasoning_tokens = 0
+                    t_calls = _safe_json_loads(md.get("tool_calls"), [])
+                    messages.append({
+                        "id": int(md["id"]),
+                        "role": str(md.get("role") or ""),
+                        "timestamp": md.get("timestamp"),
+                        "content": md.get("content"),
+                        "reasoning": md.get("reasoning") or md.get("reasoning_content"),
+                        "reasoningTokens": reasoning_tokens,
+                        "toolCalls": t_calls,
+                        "toolName": md.get("tool_name"),
+                        "toolCallId": md.get("tool_call_id"),
+                        "compacted": bool(md.get("compacted")),
+                    })
+                if messages:
+                    last_id = messages[-1]["id"]
+        finally:
+            if con is not None:
+                try:
+                    con.close()
+                except Exception:
+                    pass
+
+    if not tokens and target_session_id:
+        db_toks, _, _ = _query_hermes_session_stats(target_session_id, model=worker_model)
+        if db_toks:
+            tokens = db_toks
+
+    return {
+        "member": canonical_name or member_name,
+        "sessionId": target_session_id,
+        "parentSessionId": hermes_session_id or None,
+        "messages": messages,
+        "hasMore": has_more,
+        "totalCount": total_count,
+        "lastId": last_id,
+        "tokens": tokens,
+        "tps": tps,
+        "tpsEstimated": tps_estimated,
+        "currentTool": current_tool,
+        "state": worker_state,
+        "model": worker_model,
+        "subagents": subagents,
+    }

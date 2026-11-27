@@ -1,0 +1,35 @@
+# Byte-compiled / Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.Python
+dist/
+build/
+.venv/
+venv/
+
+# Node / Playwright / Sidecar
+node_modules/
+npm-debug.log*
+playwright-report/
+test-results/
+
+# Runtime state, databases, tokens, logs
+packages/mcp-server/state/
+state/
+internal_token
+*.db
+*.db-shm
+*.db-wal
+*.jsonl
+*.log
+*.lock
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.tmp
+.env

@@ -1,0 +1,51 @@
+name: bug_report
+description: File a bug report for Hermes Swarm
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please run `python scripts/doctor.py --json` (or `hermes-swarm doctor`) and attach the output below with any private paths redacted.
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - mcp-server (packages/mcp-server)
+        - antigravity-plugin (packages/antigravity-plugin)
+        - hermes-bridge (packages/hermes-bridge)
+        - observer-ui (board_ui)
+        - installer / docs
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Windows
+        - macOS
+        - Linux / WSL2
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: Clear description of the bug and expected behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      render: markdown
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Doctor output & relevant logs
+      description: Redact any API keys or local secrets before pasting.
+      render: shell

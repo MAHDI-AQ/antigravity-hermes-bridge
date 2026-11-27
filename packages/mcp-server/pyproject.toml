@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling>=1.21.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-swarm-mcp"
+version = "1.0.0"
+description = "MCP server, A2A worker runtime, read-only session history reader, and live observer UI for Hermes Swarm."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Hermes Swarm Contributors" }
+]
+keywords = ["mcp", "a2a", "multi-agent", "hermes", "antigravity", "swarm"]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
+dependencies = [
+  "httpx>=0.27.0",
+  "mcp>=1.2.0",
+  "pyyaml>=6.0.1",
+  "starlette>=0.38.0",
+  "uvicorn>=0.30.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+]
+
+[project.scripts]
+hermes-swarm-mcp = "server:main"
+hermes-swarm-board = "board_cli:main"
+
+[project.urls]
+Homepage = "https://github.com/MAHDI-AQ/hermes-swarm"
+Repository = "https://github.com/MAHDI-AQ/hermes-swarm"
+Issues = "https://github.com/MAHDI-AQ/hermes-swarm/issues"
+
+[tool.hatch.build.targets.wheel]
+include = [
+  "*.py",
+  "board_ui/**/*",
+]

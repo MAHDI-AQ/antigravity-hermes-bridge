@@ -1,0 +1,29 @@
+name: hermes-swarm-bridge
+version: "1.0.0"
+description: "Native Hermes worker bridge for the Swarm Board: first-class swarm_post, swarm_read, swarm_claim, swarm_release, swarm_status, swarm_wait, and swarm_channel tools inside swarm worker sessions."
+author: "Hermes Swarm Contributors"
+license: MIT
+kind: standalone
+manifest_version: 2
+api_version: 1
+requires_hermes: ">=0.21.4"
+optional_env:
+  - HERMES_SWARM_ID
+  - HERMES_SWARM_AGENT
+  - HERMES_SWARM_ROLE
+  - HERMES_SWARM_HTTP_URL
+  - HERMES_SWARM_HTTP_TOKEN
+  - HERMES_SWARM_TOKEN_FILE
+  - HERMES_SWARM_BOARD_DIR
+  - HERMES_SWARM_CONVERSATION_ID
+  - HERMES_SWARM_TASK_ID
+  - HERMES_SWARM_CONTEXT_ID
+provides_tools:
+  - swarm_post
+  - swarm_read
+  - swarm_claim
+  - swarm_release
+  - swarm_status
+  - swarm_wait
+  - swarm_channel
+tags: [swarm, coordination, board, multi-agent]

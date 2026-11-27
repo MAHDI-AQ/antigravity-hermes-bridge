@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  privacy-and-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run privacy & portability gate
+        run: python scripts/check_privacy.py
+      - name: Verify installer dry-run and syntax
+        run: |
+          python scripts/install.py --dry-run --json
+          python -m py_compile packages/mcp-server/*.py packages/hermes-bridge/*.py scripts/*.py
+
+  test-matrix:
+    needs: privacy-and-lint
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Run zero-dependency hermes-bridge tests
+        run: python -m unittest discover -s packages/hermes-bridge/tests -p "test_*.py" -v
+      - name: Install mcp-server test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e "./packages/mcp-server[dev]"
+      - name: Run mcp-server unit tests (90s bound)
+        timeout-minutes: 5
+        run: python -m unittest discover -s packages/mcp-server/tests -p "test_hermes_a2a.py" -v
+        env:
+          PYTHONPATH: packages/mcp-server
+      - name: Check sidecar syntax and run Node tests
+        timeout-minutes: 3
+        run: |
+          node --check packages/antigravity-plugin/sidecars/swarm_board/main.mjs
+          node --check packages/antigravity-plugin/sidecars/swarm_board/wakeup_bridge.mjs
+          node --check packages/mcp-server/board_ui/app.js
+          node --check packages/mcp-server/board_ui/hive.js
+          node --test --test-timeout=30000 packages/mcp-server/tests/test_sidecar.mjs
+        env:
+          HERMES_SWARM_SIDECAR_DIR: ${{ github.workspace }}/packages/antigravity-plugin/sidecars/swarm_board
+          HERMES_A2A_MCP_DIR: ${{ github.workspace }}/packages/mcp-server

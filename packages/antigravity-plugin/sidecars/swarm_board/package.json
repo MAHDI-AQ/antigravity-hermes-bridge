@@ -1,0 +1,6 @@
+{
+  "name": "hermes_swarm_board",
+  "version": "2.0.0",
+  "type": "module",
+  "description": "Hermes Swarm read-only observer sidecar and 3-tier wakeup bridge"
+}

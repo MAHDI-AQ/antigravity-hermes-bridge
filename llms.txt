@@ -1,0 +1,15 @@
+# Hermes Swarm
+
+> 3-tier multi-agent orchestration bridging Antigravity IDE and Hermes Agent with a local A2A runtime, 7-tool MCP control plane, compaction-safe Hermes bridge hooks, billable token-economy observability, and Live Agent History Tabs.
+
+## Documentation
+
+- [README](README.md): Overview, quick start, and architecture summary
+- [Human Installation Guide](docs/INSTALL.md): Cross-platform setup for Windows, macOS, and Linux
+- [AI Agent Installation Playbook](docs/AGENT_INSTALL.md): Deterministic non-interactive install & doctor verification (`--non-interactive --json`)
+- [Architecture Reference](docs/ARCHITECTURE.md): 3-tier topology, A2A + MCP + HTTP/SSE + sidecar wakeup bridge, and read-only SQLite history
+- [Configuration Guide](docs/CONFIGURATION.md): Environment variables, context window resolution, ports, and optional lifecycle hooks
+- [Observer UI Guide](docs/UI_GUIDE.md): Sticky board header, 400+ message windowing, billable token economy, Hive graph, and Live Agent History Tabs
+- [Agent Coding Contract](AGENTS.md): Repository structure, test commands, and architectural invariants
+- [Contributing](CONTRIBUTING.md): Development setup and PR checklist
+- [Security Policy](SECURITY.md): Trust boundaries and vulnerability reporting

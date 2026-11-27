@@ -1,0 +1,7 @@
+{
+  "name": "hermes-swarm",
+  "displayName": "Hermes Swarm",
+  "description": "3-tier AI engineering swarm: Primary Antigravity, Coordinator subagent + Hermes A2A workers, and leaf subagents.",
+  "version": "2.0.0",
+  "logo": "assets/logo.svg"
+}

@@ -1,0 +1,30 @@
+name: feature_request
+description: Propose a new feature or enhancement
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem or goal
+      description: What workflow or pain point does this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed design
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Target component
+      options:
+        - mcp-server
+        - antigravity-plugin
+        - hermes-bridge
+        - observer-ui
+        - cross-cutting
+    validations:
+      required: true

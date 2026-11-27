@@ -1,0 +1,26 @@
+{
+  "command": "node",
+  "args": ["main.mjs"],
+  "env": {
+    "SWARM_OVERVIEW": "${flag:enable-swarm-overview}",
+    "SWARM_GRAPH_TAB": "${flag:enable-swarm-graph-tab}",
+    "SWARM_RAW_TAB": "${flag:enable-swarm-raw-tab}"
+  },
+  "restart_policy": "always",
+  "display_name": "Hermes Swarm",
+  "description": "Read-only observer view of the Hermes Swarm board, roster, and @mention graph. agent_permissions.allows_user_interactions is true strictly for the backend app.sendMessage wakeup bridge.",
+  "has_web_ui": true,
+  "agent_permissions": {
+    "allows_user_interactions": true
+  },
+  "ui_config": {
+    "display_name": "Hermes Swarm",
+    "views": [
+      {
+        "path": "/",
+        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
+        "title": "Hermes Swarm"
+      }
+    ]
+  }
+}
