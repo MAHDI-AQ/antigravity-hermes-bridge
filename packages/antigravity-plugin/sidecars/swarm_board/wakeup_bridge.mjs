@@ -91,6 +91,14 @@ function logWarn(logger, ...args) {
   }
 }
 
+function logInfo(logger, ...args) {
+  if (typeof logger?.info === 'function') {
+    logger.info(...args);
+  } else if (typeof logger?.log === 'function') {
+    logger.log(...args);
+  }
+}
+
 function defaultIsPidAlive(pid) {
   const num = typeof pid === 'number' ? pid : Number(String(pid ?? '').trim());
   if (!Number.isInteger(num) || num <= 0) return false;
@@ -102,10 +110,12 @@ function defaultIsPidAlive(pid) {
   }
 }
 
-function resolveLazyToken(config, { forceRefresh = false } = {}) {
-  const envToken = String(config?.envHttpToken || '').trim();
-  if (envToken) return envToken;
-  if (config?.hasEnvHttpToken === true && config?.httpToken) return config.httpToken;
+function resolveLazyToken(config, { forceRefresh = false, skipEnvToken = false } = {}) {
+  if (!skipEnvToken) {
+    const envToken = String(config?.envHttpToken || '').trim();
+    if (envToken) return envToken;
+    if (config?.hasEnvHttpToken === true && config?.httpToken) return config.httpToken;
+  }
 
   const candidates = [];
   if (config?.tokenFile) candidates.push(resolve(config.tokenFile));
@@ -128,7 +138,7 @@ function resolveLazyToken(config, { forceRefresh = false } = {}) {
       // Ignore unreadable token file.
     }
   }
-  return String(config?.httpToken || '').trim();
+  return skipEnvToken ? '' : String(config?.httpToken || '').trim();
 }
 
 function buildHeaders(config, extra = {}, options = {}) {
@@ -890,16 +900,6 @@ export function createWakeupBridge({
     if (Number.isFinite(waitSince) && waitSince > 0 && Array.isArray(events) && events.length > 0) {
       return events.every((ev) => Number(ev.seq || 0) > waitSince);
     }
-    const lastReadSeq = Number(
-      coord?.lastReadSeq ??
-      coord?.readSeq ??
-      sourceObj.coordinatorReadSeq ??
-      sourceObj.meta?.coordinatorReadSeq ??
-      0,
-    );
-    if (Number.isFinite(lastReadSeq) && lastReadSeq > 0 && Array.isArray(events) && events.length > 0) {
-      return events.every((ev) => Number(ev.seq || 0) > 0 && Number(ev.seq || 0) <= lastReadSeq);
-    }
     return false;
   }
 
@@ -982,9 +982,21 @@ export function createWakeupBridge({
       headers: firstHeaders,
       signal: AbortSignal.timeout(DEFAULT_FETCH_TIMEOUT_MS),
     });
-    if (res.status === 401 && !config?.hasEnvHttpToken) {
-      const retryHeaders = buildHeaders(config, { Accept: 'application/json' }, { forceRefresh: true });
+    if (res.status === 401) {
+      const hasEnvToken = Boolean(config?.hasEnvHttpToken || String(config?.envHttpToken || '').trim());
+      const retryHeaders = buildHeaders(
+        config,
+        { Accept: 'application/json' },
+        { forceRefresh: true, skipEnvToken: hasEnvToken },
+      );
       if (retryHeaders.Authorization && retryHeaders.Authorization !== firstHeaders.Authorization) {
+        if (hasEnvToken) {
+          logTransient(
+            'warn',
+            `token-fallback:${url}`,
+            `[hermes-swarm] HTTP 401 with HERMES_A2A_HTTP_TOKEN on ${url}; falling back to internal_token`,
+          );
+        }
         try { await res.body?.cancel?.(); } catch {}
         res = await fetchImpl(url, {
           headers: retryHeaders,
@@ -1035,8 +1047,13 @@ export function createWakeupBridge({
               return true;
             }
           }
-        } catch {
-          // Non-fatal: fall back to current state.
+        } catch (err) {
+          logTransient(
+            'warn',
+            `fresh-suppression:${sid}`,
+            `[hermes-swarm] fresh suppression board check failed for swarm=${sid}:`,
+            err?.message || err,
+          );
         }
       }
     }
@@ -1049,8 +1066,9 @@ export function createWakeupBridge({
     const targetConv = isCoord ? targets.coordinatorConversationId : targets.primaryConversationId;
     if (!targetConv) {
       // Strict 3-tier isolation: NEVER fall back to primaryConversationId for coordinator wakes.
-      logWarn(
-        logger,
+      logTransient(
+        'warn',
+        `missing-target:${sid}:${tier}`,
         `[hermes-swarm] skipping Tier-${isCoord ? 2 : 1} wakeup for swarm=${sid}: ${
           isCoord ? 'coordinatorConversationId' : 'primaryConversationId'
         } is unset`,
@@ -1095,6 +1113,10 @@ export function createWakeupBridge({
 
             try {
               await sendMessage(targetConv, notice, { title, projectId });
+              logInfo(
+                logger,
+                `[hermes-swarm] dispatched ${isCoord ? 'coordinator wakeup' : 'primary escalation'} to ${targetConv} (swarm=${sid}, seq=${maxSeq}, wakeSeq=${maxWakeSeq}, events=${pending.length})`,
+              );
             } catch (err) {
               logError(
                 logger,
@@ -1103,6 +1125,11 @@ export function createWakeupBridge({
               );
               return false;
             }
+          } else {
+            logInfo(
+              logger,
+              `[hermes-swarm] suppressed ${isCoord ? 'coordinator wakeup' : 'primary escalation'} for ${targetConv} (swarm=${sid}, seq=${maxSeq}, wakeSeq=${maxWakeSeq}; coordinator waiting in swarm_wait)`,
+            );
           }
 
           for (const ev of pending) {
@@ -1591,9 +1618,21 @@ export function createWakeupBridge({
             headers: firstHeaders,
             signal: ctrl.signal,
           });
-          if (res.status === 401 && !config?.hasEnvHttpToken) {
-            const retryHeaders = buildHeaders(config, { Accept: 'text/event-stream' }, { forceRefresh: true });
+          if (res.status === 401) {
+            const hasEnvToken = Boolean(config?.hasEnvHttpToken || String(config?.envHttpToken || '').trim());
+            const retryHeaders = buildHeaders(
+              config,
+              { Accept: 'text/event-stream' },
+              { forceRefresh: true, skipEnvToken: hasEnvToken },
+            );
             if (retryHeaders.Authorization && retryHeaders.Authorization !== firstHeaders.Authorization) {
+              if (hasEnvToken) {
+                logTransient(
+                  'warn',
+                  `token-fallback:${eventsUrl}`,
+                  `[hermes-swarm] HTTP 401 with HERMES_A2A_HTTP_TOKEN on ${eventsUrl}; falling back to internal_token`,
+                );
+              }
               try { await res.body?.cancel?.(); } catch {}
               res = await fetchImpl(eventsUrl, {
                 headers: retryHeaders,
@@ -1705,16 +1744,24 @@ export function createWakeupBridge({
             };
             res = await fetchImpl(reqUrl, reqOpts);
           }
-          if (res.status === 401 && !config?.hasEnvHttpToken) {
+          if (res.status === 401) {
+            const hasEnvToken = Boolean(config?.hasEnvHttpToken || String(config?.envHttpToken || '').trim());
             const retryHeaders = buildHeaders(
               config,
               {
                 Accept: 'text/event-stream',
                 ...(reqOpts.method === 'POST' ? { 'Content-Type': 'application/json' } : {}),
               },
-              { forceRefresh: true },
+              { forceRefresh: true, skipEnvToken: hasEnvToken },
             );
             if (retryHeaders.Authorization && retryHeaders.Authorization !== reqOpts.headers?.Authorization) {
+              if (hasEnvToken) {
+                logTransient(
+                  'warn',
+                  `token-fallback:${reqUrl}`,
+                  `[hermes-swarm] HTTP 401 with HERMES_A2A_HTTP_TOKEN on ${reqUrl}; falling back to internal_token`,
+                );
+              }
               try { await res.body?.cancel?.(); } catch {}
               res = await fetchImpl(reqUrl, { ...reqOpts, headers: retryHeaders });
             }

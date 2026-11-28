@@ -29,15 +29,15 @@ You are connected to the Hermes A2A Swarm Bridge (`hermes-a2a`), enabling a 3-ti
 1:1 session-bound workflow with a read-only live observer pane ([Hermes Swarm](sidecar://hermes-swarm/swarm_board/)):
 
 1. Tier 1 (`primary` — User + Primary Antigravity session):
-   - Resolve active workspace via `swarm_workspace(action="get")`.
-   - Initialize this conversation's 1:1 swarm via `swarm_manage(action="init", primary_conversation_id=..., title=..., mission=...)` and put `open_board` on its own line (never a manual board link or command).
-   - Spawn ONE dedicated Tier-2 Coordinator subagent via `invoke_subagent`, bind its conversation ID
-     via `swarm_manage(action="bind_coordinator", ...)`, and wait for `@primary` escalations.
+   - Resolve active workspace via `swarm_workspace(action="get_workdir")` (and `set_workdir` if needed).
+   - Initialize this conversation's 1:1 swarm via `swarm_manage(action="init", conversation_id=..., title=..., mission=...)` and put `open_board` on its own line (never a manual board link or command).
+   - Spawn ONE dedicated Tier-2 Coordinator subagent via `invoke_subagent`, bind its exact verbatim `conversationId`
+     via `swarm_manage(action="bind_coordinator", conversation_id=..., coordinator_conversation_id=..., model=..., provider=...)` (NEVER hand-type or splice UUID segments), and wait for `@primary` escalations.
    - Read the project's Obsidian vault (`Handoffs/current.md` and `Lessons/lessons.md`) before starting and write verified receipts/lessons to `Evidence/` / `Handoffs/` before closing.
 2. Tier 2 (`coordinator` + Hermes A2A workers `worker|verifier|researcher|monitor|narrator`):
    - Discover available models dynamically via `swarm_catalog()` before spawning workers.
    - Publish `swarm_manage(action="set_plan", ...)`, spawn/resume/switch/diff/kill workers via
-     `swarm_worker(...)`, manage channels via `swarm_manage(action="channel", ...)`, claim/release
+     `swarm_worker(...)` (`diff` accepts optional `name`, omitting `name` inspects all workers), manage channels via `swarm_manage(action="channel", ...)`, claim/release
      scopes via `swarm_board_read(scope_action=...)`, and block zero-cost via `swarm_wait(since=...)`.
 3. Tier 3 (`subagent` — Hermes `delegate_task` leaf workers):
    - Spawned exclusively by Tier-2 Hermes workers; surfaced read-only under Members.
@@ -292,8 +292,20 @@ async def swarm_workspace(
         return _json_str({"workdir": new_wd, "swarmId": None})
 
     resolved, source = await _resolve_active_workdir(workdir, ctx)
+    if not workdir or not str(workdir).strip():
+        hint_conv = conversation_id or _get_session_val(ctx, "conversation_id")
+        hint_sid = store.sanitize_swarm_id(swarm_id)
+        if not hint_sid and hint_conv:
+            hint_sid = await asyncio.to_thread(_swarm_mgr.store.resolve_swarm_for_conversation, hint_conv)
+        if not hint_sid:
+            hint_sid = _get_session_val(ctx, "swarm_id")
+        if hint_sid:
+            meta_doc = await asyncio.to_thread(_swarm_mgr.store.read_meta, hint_sid)
+            meta_ws = str((meta_doc or {}).get("workspace") or "").strip()
+            if meta_ws and Path(meta_ws).is_dir():
+                resolved, source = meta_ws, "swarm_meta"
     if not resolved:
-        raise ValueError("No active workdir could be resolved; pass `workdir` or call `swarm_workspace(action='set', workdir=...)`.")
+        raise ValueError("No active workdir could be resolved; pass `workdir` or call `swarm_workspace(action='set_workdir', workdir=...)`.")
 
     if act == "git_status":
         res = await catalog_mod.run_git_inspect(resolved, action="status")
@@ -347,6 +359,8 @@ async def swarm_manage(
     coordinator_conversation_id: str | None = None,
     conversation_id: str | None = None,
     project_id: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
     plan: dict[str, Any] | None = None,
     op: str | None = None,
     channel: str | None = None,
@@ -426,12 +440,31 @@ async def swarm_manage(
         if not ccid:
             raise ValueError("`coordinator_conversation_id` is required for action='bind_coordinator'.")
         existing_meta = await asyncio.to_thread(_swarm_mgr.store.read_meta, sid)
+        prim_for_check = str(primary_conversation_id or (existing_meta or {}).get("primaryConversationId") or "").strip() or None
+        valid_ccid, valid_err = await asyncio.to_thread(
+            runtime_mod.validate_coordinator_conversation_id,
+            ccid,
+            prim_for_check,
+        )
+        if not valid_ccid:
+            raise ValueError(valid_err or f"Invalid coordinator_conversation_id: {ccid!r}")
         existing_ws = (existing_meta or {}).get("workspace")
         ws_for_bind = (
             resolved_ws
             if (resolved_ws and (not existing_ws or runtime_mod._is_worktree_subpath(existing_ws)))
             else None
         )
+        eff_model = str(model or "").strip() or None
+        eff_provider = str(provider or "").strip() or None
+        if not eff_model:
+            t_summary = await asyncio.to_thread(
+                runtime_mod.extract_antigravity_transcript_summary,
+                [ccid],
+                primary_cid=prim_for_check,
+            )
+            eff_model = str(t_summary.get("model") or "").strip() or None
+            if not eff_provider and t_summary.get("provider"):
+                eff_provider = str(t_summary["provider"]).strip() or None
         meta = await asyncio.to_thread(
             _swarm_mgr.store.upsert_meta,
             sid,
@@ -448,6 +481,8 @@ async def swarm_manage(
             runtime="antigravity",
             state=models.MemberState.WORKING.value,
             conversation_id=ccid,
+            model=eff_model,
+            provider=eff_provider,
             channels=["*"],
             swarm_id=sid,
         )
@@ -457,6 +492,8 @@ async def swarm_manage(
             "swarm_id": sid,
             "open_board": _OPEN_BOARD_LINK,
             "coordinator_conversation_id": ccid,
+            "model": eff_model,
+            "provider": eff_provider,
             "meta": meta,
         })
 
@@ -645,9 +682,8 @@ async def swarm_worker(
         })
 
     if act == "diff":
-        if not name or not name.strip():
-            raise ValueError("`name` (worker name or task ID) is required for action='diff'.")
-        res = await rt.run_on_loop(rt.diff_worker, name.strip(), include_patch=bool(include_patch))
+        target_name = name.strip() if (name and name.strip()) else None
+        res = await rt.run_on_loop(rt.diff_worker, target_name, include_patch=bool(include_patch))
         return _json_str({"swarmId": sid, **res})
 
     if act == "kill":

@@ -33,6 +33,8 @@ When `HERMES_SWARM_ID` is set, `register(ctx)` also registers:
 ## Read, Archive & Logging
 
 - `swarm_read` defaults to `limit=100` (max `500`) and supports `include_archive`, `before_seq`, `search`, and `full` on both HTTP (`POST /internal/board/read`) and disk fallback.
+- `swarm_wait` defaults to `timeout_seconds=120` (clamped to `0.05..600` seconds).
+- Workers should invoke `swarm_post` directly (rather than wrapping large payloads inside batched `tool_call(calls=...)` JSON strings), avoid live diagnostic probe posts on the board, and reserve `[done]` strictly for verified completion reports.
 - Disk-fallback `swarm_post` and `swarm_channel` append messages trimmed past `MAX_BOARD_MESSAGES` (`1000`) to `board_archive.jsonl` in the swarm directory (zero silent loss), which `swarm_read(..., include_archive=True)` merges cleanly by `seq`.
 - Structured JSONL logs for tool calls, HTTP 4xx/5xx retries, disk fallbacks, and compaction events are written best-effort (capped at 1 MiB with `.1` rotation) to `<swarm_dir>/logs/bridge.jsonl`.
 

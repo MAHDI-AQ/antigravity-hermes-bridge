@@ -4851,7 +4851,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                 "turn_file = sys.argv[1]",
                 "with open(turn_file, 'r', encoding='utf-8') as fh:",
                 "    mode = fh.read().strip()",
-                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'custom-1m-model', 'session_id': 'hs-v3-tps'}), flush=True)",
+                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'qwen3-coder-30b', 'session_id': 'hs-v3-tps'}), flush=True)",
                 "time.sleep(0.35)",
                 "if mode == 'turn1':",
                 "    print(json.dumps({'type': 'text', 'text': 'turn1'}), flush=True)",
@@ -4882,7 +4882,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                             name="w-tps",
                             prompt="turn 1",
                             workdir=str(ws_dir),
-                            model="custom-1m-model",
+                            model="qwen3-coder-30b",
                             return_immediately=False,
                         )
                         t1 = spawn1["workers"][0]
@@ -4902,7 +4902,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                         )
                         con_tps.execute(
                             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                            ("hs-v3-tps", None, "cli", 2000, 1000, 0, 0, 0, 0.0, None, "custom-1m-model", "{}", 2, 0, 100.0, 101.0, "custom", "https://example.invalid/v1"),
+                            ("hs-v3-tps", None, "cli", 2000, 1000, 0, 0, 0, 0.0, None, "qwen3-coder-30b", "{}", 2, 0, 100.0, 101.0, "custom", "https://example.invalid/v1"),
                         )
                         con_tps.commit()
                         con_tps.close()
@@ -4911,7 +4911,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                         t2 = await rt.send_message(
                             message_parts=[models.text_part("turn 2")],
                             context_id=cid,
-                            config=models.WorkerConfig(worker_name="w-tps", role="worker", model="custom-1m-model"),
+                            config=models.WorkerConfig(worker_name="w-tps", role="worker", model="qwen3-coder-30b"),
                             return_immediately=False,
                         )
                         act2 = t2["metadata"]["liveActivity"]
@@ -4924,7 +4924,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                             name="w-est",
                             prompt="stream fallback",
                             workdir=str(ws_dir),
-                            model="custom-1m-model",
+                            model="qwen3-coder-30b",
                             return_immediately=False,
                         )
                         t3 = await rt.get_task(spawn3["workers"][0]["taskId"])
@@ -5060,7 +5060,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
         )
         con.execute(
             "INSERT INTO sessions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            ("hs-hist-1", None, "cli", 1000, 300, 5000, 0, 120, 0.0, None, "custom-1m-model", "{}", 3, 1, 100.0, None, "custom", "https://example.invalid/v1", "Main"),
+            ("hs-hist-1", None, "cli", 1000, 300, 5000, 0, 120, 0.0, None, "qwen3-coder-30b", "{}", 3, 1, 100.0, None, "custom", "https://example.invalid/v1", "Main"),
         )
         con.execute(
             "INSERT INTO messages (session_id, role, timestamp, content, reasoning, reasoning_content, display_metadata, tool_calls, tool_name, tool_call_id, compacted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -5094,7 +5094,7 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                         "contextId": ctx_id,
                         "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
                         "metadata": {
-                            "workerConfig": {"worker_name": "w-hist", "role": "worker", "model": "custom-1m-model"},
+                            "workerConfig": {"worker_name": "w-hist", "role": "worker", "model": "qwen3-coder-30b"},
                             "liveActivity": {"hermesSessionId": "hs-hist-1", "tps": 25.5, "tpsEstimated": False},
                             "tokens": {"pureInput": 1000, "cachedInput": 5000, "output": 300},
                         },
@@ -5244,7 +5244,6 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
                 )
         self.assertEqual(matched, [998877])
         self.assertEqual(killed_pids, [998877])
-
 
     def test_v3_member_history_scope_state_timestamps_live_overlay_and_subagent_guard(self) -> None:
         import sqlite3
@@ -5579,6 +5578,819 @@ class Phase2HardeningRegressionTests(unittest.TestCase):
         self.assertEqual(len(res_leg["messages"]), 1)
         self.assertEqual(res_leg["messages"][0]["content"], "Legacy row")
         self.assertEqual(res_leg["messages"][0]["timestampMs"], 1795799110500)
+
+
+class Phase4HardeningRegressionTests(unittest.TestCase):
+    """Comprehensive tests for coordinator history/validation, model propagation, telemetry math, SQLite caching, and auth/store hardening."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="hermes-p4-harden-")
+        self.tmp_root = Path(self._tmp.name)
+        self.state_dir = self.tmp_root / "state"
+        self.repo_dir = self.tmp_root / "repo"
+        _init_temp_git_repo(self.repo_dir)
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in (
+                "HERMES_A2A_STATE_DIR",
+                "HERMES_A2A_SWARM_ID",
+                "HERMES_A2A_HTTP_TOKEN",
+                "HERMES_HOME",
+                "ANTIGRAVITY_APP_DATA_DIR",
+                "HERMES_A2A_SKIP_BRAIN_CHECK",
+            )
+        }
+        os.environ["HERMES_A2A_STATE_DIR"] = str(self.state_dir)
+        for k in (
+            "HERMES_A2A_SWARM_ID",
+            "HERMES_A2A_HTTP_TOKEN",
+            "HERMES_HOME",
+            "ANTIGRAVITY_APP_DATA_DIR",
+            "HERMES_A2A_SKIP_BRAIN_CHECK",
+        ):
+            os.environ.pop(k, None)
+        self._orig_session_wd = mcp_srv._session_workdir
+        self._orig_session_conv = mcp_srv._session_conversation_id
+        self._orig_session_swarm = mcp_srv._session_swarm_id
+        self._orig_mgr = mcp_srv._swarm_mgr
+        self._orig_ctrl = mcp_srv._http_ctrl
+        mcp_srv._session_workdir = None
+        mcp_srv._session_conversation_id = None
+        mcp_srv._session_swarm_id = None
+        mcp_srv._swarm_mgr = runtime_mod.SwarmManager(
+            state_dir=self.state_dir,
+            default_workdir_provider=lambda: mcp_srv._session_workdir,
+        )
+        mcp_srv._http_ctrl = http_server.EmbeddedA2AHttpController(mcp_srv._swarm_mgr)
+
+    def tearDown(self) -> None:
+        try:
+            mcp_srv._http_ctrl.stop()
+        except Exception:
+            pass
+        mcp_srv._session_workdir = self._orig_session_wd
+        mcp_srv._session_conv = self._orig_session_conv
+        mcp_srv._session_conversation_id = self._orig_session_conv
+        mcp_srv._session_swarm_id = self._orig_session_swarm
+        mcp_srv._swarm_mgr = self._orig_mgr
+        mcp_srv._http_ctrl = self._orig_ctrl
+        for k, val in self._env_backup.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+        self._tmp.cleanup()
+
+    def test_coordinator_history_model_stats_and_bind_validation(self) -> None:
+        app_data = self.tmp_root / "ag_app_data"
+        brain_dir = app_data / "brain"
+        prim_uuid = "737e69ed-0042-4d71-8d92-6242a30408a9"
+        coord_uuid = "9f556b92-cca8-48c0-a956-eb5c05d0871b"
+        spliced_uuid = "9f556b92-cca8-4d71-8d92-6242a30408a9"
+
+        # Seed primary subagent record and coordinator transcript_full.jsonl
+        sub_dir = brain_dir / prim_uuid / ".system_generated" / "subagents"
+        sub_dir.mkdir(parents=True, exist_ok=True)
+        (sub_dir / f"{coord_uuid}.json").write_text(
+            json.dumps({"conversationId": coord_uuid, "subagentDescriptor": {"role": "Swarm Coordinator"}}),
+            encoding="utf-8",
+        )
+        coord_logs = brain_dir / coord_uuid / ".system_generated" / "logs"
+        coord_logs.mkdir(parents=True, exist_ok=True)
+        steps = [
+            {
+                "step_index": 0,
+                "source": "SYSTEM",
+                "type": "SYSTEM_MESSAGE",
+                "status": "DONE",
+                "created_at": "2026-11-28T01:12:21Z",
+                "content": "Boot coordinator",
+            },
+            {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-28T01:12:25Z",
+                "model": "gemini-4-hydrogen-medium",
+                "input_tokens": 10000,
+                "cache_read_tokens": 0,
+                "output_tokens": 400,
+                "thinking": "Checking swarm catalog",
+                "content": "",
+                "tool_calls": [{"name": "swarm_catalog", "args": {"workdir": str(self.repo_dir)}}],
+            },
+            {
+                "step_index": 2,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-28T01:12:26Z",
+                "content": "Created At: 2026-11-28T01:12:26Z\nCompleted At: 2026-11-28T01:12:27Z\n{\"ok\": true}",
+            },
+            {
+                "step_index": 3,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-28T01:12:30Z",
+                "model": "gemini-4-hydrogen-medium",
+                "input_tokens": 1000,
+                "cache_read_tokens": 10400,
+                "output_tokens": 600,
+                "content": "Workers spawned cleanly.",
+                "tool_calls": [],
+            },
+        ]
+        (coord_logs / "transcript_full.jsonl").write_text(
+            "\n".join(json.dumps(s) for s in steps) + "\n",
+            encoding="utf-8",
+        )
+
+        async def _run() -> None:
+            with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_data)}):
+                await mcp_srv.swarm_manage(
+                    "init",
+                    title="Coord Test",
+                    primary_conversation_id=prim_uuid,
+                    workspace=str(self.repo_dir),
+                )
+                # Spliced UUID MUST be rejected with valid candidate hint
+                with self.assertRaises(ValueError) as ctx_err:
+                    await mcp_srv.swarm_manage(
+                        "bind_coordinator",
+                        primary_conversation_id=prim_uuid,
+                        coordinator_conversation_id=spliced_uuid,
+                    )
+                self.assertIn(coord_uuid, str(ctx_err.exception))
+
+                # Skip check env var allows synthetic UUID
+                with patch.dict(os.environ, {"HERMES_A2A_SKIP_BRAIN_CHECK": "1"}):
+                    skipped = json.loads(
+                        await mcp_srv.swarm_manage(
+                            "bind_coordinator",
+                            primary_conversation_id=prim_uuid,
+                            coordinator_conversation_id=spliced_uuid,
+                            model="explicit-coord-model",
+                            provider="antigravity",
+                        )
+                    )
+                    self.assertEqual(skipped["model"], "explicit-coord-model")
+                    self.assertEqual(skipped["provider"], "antigravity")
+
+                # Valid UUID binds cleanly and auto-extracts model from transcript_full.jsonl
+                bound = json.loads(
+                    await mcp_srv.swarm_manage(
+                        "bind_coordinator",
+                        primary_conversation_id=prim_uuid,
+                        coordinator_conversation_id=coord_uuid,
+                    )
+                )
+                self.assertEqual(bound["coordinator_conversation_id"], coord_uuid)
+                self.assertEqual(bound["model"], "gemini-4-hydrogen-medium")
+                self.assertEqual(bound["provider"], "antigravity")
+
+                # Verify ORCHESTRATOR_INSTRUCTIONS alignment
+                self.assertIn("get_workdir", mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
+                self.assertIn("conversation_id", mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
+                self.assertIn("bind_coordinator", mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
+
+                # Coordinator history + pagination + tokens + TPS + workspace
+                hist = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator")
+                self.assertTrue(hist["ok"])
+                self.assertEqual(hist["model"], "gemini-4-hydrogen-medium")
+                self.assertEqual(hist["provider"], "antigravity")
+                self.assertEqual(Path(hist["workspace"]), self.repo_dir.resolve())
+                self.assertEqual(len(hist["messages"]), 4)
+                self.assertEqual(hist["messages"][0]["role"], "system")
+                self.assertEqual(hist["messages"][1]["role"], "assistant")
+                self.assertEqual(hist["messages"][1]["reasoning"], "Checking swarm catalog")
+                self.assertEqual(hist["messages"][1]["toolCalls"][0]["name"], "swarm_catalog")
+                self.assertEqual(hist["messages"][2]["role"], "tool")
+                self.assertEqual(hist["messages"][2]["toolCallId"], hist["messages"][1]["toolCalls"][0]["id"])
+                self.assertEqual(hist["tokens"]["pureInput"], 11000)
+                self.assertEqual(hist["tokens"]["cachedInput"], 10400)
+                self.assertEqual(hist["tokens"]["output"], 1000)
+                # llmActiveMs = (01:12:25 - 01:12:21) + (01:12:30 - 01:12:27) = 7s -> 1000/7 = 142.9 tps
+                self.assertGreater(hist["tps"], 100.0)
+
+                hist_inc = runtime_mod.query_member_session_history(
+                    self.state_dir, prim_uuid, "coordinator", after_id=hist["messages"][1]["id"]
+                )
+                self.assertEqual(len(hist_inc["messages"]), 2)
+
+                # Snapshot exposes coordinator model/provider/stats
+                snap = http_server.build_observer_snapshot(mcp_srv._swarm_mgr, prim_uuid)
+                coord_m = next(m for m in snap["members"] if m["name"] == "coordinator")
+                self.assertEqual(coord_m["model"], "gemini-4-hydrogen-medium")
+                self.assertEqual(coord_m["provider"], "antigravity")
+                self.assertEqual(coord_m["steps"], 2)
+                self.assertEqual(coord_m["toolCalls"], 1)
+
+                # Fallback to transcript.jsonl when transcript_full.jsonl is absent
+                (coord_logs / "transcript_full.jsonl").unlink()
+                (coord_logs / "transcript.jsonl").write_text(json.dumps(steps[1]) + "\n", encoding="utf-8")
+                hist_fb = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator")
+                self.assertEqual(len(hist_fb["messages"]), 1)
+                self.assertEqual(hist_fb["model"], "gemini-4-hydrogen-medium")
+
+        asyncio.run(_run())
+
+    def test_worker_db_extra_model_token_double_count_tps_and_live_step_scoping(self) -> None:
+        import sqlite3
+
+        hermes_home = self.tmp_root / "hermes_home_p4"
+        hermes_home.mkdir(parents=True, exist_ok=True)
+        db_path = hermes_home / "state.db"
+        con = sqlite3.connect(str(db_path))
+        con.execute(
+            "CREATE TABLE sessions ("
+            "id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, title TEXT, "
+            "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, "
+            "cache_write_tokens INTEGER, reasoning_tokens INTEGER, "
+            "estimated_cost_usd REAL, actual_cost_usd REAL, model TEXT, model_config TEXT, "
+            "message_count INTEGER, tool_call_count INTEGER, started_at REAL, ended_at REAL, "
+            "billing_provider TEXT, billing_base_url TEXT)"
+        )
+        con.execute(
+            "CREATE TABLE messages ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, timestamp REAL, "
+            "content TEXT, reasoning TEXT, tool_calls TEXT, tool_name TEXT, tool_call_id TEXT)"
+        )
+        # Worker session in state.db: pureInput=2000, cacheRead=8000, output=500, model=db-resolved-model
+        con.execute(
+            "INSERT INTO sessions VALUES (?, NULL, 'cli', 'Worker', 2000, 500, 8000, 0, 0, 0.0, 0.0, ?, ?, 2, 1, ?, ?, 'custom', NULL)",
+            (
+                "hs-p4-w1",
+                "db-resolved-model",
+                json.dumps({"gateway_runtime": {"provider": "custom:custom-provider"}}),
+                1795800000.0,
+                1795800010.0,
+            ),
+        )
+        # Tier-3 subagent with tokens & timings
+        con.execute(
+            "INSERT INTO sessions VALUES (?, ?, 'subagent', 'Leaf audit', 300, 120, 100, 0, 0, 0.0, 0.0, ?, ?, 2, 1, ?, ?, 'custom', NULL)",
+            ("hs-p4-sub1", "hs-p4-w1", "leaf-db-model", json.dumps({"_subagent_id": "sub-1"}), 1795800001.0, 1795800003.0),
+        )
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, tool_calls) VALUES (?, 'assistant', 1795800001.0, 'Step 1 reply', ?)",
+            ("hs-p4-w1", json.dumps([{"id": "tc-s1", "name": "bash", "arguments": {"cmd": "ls"}}])),
+        )
+        con.execute(
+            "INSERT INTO messages (session_id, role, timestamp, content, tool_name, tool_call_id) VALUES (?, 'tool', 1795800002.0, 'ok', 'bash', 'tc-s1')",
+            ("hs-p4-w1",),
+        )
+        con.commit()
+        con.close()
+
+        # Fake multi-step worker where result event lacks cacheRead (10000 inclusive) while DB has cacheRead=8000, pureInput=2000
+        worker_script = self.tmp_root / "fake_p4_worker.py"
+        worker_script.write_text(
+            "\n".join([
+                "import json, time",
+                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': '', 'session_id': 'hs-p4-w1'}), flush=True)",
+                "print(json.dumps({'type': 'thinking', 'text': 'Step1Think'}), flush=True)",
+                "print(json.dumps({'type': 'text', 'text': 'Step1Text'}), flush=True)",
+                "print(json.dumps({'type': 'tool_use', 'name': 'swarm_wait', 'tool_call_id': 'tc-s1', 'input': {'since': 0}}), flush=True)",
+                "time.sleep(0.05)",
+                "print(json.dumps({'type': 'tool_result', 'name': 'swarm_wait', 'tool_call_id': 'tc-s1', 'is_error': False, 'output': 'ok', 'duration_ms': 2000}), flush=True)",
+                "print(json.dumps({'type': 'thinking', 'text': 'Step2Think'}), flush=True)",
+                "print(json.dumps({'type': 'text', 'text': 'Step2Text'}), flush=True)",
+                "time.sleep(0.3)",
+                "print(json.dumps({'type': 'result', 'session_id': 'hs-p4-w1', 'exit_code': 0, 'duration_ms': 10000, 'text': 'Step2Text', 'tokens': {'input': 10000, 'output': 500}}), flush=True)",
+            ]),
+            encoding="utf-8",
+        )
+
+        async def _run() -> None:
+            mgr = mcp_srv._swarm_mgr
+            sid = "conv-p4-worker"
+            mgr.store.upsert_meta(sid, title="P4 Worker", workspace=str(self.repo_dir), primary_conversation_id=sid)
+            rt = mgr.get_runtime(sid)
+            prompt = (
+                f"You are `backend-dev` in this Hermes swarm (`swarm_id`: `{sid}`, `workdir`: `{self.repo_dir}`).\n\n"
+                "Ownership & Locks:\n- You ONLY own `app.py`.\n\n"
+                "Task:\n1. Implement token math fix cleanly.\n"
+            )
+            with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+                with patch.object(rt, "_build_hermes_command", return_value=([sys.executable, str(worker_script)], str(self.repo_dir))):
+                    res = await rt.spawn_workers(
+                        name="backend-dev",
+                        prompt=prompt,
+                        workdir=str(self.repo_dir),
+                        return_immediately=False,
+                        wait_seconds=15.0,
+                    )
+                task = res["tasks"][0]
+                self.assertEqual(task["status"]["state"], models.TaskState.COMPLETED.value)
+
+                # 1. Step-scoped liveTranscript/liveReasoning reset on step boundary (no Step1 concatenation!)
+                overlay = rt.get_live_worker_overlay("backend-dev")
+                self.assertIsNotNone(overlay)
+                self.assertEqual(overlay["transcript"], "Step2Text")
+                self.assertEqual(overlay["reasoning"], "Step2Think")
+
+                # 2. db_extra model & provider propagated to workerConfig, board, snapshot, and history
+                self.assertEqual(task["metadata"]["workerConfig"]["model"], "db-resolved-model")
+                self.assertEqual(task["metadata"]["workerConfig"]["provider"], "custom")
+                board = mgr.board_service.read_board(sid)
+                self.assertEqual(board["members"]["backend-dev"]["model"], "db-resolved-model")
+                self.assertEqual(board["members"]["backend-dev"]["provider"], "custom")
+                self.assertEqual(board["members"]["backend-dev"]["assignment"], "Implement token math fix cleanly.")
+
+                # 3. Cache+uncached double-count prevented: pureInput=2000, cachedInput=8000, output=500 -> totalProcessed=10500 (not 18500!)
+                tok = task["metadata"]["tokens"]
+                self.assertEqual(tok["pureInput"], 2000)
+                self.assertEqual(tok["cachedInput"], 8000)
+                self.assertEqual(tok["output"], 500)
+                self.assertEqual(tok["totalProcessed"], 10500)
+
+                # 4. avgTps in compute_swarm_telemetry uses llmActiveMs (excluding swarm_wait idle time)
+                snap = http_server.build_observer_snapshot(mgr, sid)
+                w_snap = next(m for m in snap["members"] if m["name"] == "backend-dev")
+                self.assertEqual(w_snap["model"], "db-resolved-model")
+                self.assertGreater(w_snap["llmActiveMs"], 0)
+                self.assertLess(w_snap["llmActiveMs"], w_snap["elapsedMs"])
+                self.assertEqual(
+                    snap["telemetry"]["avgTps"],
+                    runtime_mod._compute_tps(500, w_snap["llmActiveMs"]),
+                )
+
+                # 5. Tier-3 subagent tokens/TPS included in query_member_session_history + SQLite schema caching + incremental after_id
+                with patch.object(runtime_mod, "_COMMITTED_TC_CACHE", {}):
+                    hist_main = runtime_mod.query_member_session_history(self.state_dir, sid, "backend-dev", runtime=rt)
+                    self.assertEqual(hist_main["model"], "db-resolved-model")
+                    self.assertEqual(hist_main["provider"], "custom")
+                    self.assertEqual(Path(hist_main["workspace"]), self.repo_dir.resolve())
+                    self.assertEqual(len(hist_main["subagents"]), 1)
+                    self.assertEqual(hist_main["subagents"][0]["tokens"]["output"], 120)
+                    self.assertAlmostEqual(hist_main["subagents"][0]["tps"], 60.0)
+
+                    hist_sub = runtime_mod.query_member_session_history(
+                        self.state_dir, sid, "backend-dev", subagent_session_id="hs-p4-sub1", runtime=rt
+                    )
+                    self.assertEqual(hist_sub["model"], "leaf-db-model")
+                    self.assertEqual(hist_sub["tokens"]["output"], 120)
+                    self.assertAlmostEqual(hist_sub["tps"], 60.0)
+
+                    # Simulate active live overlay and verify incremental poll uses cache without full scan
+                    with rt._state_rlock:
+                        t_obj = rt._tasks[task["id"]]
+                        t_obj["status"]["state"] = models.TaskState.WORKING.value
+                        rt._live_buffers[task["id"]]["liveToolTrace"] = [
+                            {"event": "tool_use", "name": "bash", "tool_call_id": "tc-s1"},
+                            {"event": "tool_use", "name": "grep", "tool_call_id": "tc-s2"},
+                        ]
+                    h_live1 = runtime_mod.query_member_session_history(self.state_dir, sid, "backend-dev", runtime=rt)
+                    self.assertEqual([x["tool_call_id"] for x in h_live1["live"]["toolTrace"]], ["tc-s2"])
+                    h_live2 = runtime_mod.query_member_session_history(
+                        self.state_dir, sid, "backend-dev", after_id=h_live1["lastId"], runtime=rt
+                    )
+                    self.assertEqual([x["tool_call_id"] for x in h_live2["live"]["toolTrace"]], ["tc-s2"])
+
+                # 6. Preambles forbid tool_call JSON batch wrappers and Probe posts
+                pre = runtime_mod.build_worker_preamble(
+                    models.WorkerConfig(worker_name="backend-dev", role="worker"),
+                    swarm_id=sid,
+                    task_id=task["id"],
+                    context_id=task["contextId"],
+                    board_dir=mgr.store.paths(sid).swarm_dir,
+                )
+                self.assertIn("tool_call", pre)
+                self.assertIn("Probe post", pre)
+
+                # 7. _clean_assignment_title strips swarm boilerplate
+                self.assertEqual(
+                    http_server._clean_assignment_title(
+                        "You are `verifier` in this Hermes swarm (`swarm_id`: `737e69ed-0042`, `workdir`: `C:\\Proj…",
+                        "verifier",
+                    ),
+                    "verifier",
+                )
+
+        asyncio.run(_run())
+
+    def test_migrate_board_dict_plan_ghost_dirs_sync_wait_clear_workspace_diff_and_auth(self) -> None:
+        # 1. migrate_board_v1_to_v2 preserves dict plan["tasks"] and plan["goal"]
+        migrated = store.migrate_board_v1_to_v2(
+            {
+                "plan": {
+                    "summary": "Build API",
+                    "goal": {"title": "Ship API", "line": "Implement and verify."},
+                    "tasks": {"store-dev": "Implement store", "verifier": {"title": "Verify suite", "status": "queued"}},
+                    "threads": [{"id": "t-1", "title": "Core", "tasks": ["store-dev", "verifier"]}],
+                }
+            },
+            "mig-swarm",
+        )
+        self.assertIsInstance(migrated["plan"]["tasks"], dict)
+        self.assertEqual(migrated["plan"]["tasks"]["store-dev"], "Implement store")
+        self.assertEqual(migrated["plan"]["tasks"]["verifier"]["title"], "Verify suite")
+        self.assertEqual(migrated["plan"]["goal"], {"title": "Ship API", "line": "Implement and verify."})
+
+        # 2. Ghost swarm dir prevention on read-only paths, wait_for_update, set_member_wait, release_scope
+        svc = board_mod.BoardService(state_dir=self.state_dir)
+        ghost_id = "ghost-typo-id-999"
+        ghost_dir = self.state_dir / "swarms" / ghost_id
+        svc.read_messages(swarm_id=ghost_id, mark_read_by="coordinator")
+        svc.set_member_wait("coordinator", waiting=True, swarm_id=ghost_id)
+        svc.release_scope(scope="app.py", holder="coordinator", swarm_id=ghost_id)
+
+        async def _check_wait_and_tools() -> None:
+            w_ghost = await svc.wait_for_update(swarm_id=ghost_id, since=0, timeout_seconds=0.25)
+            self.assertFalse(w_ghost["woken"])
+            self.assertTrue(w_ghost["timedOut"])
+            self.assertFalse(ghost_dir.exists())
+
+            # Synchronous waitSince clear in wait_for_update finally
+            real_sid = "real-wait-swarm"
+            svc.upsert_member("coordinator", role="coordinator", swarm_id=real_sid)
+            w_real = await svc.wait_for_update(swarm_id=real_sid, since=0, timeout_seconds=0.25)
+            self.assertTrue(w_real["timedOut"])
+            # Immediately after wait_for_update returns (no sleep!), waitSince MUST already be None on disk
+            b_after = svc.read_board(real_sid)
+            self.assertIsNone(b_after["members"]["coordinator"]["waitSince"])
+
+            # swarm_workspace(git_status|git_diff) resolves meta["workspace"] via conversation_id
+            await mcp_srv.swarm_manage(
+                "init",
+                title="WS Test",
+                primary_conversation_id="conv-ws-resolve",
+                workspace=str(self.repo_dir),
+            )
+            mcp_srv._session_workdir = None
+            gs = json.loads(await mcp_srv.swarm_workspace("git_status", conversation_id="conv-ws-resolve"))
+            self.assertTrue(gs["ok"])
+            self.assertEqual(gs["source"], "swarm_meta")
+            gd = json.loads(await mcp_srv.swarm_workspace("git_diff", conversation_id="conv-ws-resolve"))
+            self.assertTrue(gd["ok"])
+
+            # swarm_worker(action="diff") with omitted name aggregates across workers
+            rt = mcp_srv._swarm_mgr.get_runtime("conv-ws-resolve")
+            with rt._state_rlock:
+                rt._tasks["t-diff-1"] = {
+                    "id": "t-diff-1",
+                    "contextId": "c-diff-1",
+                    "status": {"state": models.TaskState.COMPLETED.value, "timestamp": models.now_iso()},
+                    "metadata": {"workerConfig": {"worker_name": "w-one", "workdir": str(self.repo_dir)}},
+                }
+            diff_all = json.loads(await mcp_srv.swarm_worker("diff", conversation_id="conv-ws-resolve"))
+            self.assertEqual(diff_all["count"], 1)
+            self.assertEqual(diff_all["workers"][0]["worker"], "w-one")
+
+        asyncio.run(_check_wait_and_tools())
+
+        # 3. _check_loopback_wake_auth internal_token fallback on HERMES_A2A_HTTP_TOKEN mismatch + /board/{asset}
+        mgr_auth = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        # First create state/internal_token while HERMES_A2A_HTTP_TOKEN is unset
+        disk_tok = mgr_auth.get_internal_token()
+        self.assertTrue((self.state_dir / "internal_token").is_file())
+        with patch.dict(os.environ, {"HERMES_A2A_HTTP_TOKEN": "mismatched-env-token"}):
+            app = http_server.create_a2a_app(mgr_auth, http_url="http://127.0.0.1:19950", bearer_token="mismatched-env-token")
+            client = TestClient(app, base_url="http://127.0.0.1:19950")
+            # /internal/wake/swarms accepts state/internal_token even when HERMES_A2A_HTTP_TOKEN mismatches
+            r_wake_fb = client.get("/internal/wake/swarms", headers={"Authorization": f"Bearer {disk_tok}"})
+            self.assertEqual(r_wake_fb.status_code, 200)
+            # Wrong token still rejected
+            r_wake_bad = client.get("/internal/wake/swarms", headers={"Authorization": "Bearer totally-wrong"})
+            self.assertEqual(r_wake_bad.status_code, 401)
+            # Static assets and preload.js load without Authorization header when bearer_token is enabled
+            self.assertEqual(client.get("/board/styles.css").status_code, 200)
+            self.assertEqual(client.get("/board/preload.js").status_code, 200)
+            # /board/ui accepts ?token= query param while /board API still requires header
+            self.assertEqual(client.get("/board/ui").status_code, 401)
+            self.assertEqual(client.get("/board/ui?token=mismatched-env-token").status_code, 200)
+            self.assertEqual(client.get("/board?conversationId=x").status_code, 401)
+
+    def test_findings_3_6_7_8_9_11d_regressions(self) -> None:
+        import sqlite3
+
+        # --- Finding #3: brain root fallback & remote/synthetic UUID validation ---
+        fake_home = self.tmp_root / "fake_home_f3"
+        std_brain = fake_home / ".gemini" / "antigravity" / "brain"
+        std_brain.mkdir(parents=True, exist_ok=True)
+        missing_app_data = self.tmp_root / "missing_app_data"
+        missing_app_data.mkdir(parents=True, exist_ok=True)
+
+        with (
+            patch.object(Path, "home", return_value=fake_home),
+            patch.dict(
+                os.environ,
+                {"ANTIGRAVITY_APP_DATA_DIR": str(missing_app_data), "ANTIGRAVITY_EXECUTABLE_DATA_DIR": ""},
+            ),
+        ):
+            roots_fb = runtime_mod.resolve_antigravity_brain_roots()
+            self.assertIn(std_brain, roots_fb)
+
+            # Seed unrelated local conversation in std_brain; remote primary UUID is NOT in local brain -> must pass!
+            unrelated_prim = "11111111-1111-4111-8111-111111111111"
+            (std_brain / unrelated_prim).mkdir(parents=True, exist_ok=True)
+            remote_prim = "22222222-2222-4222-8222-222222222222"
+            remote_coord = "33333333-3333-4333-8333-333333333333"
+            ok_remote, err_remote = runtime_mod.validate_coordinator_conversation_id(
+                remote_coord, primary_cid=remote_prim
+            )
+            self.assertTrue(ok_remote, msg=str(err_remote))
+            self.assertIsNone(err_remote)
+
+            # Local primary present in brain -> unknown coordinator UUID still rejected
+            ok_local, err_local = runtime_mod.validate_coordinator_conversation_id(
+                remote_coord, primary_cid=unrelated_prim
+            )
+            self.assertFalse(ok_local)
+            self.assertIn("not found in local Antigravity brain directory", str(err_local))
+
+        # --- Findings #6 & #11d: /board & /board/events internal_token loopback fallback + static asset Host check ---
+        mgr_auth = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        disk_tok = mgr_auth.get_internal_token()
+        sid_auth = "conv-f6-auth"
+        mgr_auth.store.upsert_meta(sid_auth, title="F6 Auth", workspace=str(self.repo_dir), primary_conversation_id=sid_auth)
+        with patch.dict(os.environ, {"HERMES_A2A_HTTP_TOKEN": "mismatched-env-token"}):
+            app = http_server.create_a2a_app(mgr_auth, http_url="http://127.0.0.1:19951", bearer_token="mismatched-env-token")
+            client = TestClient(app, base_url="http://127.0.0.1:19951")
+            remote_client = TestClient(app, base_url="http://127.0.0.1:19951", client=("10.20.30.40", 4444))
+
+            # Loopback internal_token fallback works on /board, /board/member/history, and /board/events
+            self.assertEqual(
+                client.get(f"/board?conversationId={sid_auth}", headers={"Authorization": f"Bearer {disk_tok}"}).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.get(f"/board?conversationId={sid_auth}", headers={"x-sidecar-token": disk_tok}).status_code,
+                200,
+            )
+            self.assertEqual(
+                client.get(
+                    f"/board/member/history?conversationId={sid_auth}&member=coordinator",
+                    headers={"Authorization": f"Bearer {disk_tok}"},
+                ).status_code,
+                200,
+            )
+            with client.stream(
+                "GET",
+                f"/board/events?conversationId={sid_auth}",
+                headers={"Authorization": f"Bearer {disk_tok}"},
+            ) as ev_resp:
+                self.assertEqual(ev_resp.status_code, 200)
+
+            # Invalid token, non-loopback Host, and non-loopback client IP remain strictly rejected
+            self.assertEqual(
+                client.get(f"/board?conversationId={sid_auth}", headers={"Authorization": "Bearer bad-tok"}).status_code,
+                401,
+            )
+            self.assertEqual(
+                client.get(
+                    f"/board?conversationId={sid_auth}",
+                    headers={"Host": "evil.example:19951", "Authorization": f"Bearer {disk_tok}"},
+                ).status_code,
+                401,
+            )
+            self.assertEqual(
+                remote_client.get(
+                    f"/board?conversationId={sid_auth}",
+                    headers={"Authorization": f"Bearer {disk_tok}"},
+                ).status_code,
+                401,
+            )
+
+            # Finding #11d: /board/preload.js & /board/styles.css allow loopback without auth, reject evil Host with 403
+            self.assertEqual(client.get("/board/preload.js").status_code, 200)
+            self.assertEqual(client.get("/board/styles.css").status_code, 200)
+            self.assertEqual(client.get("/board/preload.js", headers={"Host": "evil.example:19951"}).status_code, 403)
+            self.assertEqual(client.get("/board/styles.css", headers={"Host": "evil.example:19951"}).status_code, 403)
+
+        # --- Finding #7: _parse_antigravity_transcript RUNNING -> DONE + ERROR_MESSAGE ---
+        app_data_f7 = self.tmp_root / "ag_f7"
+        brain_f7 = app_data_f7 / "brain"
+        prim_f7 = "44444444-4444-4444-8444-444444444444"
+        coord_f7 = "55555555-5555-4555-8555-555555555555"
+        (brain_f7 / prim_f7 / ".system_generated" / "subagents").mkdir(parents=True, exist_ok=True)
+        (brain_f7 / prim_f7 / ".system_generated" / "subagents" / f"{coord_f7}.json").write_text(
+            json.dumps({"conversationId": coord_f7}), encoding="utf-8"
+        )
+        tlog_dir = brain_f7 / coord_f7 / ".system_generated" / "logs"
+        tlog_dir.mkdir(parents=True, exist_ok=True)
+        tlog_file = tlog_dir / "transcript_full.jsonl"
+
+        step0 = {
+            "step_index": 0,
+            "source": "SYSTEM",
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-28T01:00:00Z",
+            "content": "Boot",
+        }
+        step1_running = {
+            "step_index": 1,
+            "source": "MODEL",
+            "type": "PLANNER_RESPONSE",
+            "status": "RUNNING",
+            "created_at": "2026-11-28T01:00:05Z",
+            "model": "custom-test-model",
+            "thinking": "Drafting plan",
+            "content": "Partial answer",
+            "tool_calls": [{"name": "swarm_status", "args": {"swarm_id": prim_f7}}],
+        }
+        tlog_file.write_text("\n".join(json.dumps(s) for s in (step0, step1_running)) + "\n", encoding="utf-8")
+
+        with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_data_f7)}):
+            mgr_f7 = runtime_mod.SwarmManager(state_dir=self.state_dir)
+            mgr_f7.store.upsert_meta(
+                prim_f7,
+                title="F7 Test",
+                workspace=str(self.repo_dir),
+                primary_conversation_id=prim_f7,
+                coordinator_conversation_id=coord_f7,
+            )
+            h_run = runtime_mod.query_member_session_history(self.state_dir, prim_f7, "coordinator")
+            self.assertEqual(len(h_run["messages"]), 1)
+            self.assertEqual(h_run["lastId"], 1)
+            self.assertTrue(h_run["live"]["active"])
+            self.assertEqual(h_run["live"]["transcript"], "Partial answer")
+            self.assertEqual(h_run["live"]["reasoning"], "Drafting plan")
+            self.assertEqual(h_run["live"]["toolCalls"][0]["name"], "swarm_status")
+            self.assertEqual(h_run["live"]["currentTool"]["name"], "swarm_status")
+
+            step1_done = {
+                "step_index": 1,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "created_at": "2026-11-28T01:00:08Z",
+                "model": "custom-test-model",
+                "input_tokens": 500,
+                "cache_read_tokens": 0,
+                "output_tokens": 80,
+                "thinking": "Drafting plan",
+                "content": "Final answer",
+                "tool_calls": [],
+            }
+            step2_err = {
+                "step_index": 2,
+                "source": "SYSTEM",
+                "type": "ERROR_MESSAGE",
+                "status": "DONE",
+                "created_at": "2026-11-28T01:00:09Z",
+                "error": "The stream was interrupted.",
+                "content": "Error: The stream was interrupted.",
+            }
+            tlog_file.write_text(
+                "\n".join(json.dumps(s) for s in (step0, step1_done, step2_err)) + "\n", encoding="utf-8"
+            )
+            h_done = runtime_mod.query_member_session_history(
+                self.state_dir, prim_f7, "coordinator", after_id=h_run["lastId"]
+            )
+            self.assertEqual(len(h_done["messages"]), 2)
+            self.assertEqual(h_done["messages"][0]["content"], "Final answer")
+            self.assertEqual(h_done["messages"][1]["status"], "error")
+            self.assertTrue(h_done["messages"][1]["isError"])
+            self.assertIn("stream was interrupted", h_done["messages"][1]["content"])
+            self.assertEqual(h_done["live"]["transcript"], "")
+            self.assertEqual(h_done["live"]["toolCalls"], [])
+
+        # --- Finding #8: _COMMITTED_TC_CACHE invalidation on in-place DB delete/update ---
+        hh_f8 = self.tmp_root / "hh_f8"
+        hh_f8.mkdir(parents=True, exist_ok=True)
+        db_f8 = hh_f8 / "state.db"
+        con_f8 = sqlite3.connect(str(db_f8))
+        con_f8.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, title TEXT, "
+            "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+            "reasoning_tokens INTEGER, estimated_cost_usd REAL, actual_cost_usd REAL, model TEXT, model_config TEXT, "
+            "message_count INTEGER, tool_call_count INTEGER, started_at REAL, ended_at REAL, "
+            "billing_provider TEXT, billing_base_url TEXT)"
+        )
+        con_f8.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT, role TEXT, timestamp REAL, "
+            "content TEXT, reasoning TEXT, tool_calls TEXT, tool_name TEXT, tool_call_id TEXT)"
+        )
+        con_f8.execute(
+            "INSERT INTO sessions VALUES ('hs-f8', NULL, 'cli', 'F8', 100, 20, 0, 0, 0, 0.0, 0.0, 'custom-test-model', '{}', 2, 1, 100.0, NULL, 'custom', NULL)"
+        )
+        con_f8.execute(
+            "INSERT INTO messages (id, session_id, role, timestamp, content, tool_calls) VALUES (1, 'hs-f8', 'assistant', 100.0, 'step1', ?)",
+            (json.dumps([{"id": "tc-f8-1", "name": "bash", "arguments": {"cmd": "ls"}}]),),
+        )
+        con_f8.execute(
+            "INSERT INTO messages (id, session_id, role, timestamp, content, tool_name, tool_call_id) VALUES (2, 'hs-f8', 'tool', 101.0, 'ok', 'bash', 'tc-f8-1')"
+        )
+        con_f8.commit()
+        con_f8.close()
+
+        sid_f8 = "conv-f8-cache"
+        mgr_f8 = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        mgr_f8.store.upsert_meta(sid_f8, title="F8", workspace=str(self.repo_dir), primary_conversation_id=sid_f8)
+        rt_f8 = mgr_f8.get_runtime(sid_f8)
+        with rt_f8._state_rlock:
+            rt_f8._context_sessions["ctx-f8"] = "hs-f8"
+            rt_f8._tasks["task-f8"] = {
+                "id": "task-f8",
+                "contextId": "ctx-f8",
+                "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+                "metadata": {
+                    "workerConfig": {"worker_name": "w-f8", "role": "worker", "model": "custom-test-model"},
+                    "liveActivity": {"hermesSessionId": "hs-f8"},
+                },
+            }
+            rt_f8._live_buffers["task-f8"] = {
+                "liveToolTrace": [
+                    {"event": "tool_use", "name": "bash", "tool_call_id": "tc-f8-1"},
+                    {"event": "tool_use", "name": "grep", "tool_call_id": "tc-f8-2"},
+                ],
+                "liveTranscript": "",
+                "liveReasoning": "",
+                "recentTools": ["bash", "grep"],
+                "startedAt": models.now_iso(),
+            }
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hh_f8)}), patch.object(runtime_mod, "_COMMITTED_TC_CACHE", {}):
+            h8_1 = runtime_mod.query_member_session_history(self.state_dir, sid_f8, "w-f8", runtime=rt_f8)
+            self.assertEqual([x["tool_call_id"] for x in h8_1["live"]["toolTrace"]], ["tc-f8-2"])
+
+            # Append tc-f8-2 to SQLite -> incremental cache suppresses it
+            con_f8 = sqlite3.connect(str(db_f8))
+            con_f8.execute(
+                "INSERT INTO messages (id, session_id, role, timestamp, content, tool_calls) VALUES (3, 'hs-f8', 'assistant', 102.0, 'step2', ?)",
+                (json.dumps([{"id": "tc-f8-2", "name": "grep", "arguments": {"query": "x"}}]),),
+            )
+            con_f8.commit()
+            con_f8.close()
+            h8_2 = runtime_mod.query_member_session_history(
+                self.state_dir, sid_f8, "w-f8", after_id=h8_1["lastId"], runtime=rt_f8
+            )
+            self.assertEqual(h8_2["live"]["toolTrace"], [])
+
+            # Delete id=3 in-place (simulating NTFS in-place delete without ctime change) -> cache MUST invalidate
+            con_f8 = sqlite3.connect(str(db_f8))
+            con_f8.execute("DELETE FROM messages WHERE id = 3")
+            con_f8.commit()
+            con_f8.close()
+            h8_3 = runtime_mod.query_member_session_history(
+                self.state_dir, sid_f8, "w-f8", after_id=2, runtime=rt_f8
+            )
+            self.assertEqual([x["tool_call_id"] for x in h8_3["live"]["toolTrace"]], ["tc-f8-2"])
+
+        # --- Finding #9: final_provider precedence (billingProvider > gw_prov > cfg.provider) ---
+        hh_f9 = self.tmp_root / "hh_f9"
+        hh_f9.mkdir(parents=True, exist_ok=True)
+        db_f9 = hh_f9 / "state.db"
+        con_f9 = sqlite3.connect(str(db_f9))
+        con_f9.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT, title TEXT, "
+            "input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER, cache_write_tokens INTEGER, "
+            "reasoning_tokens INTEGER, estimated_cost_usd REAL, actual_cost_usd REAL, model TEXT, model_config TEXT, "
+            "message_count INTEGER, tool_call_count INTEGER, started_at REAL, ended_at REAL, "
+            "billing_provider TEXT, billing_base_url TEXT)"
+        )
+        con_f9.execute(
+            "INSERT INTO sessions VALUES (?, NULL, 'cli', 'F9a', 100, 50, 0, 0, 0, 0.0, 0.0, 'custom-test-model', ?, 1, 0, 100.0, 101.0, 'custom', NULL)",
+            ("hs-f9-bill", json.dumps({"gateway_runtime": {"provider": "gw-prov"}})),
+        )
+        con_f9.execute(
+            "INSERT INTO sessions VALUES (?, NULL, 'cli', 'F9b', 100, 50, 0, 0, 0, 0.0, 0.0, 'custom-test-model', ?, 1, 0, 100.0, 101.0, NULL, NULL)",
+            ("hs-f9-gw", json.dumps({"gateway_runtime": {"provider": "gw-prov"}})),
+        )
+        con_f9.commit()
+        con_f9.close()
+
+        f9_script = self.tmp_root / "fake_f9_worker.py"
+        f9_script.write_text(
+            "\n".join([
+                "import json, sys",
+                "sid = sys.argv[1]",
+                "print(json.dumps({'type': 'system', 'subtype': 'init', 'model': 'custom-test-model', 'session_id': sid}), flush=True)",
+                "print(json.dumps({'type': 'result', 'session_id': sid, 'exit_code': 0, 'duration_ms': 100, 'text': 'done', 'tokens': {'input': 100, 'output': 50}}), flush=True)",
+            ]),
+            encoding="utf-8",
+        )
+
+        async def _run_f9() -> None:
+            mgr9 = mcp_srv._swarm_mgr
+            sid9 = "conv-f9-prov"
+            mgr9.store.upsert_meta(sid9, title="F9", workspace=str(self.repo_dir), primary_conversation_id=sid9)
+            rt9 = mgr9.get_runtime(sid9)
+            with patch.dict(os.environ, {"HERMES_HOME": str(hh_f9)}):
+                with patch.object(rt9, "_build_hermes_command", return_value=([sys.executable, str(f9_script), "hs-f9-bill"], str(self.repo_dir))):
+                    r1 = await rt9.spawn_workers(
+                        name="w-f9-bill",
+                        prompt="test",
+                        workdir=str(self.repo_dir),
+                        provider="requested-prov",
+                        return_immediately=False,
+                    )
+                self.assertEqual(r1["tasks"][0]["metadata"]["resolvedProvider"], "custom")
+                with patch.object(rt9, "_build_hermes_command", return_value=([sys.executable, str(f9_script), "hs-f9-gw"], str(self.repo_dir))):
+                    r2 = await rt9.spawn_workers(
+                        name="w-f9-gw",
+                        prompt="test",
+                        workdir=str(self.repo_dir),
+                        provider="requested-prov",
+                        return_immediately=False,
+                    )
+                self.assertEqual(r2["tasks"][0]["metadata"]["resolvedProvider"], "gw-prov")
+
+        asyncio.run(_run_f9())
 
 
 if __name__ == "__main__":

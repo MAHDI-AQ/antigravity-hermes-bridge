@@ -121,20 +121,10 @@ def _parse_host_header(host_header: str) -> str:
         return "__invalid__"
 
 
-def _check_auth(request: Request, token: str | None) -> Response | None:
-    if not token:
-        parsed_host = _parse_host_header(request.headers.get("host") or "")
-        if not parsed_host or parsed_host not in ("127.0.0.1", "localhost", "::1"):
-            return JSONResponse({"error": "Forbidden host without bearer token"}, status_code=403)
-        return None
-    auth = request.headers.get("authorization") or ""
-    supplied = ""
-    if auth.startswith("Bearer "):
-        supplied = auth[7:].strip()
-    elif request.headers.get("x-sidecar-token"):
-        supplied = str(request.headers.get("x-sidecar-token") or "").strip()
-    if not supplied or not hmac.compare_digest(supplied, token):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+def _check_host_header(request: Request, *, error_message: str = "Forbidden host") -> Response | None:
+    parsed_host = _parse_host_header(request.headers.get("host") or "")
+    if not parsed_host or parsed_host not in ("127.0.0.1", "localhost", "::1"):
+        return JSONResponse({"error": error_message}, status_code=403)
     return None
 
 
@@ -144,13 +134,69 @@ def _allowed_loopback_clients() -> tuple[str, ...]:
     return ("127.0.0.1", "::1", "localhost")
 
 
+def _is_loopback_request(request: Request) -> bool:
+    client_host = request.client.host if request.client else ""
+    if not client_host or client_host not in _allowed_loopback_clients():
+        return False
+    return _check_host_header(request) is None
+
+
+def _extract_supplied_token(request: Request) -> str:
+    auth = request.headers.get("authorization") or ""
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    if request.headers.get("x-sidecar-token"):
+        return str(request.headers.get("x-sidecar-token") or "").strip()
+    return ""
+
+
+def _collect_loopback_tokens(
+    bearer_token: str | None,
+    manager: runtime_mod.SwarmManager | None = None,
+) -> list[str]:
+    accepted: list[str] = []
+    for cand in (
+        bearer_token,
+        (os.environ.get("HERMES_A2A_HTTP_TOKEN") or "").strip() or None,
+        manager.get_internal_token() if manager is not None else None,
+    ):
+        if cand and cand not in accepted:
+            accepted.append(cand)
+    if manager is not None:
+        tok_file = manager.store.state_dir / "internal_token"
+        if tok_file.is_file():
+            try:
+                file_tok = tok_file.read_text(encoding="utf-8", errors="replace").strip()
+                if file_tok and file_tok not in accepted:
+                    accepted.append(file_tok)
+            except OSError:
+                pass
+    return accepted
+
+
+def _check_auth(
+    request: Request,
+    token: str | None,
+    manager: runtime_mod.SwarmManager | None = None,
+) -> Response | None:
+    if not token:
+        return _check_host_header(request, error_message="Forbidden host without bearer token")
+    supplied = _extract_supplied_token(request)
+    if supplied and hmac.compare_digest(supplied, token):
+        return None
+    if manager is not None and _is_loopback_request(request):
+        accepted = _collect_loopback_tokens(token, manager)
+        if supplied and any(hmac.compare_digest(supplied, tok) for tok in accepted):
+            return None
+    return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+
 def _check_loopback_internal_auth(request: Request, manager: runtime_mod.SwarmManager) -> Response | None:
     client_host = request.client.host if request.client else ""
     if not client_host or client_host not in _allowed_loopback_clients():
         return JSONResponse({"error": "Forbidden: loopback required"}, status_code=403)
-    parsed_host = _parse_host_header(request.headers.get("host") or "")
-    if not parsed_host or parsed_host not in ("127.0.0.1", "localhost", "::1"):
-        return JSONResponse({"error": "Forbidden host"}, status_code=403)
+    if (denied := _check_host_header(request)) is not None:
+        return denied
 
     expected = manager.get_internal_token()
     auth = request.headers.get("authorization") or ""
@@ -168,23 +214,13 @@ def _check_loopback_wake_auth(
     client_host = request.client.host if request.client else ""
     if not client_host or client_host not in _allowed_loopback_clients():
         return JSONResponse({"error": "Forbidden: loopback required"}, status_code=403)
-    parsed_host = _parse_host_header(request.headers.get("host") or "")
-    if not parsed_host or parsed_host not in ("127.0.0.1", "localhost", "::1"):
-        return JSONResponse({"error": "Forbidden host"}, status_code=403)
+    if (denied := _check_host_header(request)) is not None:
+        return denied
 
-    expected = (
-        bearer_token
-        or (os.environ.get("HERMES_A2A_HTTP_TOKEN") or "").strip()
-        or (manager.get_internal_token() if manager is not None else None)
-    )
-    if expected:
-        auth = request.headers.get("authorization") or ""
-        supplied = ""
-        if auth.startswith("Bearer "):
-            supplied = auth[7:].strip()
-        elif request.headers.get("x-sidecar-token"):
-            supplied = str(request.headers.get("x-sidecar-token") or "").strip()
-        if not supplied or not hmac.compare_digest(supplied, expected):
+    accepted = _collect_loopback_tokens(bearer_token, manager)
+    if accepted:
+        supplied = _extract_supplied_token(request)
+        if not supplied or not any(hmac.compare_digest(supplied, tok) for tok in accepted):
             return JSONResponse({"error": "Unauthorized"}, status_code=401)
     return None
 
@@ -423,15 +459,31 @@ def _normalize_plan_status(raw: Any) -> str:
     return _PLAN_STATUS_ALIASES.get(s, "")
 
 
+_SWARM_PREAMBLE_STRIP_RE = re.compile(
+    r"^You\s+are\s+[`'\"*]?[\w-]+[`'\"*]?\s+in\s+(?:this\s+)?(?:Hermes\s+)?swarm(?:\s+[`'\"*]?[\w-]+[`'\"*]?)?(?:\s*\([^)]*(?:\)|…|$))?[.:—–\-\s]*",
+    re.IGNORECASE,
+)
+_OWNERSHIP_HDR_RE = re.compile(r"^(?:Ownership(?:\s*&\s*Locks)?|Rules|Constraints|Completion)\s*:?\s*$", re.IGNORECASE)
+
+
 def _clean_assignment_title(raw_text: str | None, fallback: str) -> str:
     text = str(raw_text or "").strip()
     if not text:
         return fallback
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip() and not _SLICE_HEADER_RE.match(ln.strip())]
-    cand = lines[0] if lines else text
-    cand = re.sub(r"^\s*(?:[-*]|#+)\s+", "", cand)
-    cand = re.sub(r"\*\*([^*]+)\*\*", r"\1", cand)
-    cand = cand.replace("`", "").replace("__", "")
+    cleaned_lines: list[str] = []
+    for raw_ln in text.splitlines():
+        ln = raw_ln.strip()
+        if not ln or _SLICE_HEADER_RE.match(ln) or _OWNERSHIP_HDR_RE.match(ln):
+            continue
+        ln = re.sub(r"^\s*(?:[-*]|#+)\s+", "", ln)
+        ln = re.sub(r"\*\*([^*]+)\*\*", r"\1", ln)
+        ln = ln.replace("`", "").replace("__", "")
+        ln = _SWARM_PREAMBLE_STRIP_RE.sub("", ln).strip()
+        if ln:
+            cleaned_lines.append(ln)
+    cand = cleaned_lines[0] if cleaned_lines else ""
+    if not cand:
+        return fallback
     cand = re.sub(r"^@[A-Za-z0-9_-]+[\s,:–—-]*", "", cand)
     cand = re.sub(
         r"^(?:you\s+(?:are|own|handle|drive|run|lead|manage)|your\s+(?:role|job|task|assignment|goal|focus)\s+is(?:\s+to)?|assignment\s*:|role\s*:|task\s*:)\s*",
@@ -640,11 +692,34 @@ def _task_to_summary_row(task: dict[str, Any], members_map: dict[str, Any]) -> d
     elapsed_ms = int(act.get("elapsedMs") or 0)
     if elapsed_ms <= 0:
         elapsed_ms = runtime_mod._elapsed_ms(act.get("startedAt") or meta.get("createdAt"), ended_at=ended_at)
-    ctx_limit = runtime_mod._resolve_context_limit(wcfg.get("model"), wcfg.get("provider"), wcfg.get("base_url"))
+    llm_active_ms = int(act.get("llmActiveMs") or 0)
+    tps_ms = llm_active_ms if llm_active_ms >= 250 else elapsed_ms
+
+    eff_model = wcfg.get("model") or meta.get("resolvedModel") or act.get("model") or member_rec.get("model")
+    eff_provider = wcfg.get("provider") or meta.get("resolvedProvider") or member_rec.get("provider")
+    if not eff_model or not eff_provider:
+        for art in reversed(task.get("artifacts") or []):
+            if isinstance(art, dict) and str(art.get("name") or "").startswith("usage_and_session"):
+                for part in art.get("parts") or []:
+                    if isinstance(part, dict) and isinstance(part.get("data"), dict):
+                        eff_model = eff_model or part["data"].get("model")
+                        eff_provider = eff_provider or part["data"].get("provider")
+    hermes_sid = act.get("hermesSessionId") or member_rec.get("sessionId")
+    if (not eff_model or not eff_provider) and hermes_sid:
+        _, _, db_extra = runtime_mod._query_hermes_session_stats(
+            str(hermes_sid),
+            model=eff_model,
+            provider=eff_provider,
+            base_url=wcfg.get("base_url"),
+        )
+        eff_model = eff_model or db_extra.get("model")
+        eff_provider = eff_provider or db_extra.get("billingProvider")
+
+    ctx_limit = runtime_mod._resolve_context_limit(eff_model, eff_provider, wcfg.get("base_url"))
     tokens = runtime_mod._normalize_tokens_dict(meta.get("tokens"), context_limit=ctx_limit)
-    tps = float(act.get("tps") if act.get("tps") is not None else runtime_mod._compute_tps(tokens["output"], elapsed_ms))
-    if tps <= 0.0 and tokens["output"] > 0 and elapsed_ms > 0:
-        tps = runtime_mod._compute_tps(tokens["output"], elapsed_ms)
+    tps = float(act.get("tps") if act.get("tps") is not None else runtime_mod._compute_tps(tokens["output"], tps_ms))
+    if tps <= 0.0 and tokens["output"] > 0 and tps_ms > 0:
+        tps = runtime_mod._compute_tps(tokens["output"], tps_ms)
     cost_raw = meta.get("costUsd")
     cost_usd = round(float(cost_raw), 6) if cost_raw is not None else None
     return {
@@ -655,8 +730,8 @@ def _task_to_summary_row(task: dict[str, Any], members_map: dict[str, Any]) -> d
         "tier": 2,
         "workerName": wname,
         "name": wname,
-        "model": wcfg.get("model"),
-        "provider": wcfg.get("provider"),
+        "model": eff_model,
+        "provider": eff_provider,
         "workdir": wcfg.get("workdir"),
         "worktreePath": meta.get("worktreePath"),
         "worktreeBranch": meta.get("worktreeBranch"),
@@ -670,10 +745,11 @@ def _task_to_summary_row(task: dict[str, Any], members_map: dict[str, Any]) -> d
         "recentTools": recent_tools,
         "lastTextPreview": act.get("lastTextPreview") or "",
         "lastError": act.get("lastError") or "",
-        "hermesSessionId": act.get("hermesSessionId"),
+        "hermesSessionId": hermes_sid,
         "tokens": tokens,
         "tps": tps,
         "elapsedMs": elapsed_ms,
+        "llmActiveMs": llm_active_ms,
         "costUsd": cost_usd,
         "assignment": member_rec.get("assignment") or "",
     }
@@ -748,7 +824,8 @@ def compute_swarm_telemetry(members_out: list[dict[str, Any]]) -> dict[str, Any]
         total_tokens += m_tot
         if m_ctx_pct >= 70.0:
             compaction_warning_count += 1
-        el_ms = int(m.get("elapsedMs") or 0)
+        llm_ms = int(m.get("llmActiveMs") or 0)
+        el_ms = llm_ms if llm_ms >= 250 else int(m.get("elapsedMs") or 0)
         if m_out > 0 and el_ms > 0:
             total_output_for_tps += m_out
             total_elapsed_ms_for_tps += el_ms
@@ -775,7 +852,8 @@ def compute_swarm_telemetry(members_out: list[dict[str, Any]]) -> dict[str, Any]
             total_tokens += s_tot
             if s_ctx_pct >= 70.0:
                 compaction_warning_count += 1
-            s_el = int(s.get("elapsedMs") or 0)
+            s_llm = int(s.get("llmActiveMs") or 0)
+            s_el = s_llm if s_llm >= 250 else int(s.get("elapsedMs") or 0)
             if s_out > 0 and s_el > 0:
                 total_output_for_tps += s_out
                 total_elapsed_ms_for_tps += s_el
@@ -1170,6 +1248,37 @@ def build_observer_snapshot(
                 "summary": str(s.get("summary") or ""),
             })
         member_tokens = dict((trow or {}).get("tokens") or runtime_mod._normalize_tokens_dict({}))
+        member_model = (trow or {}).get("model") or mem.get("model") or ""
+        member_provider = (trow or {}).get("provider") or mem.get("provider") or ""
+        member_steps = int((trow or {}).get("steps") or 0)
+        member_tool_calls = int((trow or {}).get("toolCalls") or 0)
+        member_tps = float((trow or {}).get("tps") or 0.0)
+        member_elapsed_ms = int((trow or {}).get("elapsedMs") or 0)
+        member_llm_active_ms = int((trow or {}).get("llmActiveMs") or 0)
+        if is_coord:
+            coord_stats = runtime_mod.extract_antigravity_transcript_summary(
+                [conv_id] if conv_id else [],
+                primary_cid=meta.get("primaryConversationId"),
+            )
+            if coord_stats:
+                if not member_model and coord_stats.get("model"):
+                    member_model = str(coord_stats["model"])
+                if not member_provider and coord_stats.get("provider"):
+                    member_provider = str(coord_stats["provider"])
+                if not member_steps and coord_stats.get("steps"):
+                    member_steps = int(coord_stats["steps"])
+                if not member_tool_calls and coord_stats.get("toolCalls"):
+                    member_tool_calls = int(coord_stats["toolCalls"])
+                if int(member_tokens.get("total") or 0) == 0 and isinstance(coord_stats.get("tokens"), dict):
+                    member_tokens = dict(coord_stats["tokens"])
+                if member_tps <= 0.0 and coord_stats.get("tps"):
+                    member_tps = float(coord_stats["tps"])
+                if member_elapsed_ms <= 0 and coord_stats.get("elapsedMs"):
+                    member_elapsed_ms = int(coord_stats["elapsedMs"])
+                if member_llm_active_ms <= 0 and coord_stats.get("llmActiveMs"):
+                    member_llm_active_ms = int(coord_stats["llmActiveMs"])
+                if not conv_id and coord_stats.get("conversationId"):
+                    conv_id = str(coord_stats["conversationId"])
         m_pure, m_cached, m_cw, m_out, m_proc, _ = _extract_token_economy(member_tokens)
         member_tokens.setdefault("pureInput", m_pure)
         member_tokens.setdefault("cachedInput", m_cached)
@@ -1192,20 +1301,21 @@ def build_observer_snapshot(
             "role": role,
             "tier": int(mem.get("tier") or 2),
             "runtime": mem.get("runtime") or ("antigravity" if is_coord else "hermes"),
-            "model": (trow or {}).get("model") or mem.get("model") or "",
-            "provider": (trow or {}).get("provider") or mem.get("provider") or "",
+            "model": member_model,
+            "provider": member_provider,
             "status": ui_status,
             "killed": killed,
             "assignment": mem.get("assignment") or "",
             "activity": activity,
             "activityKind": activity_kind,
-            "steps": int((trow or {}).get("steps") or 0),
-            "toolCalls": int((trow or {}).get("toolCalls") or 0),
+            "steps": member_steps,
+            "toolCalls": member_tool_calls,
             "currentTool": cur_tool,
             "recentTools": list((trow or {}).get("recentTools") or []),
-            "tps": float((trow or {}).get("tps") or 0.0),
+            "tps": member_tps,
             "tpsEstimated": bool((trow or {}).get("tpsEstimated")),
-            "elapsedMs": int((trow or {}).get("elapsedMs") or 0),
+            "elapsedMs": member_elapsed_ms,
+            "llmActiveMs": member_llm_active_ms,
             "posts": post_count,
             "postCount": post_count,
             "readCount": read_count,
@@ -1228,6 +1338,8 @@ def build_observer_snapshot(
             "conversation_id": conv_id or "",
             "taskId": (trow or {}).get("taskId") or mem.get("taskId"),
             "contextId": (trow or {}).get("contextId") or mem.get("contextId"),
+            "workspace": meta.get("workspace"),
+            "workdir": (trow or {}).get("workdir") or mem.get("workdir") or meta.get("workspace"),
             "worktreePath": (trow or {}).get("worktreePath") or mem.get("worktreePath"),
             "worktreeBranch": (trow or {}).get("worktreeBranch") or mem.get("worktreeBranch"),
             "tokens": member_tokens,
@@ -1292,6 +1404,7 @@ def build_observer_snapshot(
     for cand_af in [
         str(paths.swarm_dir),
         str(meta.get("workspace") or ""),
+        *[str(m.get("worktreePath") or "") for m in members_out if isinstance(m, dict)],
         str(view_info.get("dir") or ""),
         *[str(f.get("path") or "") for f in frames if isinstance(f, dict)],
     ]:
@@ -1344,6 +1457,8 @@ def build_observer_snapshot(
                     m["name"],
                     m["status"],
                     m["killed"],
+                    m.get("model"),
+                    m.get("provider"),
                     m["steps"],
                     m["toolCalls"],
                     (m.get("currentTool") or {}).get("name"),
@@ -2032,7 +2147,7 @@ def create_a2a_app(
     # --- Read-only Observer Board Routes (1:1 session-bound) ---
 
     async def board_get(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        if (denied := _check_auth(request, bearer_token, manager)) is not None:
             return denied
         _, conv_id, _ = _extract_scope_hints(request)
         if not conv_id:
@@ -2074,7 +2189,7 @@ def create_a2a_app(
         return JSONResponse(snap, headers={"ETag": str(snap.get("etag") or "")})
 
     async def board_events(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        if (denied := _check_auth(request, bearer_token, manager)) is not None:
             return denied
         with _SSE_SUBSCRIBERS_LOCK:
             if len(_ACTIVE_SSE_QUEUES) >= _MAX_SSE_SUBSCRIBERS:
@@ -2100,7 +2215,7 @@ def create_a2a_app(
         )
 
     async def board_member_history(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        if (denied := _check_auth(request, bearer_token, manager)) is not None:
             return denied
         qp = request.query_params
         member_name = str(qp.get("member") or "").strip()
@@ -2146,6 +2261,10 @@ def create_a2a_app(
                 res.setdefault("ok", True)
                 res.setdefault("swarm", sid)
                 res.setdefault("swarmId", sid)
+                if not res.get("workspace") and meta.get("workspace"):
+                    res["workspace"] = meta.get("workspace")
+                if not res.get("workdir") and meta.get("workspace"):
+                    res["workdir"] = meta.get("workspace")
                 if not res.get("primaryConversationId"):
                     res["primaryConversationId"] = meta.get("primaryConversationId")
                 if not res.get("coordinatorConversationId") and meta.get("coordinatorConversationId"):
@@ -2174,7 +2293,7 @@ def create_a2a_app(
             return JSONResponse({"error": str(exc)}, status_code=500)
 
     async def board_raw(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        if (denied := _check_auth(request, bearer_token, manager)) is not None:
             return denied
         qp = request.query_params
         kind = str(qp.get("kind") or "archive").strip().lower()
@@ -2219,7 +2338,7 @@ def create_a2a_app(
         return JSONResponse({"swarm": sid, "kind": kind, "content": raw_map.get(kind, "")})
 
     async def board_frame(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        if (denied := _check_auth(request, bearer_token, manager)) is not None:
             return denied
         raw_path = str(request.query_params.get("path") or "").strip()
         if not raw_path or "\x00" in raw_path or "%" in raw_path:
@@ -2306,7 +2425,12 @@ def create_a2a_app(
         )
 
     async def board_ui(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        if bearer_token:
+            q_tok = str(request.query_params.get("token") or "").strip()
+            if not q_tok or not hmac.compare_digest(q_tok, bearer_token):
+                if (denied := _check_auth(request, bearer_token, manager)) is not None:
+                    return denied
+        elif (denied := _check_auth(request, None)) is not None:
             return denied
         idx = _BOARD_UI_DIR / "index.html"
         if not await asyncio.to_thread(idx.is_file):
@@ -2319,7 +2443,8 @@ def create_a2a_app(
         )
 
     async def board_preload_js(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        host_err = "Forbidden host without bearer token" if not bearer_token else "Forbidden host"
+        if (denied := _check_host_header(request, error_message=host_err)) is not None:
             return denied
         shim = (
             "(function(){\n"
@@ -2348,15 +2473,18 @@ def create_a2a_app(
         )
 
     async def board_ui_asset(request: Request) -> Response:
-        if (denied := _check_auth(request, bearer_token)) is not None:
+        host_err = "Forbidden host without bearer token" if not bearer_token else "Forbidden host"
+        if (denied := _check_host_header(request, error_message=host_err)) is not None:
             return denied
         rel = str(request.path_params.get("asset_name") or "").strip().lstrip("/")
         if not rel or "/" in rel or "\\" in rel or ".." in rel:
             return JSONResponse({"error": "Not found"}, status_code=404)
         target = _BOARD_UI_DIR / rel
+        if target.suffix.lower() not in _ASSET_CONTENT_TYPES:
+            return JSONResponse({"error": "Not found"}, status_code=404)
         if not store.is_path_within(target, [_BOARD_UI_DIR]) or not await asyncio.to_thread(target.is_file):
             return JSONResponse({"error": "Not found"}, status_code=404)
-        ctype = _ASSET_CONTENT_TYPES.get(target.suffix.lower(), "application/octet-stream")
+        ctype = _ASSET_CONTENT_TYPES[target.suffix.lower()]
         raw_bytes = await asyncio.to_thread(target.read_bytes)
         return Response(content=raw_bytes, media_type=ctype, headers={"Cache-Control": "no-cache"})
 

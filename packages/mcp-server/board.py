@@ -856,6 +856,18 @@ class BoardService:
         before_val: int | None = int(before_seq) if before_seq is not None else None
 
         should_mutate = bool(mark_read_by and str(mark_read_by).strip())
+        if should_mutate:
+            _, chk_bfile, _ = resolve_board_location(
+                swarm_id,
+                state_dir=self._store._state_dir,
+                board_dir=board_dir,
+            )
+            if (
+                not chk_bfile.is_file()
+                and not chk_bfile.with_name("meta.json").is_file()
+                and not chk_bfile.with_name("tasks.json").is_file()
+            ):
+                should_mutate = False
         with self._locked_board(swarm_id, board_dir=board_dir, mutate=should_mutate) as (sid, board, bfile):
             live_msgs = [m for m in (board.get("messages") or []) if isinstance(m, dict)]
             if include_archive:
@@ -1281,6 +1293,17 @@ class BoardService:
         board_dir: Path | str | None = None,
     ) -> dict[str, Any]:
         key = str(name or "").strip() or "coordinator"
+        _, chk_bfile, _ = resolve_board_location(
+            swarm_id,
+            state_dir=self._store._state_dir,
+            board_dir=board_dir,
+        )
+        if (
+            not chk_bfile.is_file()
+            and not chk_bfile.with_name("meta.json").is_file()
+            and not chk_bfile.with_name("tasks.json").is_file()
+        ):
+            return {}
         ts = models.now_iso()
         with self._locked_board(swarm_id, board_dir=board_dir, mutate=True) as (_, board, _):
             members = board.setdefault("members", {})
@@ -1467,6 +1490,13 @@ class BoardService:
         clean_scope = _normalize_scope_key(scope) if scope else None
         clean_holder = str(holder).strip() if holder else None
         holder_low = clean_holder.lower() if clean_holder else None
+        sid_chk, chk_bfile, _ = resolve_board_location(
+            swarm_id,
+            state_dir=self._store._state_dir,
+            board_dir=board_dir,
+        )
+        if not chk_bfile.is_file() and not chk_bfile.with_name("meta.json").is_file():
+            return {"swarmId": sid_chk, "released": []}
         removed: list[str] = []
         resolved_sid = "default"
         with self._locked_board(swarm_id, board_dir=board_dir, mutate=True) as (sid, board, _):
@@ -1751,17 +1781,26 @@ class BoardService:
         deadline = time.monotonic() + timeout
         waiter_id = uuid.uuid4().hex
 
-        try:
-            await asyncio.to_thread(
-                self.set_member_wait,
-                target,
-                waiting=True,
-                waiter_id=waiter_id,
-                swarm_id=sid,
-                board_dir=board_dir,
-            )
-        except Exception:
-            pass
+        swarm_exists_on_disk = (
+            bfile.is_file()
+            or bfile.with_name("meta.json").is_file()
+            or bfile.with_name("tasks.json").is_file()
+        )
+        wait_set = False
+        wait_cleared = False
+        if swarm_exists_on_disk:
+            try:
+                await asyncio.to_thread(
+                    self.set_member_wait,
+                    target,
+                    waiting=True,
+                    waiter_id=waiter_id,
+                    swarm_id=sid,
+                    board_dir=board_dir,
+                )
+                wait_set = True
+            except Exception:
+                pass
 
         def _stat_sig() -> tuple[int, int] | None:
             try:
@@ -1787,16 +1826,23 @@ class BoardService:
             return None
 
         def _complete_wait(matched_msgs: list[dict[str, Any]]) -> None:
+            nonlocal wait_cleared
             matched_seqs = [int(m.get("seq") or 0) for m in matched_msgs if int(m.get("seq") or 0) > 0]
-            self.set_member_wait(
-                target,
-                waiting=False,
-                read_seqs=matched_seqs,
-                waiter_id=waiter_id,
-                advance_contiguous=True,
-                swarm_id=sid,
-                board_dir=board_dir,
-            )
+            if (
+                bfile.is_file()
+                or bfile.with_name("meta.json").is_file()
+                or bfile.with_name("tasks.json").is_file()
+            ):
+                self.set_member_wait(
+                    target,
+                    waiting=False,
+                    read_seqs=matched_seqs,
+                    waiter_id=waiter_id,
+                    advance_contiguous=True,
+                    swarm_id=sid,
+                    board_dir=board_dir,
+                )
+            wait_cleared = True
 
         q = self.subscribe_waiter(sid)
         try:
@@ -1848,17 +1894,20 @@ class BoardService:
                     return hit
         finally:
             self.unsubscribe_waiter(sid, q)
-            try:
-                loop = asyncio.get_running_loop()
-                loop.run_in_executor(
-                    None,
-                    lambda: self.set_member_wait(
+            if not wait_cleared and (
+                wait_set
+                or bfile.is_file()
+                or bfile.with_name("meta.json").is_file()
+                or bfile.with_name("tasks.json").is_file()
+            ):
+                try:
+                    await asyncio.to_thread(
+                        self.set_member_wait,
                         target,
                         waiting=False,
                         waiter_id=waiter_id,
                         swarm_id=sid,
                         board_dir=board_dir,
-                    ),
-                )
-            except Exception:
-                pass
+                    )
+                except Exception:
+                    pass

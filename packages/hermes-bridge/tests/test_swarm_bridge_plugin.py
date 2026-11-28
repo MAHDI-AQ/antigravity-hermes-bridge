@@ -1060,6 +1060,300 @@ class SwarmBridgePluginTests(unittest.TestCase):
             events = [json.loads(line) for line in bridge_log.read_text(encoding="utf-8").splitlines() if line.strip()]
             self.assertTrue(any(ev.get("event") == "post_compaction" and ev.get("sessionId") == "sess-hook-1" for ev in events))
 
+    def test_swarm_wait_avoids_redundant_disk_writes_and_prefers_lightweight_read(self) -> None:
+        from unittest.mock import patch
+        from hermes_swarm_bridge import swarm_tools
+
+        bpath = self.board_dir / "board.json"
+        bpath.write_text(
+            json.dumps({
+                "swarmId": "swarm-opt",
+                "nextSeq": 2,
+                "members": {
+                    "worker-1": {"name": "worker-1", "role": "worker", "state": "working", "lastReadSeq": 1},
+                },
+                "channels": {},
+                "messages": [
+                    {"seq": 1, "sender": "coordinator", "summary": "init", "channel": "#general"},
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        env = {
+            **self.base_clear_env,
+            "HERMES_SWARM_ID": "swarm-opt",
+            "HERMES_SWARM_AGENT": "worker-1",
+            "HERMES_SWARM_ROLE": "worker",
+            "HERMES_SWARM_BOARD_DIR": str(self.board_dir),
+        }
+        orig_atomic_write = swarm_tools._atomic_write_json
+        write_calls = 0
+
+        def _counting_write(path, data):
+            nonlocal write_calls
+            if Path(path) == bpath:
+                write_calls += 1
+            return orig_atomic_write(path, data)
+
+        with _EnvPatch(env), patch.object(swarm_tools, "_atomic_write_json", side_effect=_counting_write):
+            ctx = _FakeCtx()
+            self.plugin.register(ctx)
+            # Worker timeout performs ZERO board.json writes (no enter/exit waitSince churn)
+            t_res = json.loads(ctx.tools["swarm_wait"]["handler"]({"since": 1, "timeout_seconds": 0.15}))
+            self.assertTrue(t_res["ok"])
+            self.assertTrue(t_res["timedOut"])
+            self.assertEqual(write_calls, 0, f"Expected 0 board.json writes on worker wait timeout, got {write_calls}")
+
+            # Worker wake performs at most 1 board.json write (to advance lastReadSeq)
+            def _delayed_wake():
+                time.sleep(0.08)
+                with _EnvPatch({"HERMES_SWARM_AGENT": "coordinator", "HERMES_SWARM_ROLE": "coordinator"}):
+                    ctx.tools["swarm_post"]["handler"]({"summary": "@worker-1 ping"})
+
+            th = threading.Thread(target=_delayed_wake, daemon=True)
+            th.start()
+            write_calls = 0
+            w_res = json.loads(ctx.tools["swarm_wait"]["handler"]({"since": 1, "timeout_seconds": 2.0}))
+            th.join(timeout=2.0)
+            self.assertTrue(w_res["woken"])
+            # 1 write from coordinator's swarm_post + 1 write from worker-1 advancing lastReadSeq = 2 total (never 4)
+            self.assertEqual(write_calls, 2, f"Expected 1 post write + 1 wake cursor write, got {write_calls}")
+
+        # HTTP polling uses lightweight /internal/board/read rather than /board
+        seen_paths: list[str] = []
+
+        class _LightweightReadHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_GET(self):
+                seen_paths.append(self.path)
+                if self.path.startswith("/internal/board/read"):
+                    if len(seen_paths) < 2:
+                        body = {"ok": True, "swarmId": "swarm-lw", "head": 0, "count": 0, "messages": []}
+                    else:
+                        body = {
+                            "ok": True,
+                            "swarmId": "swarm-lw",
+                            "head": 3,
+                            "count": 1,
+                            "messages": [{"seq": 3, "sender": "coordinator", "summary": "@worker-lw ready", "mentions": ["worker-lw"]}],
+                        }
+                    raw = json.dumps(body).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _LightweightReadHandler)
+        port = srv.server_address[1]
+        st = threading.Thread(target=srv.serve_forever, daemon=True)
+        st.start()
+        try:
+            http_env = {
+                **self.base_clear_env,
+                "HERMES_SWARM_ID": "swarm-lw",
+                "HERMES_SWARM_AGENT": "worker-lw",
+                "HERMES_SWARM_HTTP_URL": f"http://127.0.0.1:{port}",
+                "HERMES_SWARM_HTTP_TOKEN": "tok-lw",
+                "HERMES_SWARM_CONVERSATION_ID": "conv-lw",
+            }
+            with _EnvPatch(http_env):
+                ctx = _FakeCtx()
+                self.plugin.register(ctx)
+                res = json.loads(ctx.tools["swarm_wait"]["handler"]({"since": 0, "timeout_seconds": 2.0}))
+                self.assertTrue(res["ok"])
+                self.assertTrue(res["woken"])
+                self.assertTrue(all(p.startswith("/internal/board/read") for p in seen_paths), seen_paths)
+                self.assertFalse(any(p.startswith("/board?") for p in seen_paths), seen_paths)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_swarm_wait_retries_transient_status_error_and_refreshes_channels(self) -> None:
+        from unittest.mock import patch
+        import urllib.parse
+        from hermes_swarm_bridge import swarm_tools
+
+        status_calls = 0
+
+        class _ChannelRefreshHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_GET(self):
+                nonlocal status_calls
+                parsed = urllib.parse.urlparse(self.path)
+                qs = urllib.parse.parse_qs(parsed.query)
+                if parsed.path == "/internal/board/read" and "true" in qs.get("status", []):
+                    status_calls += 1
+                    if status_calls == 1:
+                        raw = json.dumps({"ok": False, "error": "transient error"}).encode("utf-8")
+                        self.send_response(500)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(raw)))
+                        self.end_headers()
+                        self.wfile.write(raw)
+                        return
+                    if status_calls == 2:
+                        body = {
+                            "ok": True,
+                            "swarmId": "swarm-ch-ref",
+                            "head": 1,
+                            "members": [{"name": "worker-r", "role": "worker", "channels": []}],
+                            "channels": [{"name": "#deploy", "archived": False, "subscribers": []}],
+                        }
+                    else:
+                        body = {
+                            "ok": True,
+                            "swarmId": "swarm-ch-ref",
+                            "head": 1,
+                            "members": [{"name": "worker-r", "role": "worker", "channels": ["#deploy"]}],
+                            "channels": [{"name": "#deploy", "archived": False, "subscribers": ["worker-r"]}],
+                        }
+                    raw = json.dumps(body).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+
+                if parsed.path == "/internal/board/read":
+                    body = {
+                        "ok": True,
+                        "swarmId": "swarm-ch-ref",
+                        "head": 1,
+                        "count": 1,
+                        "messages": [
+                            {"seq": 1, "sender": "coordinator", "channel": "#deploy", "summary": "deploy ping"}
+                        ],
+                    }
+                    raw = json.dumps(body).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+
+                self.send_response(404)
+                self.end_headers()
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _ChannelRefreshHandler)
+        port = srv.server_address[1]
+        st = threading.Thread(target=srv.serve_forever, daemon=True)
+        st.start()
+        try:
+            http_env = {
+                **self.base_clear_env,
+                "HERMES_SWARM_ID": "swarm-ch-ref",
+                "HERMES_SWARM_AGENT": "worker-r",
+                "HERMES_SWARM_ROLE": "worker",
+                "HERMES_SWARM_HTTP_URL": f"http://127.0.0.1:{port}",
+                "HERMES_SWARM_HTTP_TOKEN": "tok-ch",
+                "HERMES_SWARM_CONVERSATION_ID": "conv-ch",
+            }
+            with _EnvPatch(http_env), patch.object(swarm_tools, "CHANNEL_META_REFRESH_SECONDS", 0.05):
+                ctx = _FakeCtx()
+                self.plugin.register(ctx)
+                res = json.loads(
+                    ctx.tools["swarm_wait"]["handler"]({
+                        "since": 0,
+                        "mentions_only": False,
+                        "timeout_seconds": 4.0,
+                    })
+                )
+                self.assertTrue(res["ok"], msg=res)
+                self.assertTrue(res["woken"], msg=res)
+                self.assertEqual(res["source"], "http")
+                self.assertEqual(res["messages"][0]["seq"], 1)
+                self.assertGreaterEqual(status_calls, 3)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_swarm_wait_coordinator_sets_waiting_state_and_flag_at_since_zero(self) -> None:
+        bpath = self.board_dir / "board.json"
+        bpath.write_text(
+            json.dumps({
+                "swarmId": "swarm-coord-wait",
+                "nextSeq": 1,
+                "members": {
+                    "coordinator": {"name": "coordinator", "role": "coordinator", "state": "working", "lastReadSeq": 0},
+                    "worker-1": {"name": "worker-1", "role": "worker", "state": "working", "lastReadSeq": 0},
+                },
+                "channels": {},
+                "messages": [],
+            }),
+            encoding="utf-8",
+        )
+
+        coord_env = {
+            **self.base_clear_env,
+            "HERMES_SWARM_ID": "swarm-coord-wait",
+            "HERMES_SWARM_AGENT": "coordinator",
+            "HERMES_SWARM_ROLE": "coordinator",
+            "HERMES_SWARM_BOARD_DIR": str(self.board_dir),
+        }
+        with _EnvPatch(coord_env):
+            ctx = _FakeCtx()
+            self.plugin.register(ctx)
+
+            wait_result: dict[str, Any] = {}
+
+            def _run_wait() -> None:
+                wait_result["res"] = json.loads(
+                    ctx.tools["swarm_wait"]["handler"]({"since": 0, "timeout_seconds": 3.0})
+                )
+
+            wt = threading.Thread(target=_run_wait, daemon=True)
+            wt.start()
+
+            deadline = time.monotonic() + 2.0
+            mid_coord: dict[str, Any] = {}
+            while time.monotonic() < deadline:
+                if bpath.is_file():
+                    doc = json.loads(bpath.read_text(encoding="utf-8"))
+                    cand = (doc.get("members") or {}).get("coordinator") or {}
+                    if cand.get("waiting") is True:
+                        mid_coord = cand
+                        break
+                time.sleep(0.02)
+
+            self.assertEqual(mid_coord.get("state"), "waiting", msg=mid_coord)
+            self.assertIs(mid_coord.get("waiting"), True, msg=mid_coord)
+            self.assertEqual(mid_coord.get("waitSince"), "0", msg=mid_coord)
+
+            with _EnvPatch({"HERMES_SWARM_AGENT": "worker-1", "HERMES_SWARM_ROLE": "worker"}):
+                ctx.tools["swarm_post"]["handler"]({"summary": "@coordinator [done] ready"})
+
+            wt.join(timeout=3.0)
+            res = wait_result.get("res") or {}
+            self.assertTrue(res.get("ok"), msg=res)
+            self.assertTrue(res.get("woken"), msg=res)
+
+            after_wake = (json.loads(bpath.read_text(encoding="utf-8")).get("members") or {}).get("coordinator") or {}
+            self.assertEqual(after_wake.get("state"), "working", msg=after_wake)
+            self.assertIs(after_wake.get("waiting"), False, msg=after_wake)
+            self.assertIsNone(after_wake.get("waitSince"), msg=after_wake)
+
+            # Timeout path also restores working state and clears waiting/waitSince
+            t_res = json.loads(
+                ctx.tools["swarm_wait"]["handler"]({"since": res["head"], "timeout_seconds": 0.15})
+            )
+            self.assertTrue(t_res["ok"])
+            self.assertTrue(t_res["timedOut"])
+            after_to = (json.loads(bpath.read_text(encoding="utf-8")).get("members") or {}).get("coordinator") or {}
+            self.assertEqual(after_to.get("state"), "working", msg=after_to)
+            self.assertIs(after_to.get("waiting"), False, msg=after_to)
+            self.assertIsNone(after_to.get("waitSince"), msg=after_to)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -43,7 +43,48 @@ def default_mcp_install_dir() -> Path:
     env = (os.environ.get("HERMES_SWARM_MCP_HOME") or "").strip()
     if env:
         return Path(env).expanduser()
-    return Path.home() / "Tools" / "hermes-a2a-mcp" if (Path.home() / "Tools" / "hermes-a2a-mcp").exists() else (Path.home() / ".local" / "share" / "hermes-swarm" / "mcp-server")
+    return Path.home() / ".local" / "share" / "hermes-swarm" / "mcp-server"
+
+
+def _inspect_mcp_config_file(cfg_path: Path) -> tuple[bool, str, Path | None]:
+    if not cfg_path.is_file():
+        return False, f"Missing {cfg_path}", None
+    try:
+        doc = json.loads(cfg_path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict):
+            return False, f"Invalid JSON object in {cfg_path}", None
+        servers = doc.get("mcpServers")
+        srv = servers.get("hermes-a2a") if isinstance(servers, dict) else None
+        ok = isinstance(srv, dict) and bool(srv.get("command")) and not bool(srv.get("disabled"))
+        detected_mcp_dir: Path | None = None
+        if isinstance(srv, dict) and isinstance(srv.get("args"), list) and srv["args"]:
+            first_arg = Path(str(srv["args"][0])).expanduser()
+            if first_arg.name == "server.py" and first_arg.is_file():
+                detected_mcp_dir = first_arg.parent.resolve()
+        detail = f"configured in {cfg_path}" if ok else f"hermes-a2a missing or disabled in {cfg_path}"
+        return ok, detail, detected_mcp_dir
+    except Exception as exc:
+        return False, f"Invalid JSON in {cfg_path}: {exc}", None
+
+
+def _resolve_antigravity_mcp_config(ag_cfg: Path, ag_gemini: Path) -> tuple[bool, str, Path | None]:
+    primary_cfg = ag_cfg / "mcp_config.json"
+    ok, detail, detected_dir = _inspect_mcp_config_file(primary_cfg)
+    if ok:
+        return True, detail, detected_dir
+
+    legacy_candidates: list[Path] = []
+    for cand in (ag_gemini / "mcp_config.json", Path.home() / ".gemini" / "antigravity" / "mcp_config.json"):
+        resolved = cand.resolve()
+        if resolved != primary_cfg.resolve() and resolved not in legacy_candidates:
+            legacy_candidates.append(resolved)
+
+    for legacy_cfg in legacy_candidates:
+        leg_ok, _, leg_dir = _inspect_mcp_config_file(legacy_cfg)
+        if leg_ok:
+            return True, f"configured in legacy {legacy_cfg} (recommended: {primary_cfg})", leg_dir
+
+    return False, detail, detected_dir
 
 
 def check_node_version() -> tuple[bool, str]:
@@ -67,10 +108,32 @@ def run_doctor(
     gemini_dir: Path | None = None,
     hermes_home: Path | None = None,
 ) -> dict[str, Any]:
-    mcp_root = (mcp_dir or default_mcp_install_dir()).resolve()
-    ag_cfg = (antigravity_config_dir or default_antigravity_config_dir()).resolve()
-    ag_gemini = (gemini_dir or default_antigravity_gemini_dir()).resolve()
+    ag_gemini = (gemini_dir or default_antigravity_gemini_dir()).expanduser().resolve()
+    if antigravity_config_dir is not None:
+        ag_cfg = antigravity_config_dir.expanduser().resolve()
+    elif gemini_dir is not None:
+        cand_cfg = (ag_gemini.parent / "config") if ag_gemini.name == "antigravity" else (ag_gemini / "config")
+        if (cand_cfg / "plugins" / "hermes-swarm").is_dir() or (cand_cfg / "mcp_config.json").is_file():
+            ag_cfg = cand_cfg
+        else:
+            ag_cfg = default_antigravity_config_dir().expanduser().resolve()
+    else:
+        ag_cfg = default_antigravity_config_dir().expanduser().resolve()
     h_home = (hermes_home or default_hermes_home()).resolve()
+
+    mcp_cfg_ok, mcp_cfg_detail, configured_mcp_dir = _resolve_antigravity_mcp_config(ag_cfg, ag_gemini)
+
+    if mcp_dir is not None:
+        mcp_root = mcp_dir.expanduser().resolve()
+    else:
+        mcp_root = default_mcp_install_dir().resolve()
+        if not (mcp_root / "server.py").is_file():
+            if configured_mcp_dir is not None and (configured_mcp_dir / "server.py").is_file():
+                mcp_root = configured_mcp_dir
+            else:
+                legacy_mcp = (Path.home() / "Tools" / "hermes-a2a-mcp").resolve()
+                if (legacy_mcp / "server.py").is_file():
+                    mcp_root = legacy_mcp
 
     checks: list[dict[str, Any]] = []
 
@@ -107,29 +170,33 @@ def run_doctor(
     # Antigravity plugin
     ag_plugin_dir = ag_cfg / "plugins" / "hermes-swarm"
     plugin_json = ag_plugin_dir / "plugin.json"
-    sidecar_main = ag_plugin_dir / "sidecars" / "swarm_board" / "main.mjs"
-    ag_ok = plugin_json.is_file() and sidecar_main.is_file()
-    if ag_ok and node_ok:
-        chk = subprocess.run(["node", "--check", str(sidecar_main)], capture_output=True, text=True, timeout=5, check=False)
-        ag_ok = chk.returncode == 0
+    sidecar_dir = ag_plugin_dir / "sidecars" / "swarm_board"
+    sidecar_main = sidecar_dir / "main.mjs"
+    sidecar_wakeup = sidecar_dir / "wakeup_bridge.mjs"
+    ag_ok = plugin_json.is_file() and sidecar_main.is_file() and sidecar_wakeup.is_file()
+    ag_detail = str(ag_plugin_dir)
+    if not ag_ok:
+        missing = [
+            p.name
+            for p in (plugin_json, sidecar_main, sidecar_wakeup)
+            if not p.is_file()
+        ]
+        ag_detail = f"{ag_plugin_dir} (missing: {', '.join(missing)})"
+    elif node_ok:
+        for js_file in (sidecar_main, sidecar_wakeup):
+            chk = subprocess.run(["node", "--check", str(js_file)], capture_output=True, text=True, timeout=5, check=False)
+            if chk.returncode != 0:
+                ag_ok = False
+                err_txt = (chk.stderr or chk.stdout).strip()[:160]
+                ag_detail = f"{ag_plugin_dir} (node --check failed for {js_file.name}: {err_txt})"
+                break
     checks.append({
         "name": "antigravity_plugin",
         "ok": ag_ok,
-        "detail": str(ag_plugin_dir),
+        "detail": ag_detail,
     })
 
     # Antigravity MCP config
-    mcp_cfg_path = ag_gemini / "mcp_config.json"
-    mcp_cfg_ok = False
-    mcp_cfg_detail = f"Missing {mcp_cfg_path}"
-    if mcp_cfg_path.is_file():
-        try:
-            doc = json.loads(mcp_cfg_path.read_text(encoding="utf-8"))
-            srv = (doc.get("mcpServers") or {}).get("hermes-a2a")
-            mcp_cfg_ok = isinstance(srv, dict) and bool(srv.get("command")) and not bool(srv.get("disabled"))
-            mcp_cfg_detail = f"configured in {mcp_cfg_path}" if mcp_cfg_ok else f"hermes-a2a missing or disabled in {mcp_cfg_path}"
-        except Exception as exc:
-            mcp_cfg_detail = f"Invalid JSON in {mcp_cfg_path}: {exc}"
     checks.append({"name": "antigravity_mcp_config", "ok": mcp_cfg_ok, "detail": mcp_cfg_detail})
 
     # Hermes bridge plugin

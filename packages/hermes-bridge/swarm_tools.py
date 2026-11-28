@@ -24,6 +24,7 @@ DEFAULT_CHANNEL = "#general"
 MAX_BOARD_MESSAGES = 1000
 MAX_BRIDGE_LOG_BYTES = 1_048_576
 HEARTBEAT_THROTTLE_SECONDS = 15.0
+CHANNEL_META_REFRESH_SECONDS = 5.0
 
 _SWARM_ID_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
 _CHANNEL_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
@@ -1201,6 +1202,74 @@ def _fetch_http_snapshot(cfg: dict[str, str], *, etag: str = "", timeout: float 
     return snap
 
 
+def _fetch_http_read(
+    cfg: dict[str, str],
+    *,
+    since: int = 0,
+    limit: int = 100,
+    timeout: float = 2.5,
+) -> dict[str, Any]:
+    """Lightweight poll via GET /internal/board/read (avoids full /board observer snapshot)."""
+    http_url = cfg.get("http_url") or ""
+    swarm_id = cfg.get("swarm_id") or ""
+    conv_id = cfg.get("conversation_id") or ""
+    if not http_url or not (swarm_id or conv_id):
+        return {"ok": False, "status": 0, "data": None}
+    query_params: dict[str, str] = {"limit": str(max(1, min(500, int(limit))))}
+    if swarm_id:
+        query_params["swarmId"] = swarm_id
+    if since > 0:
+        query_params["since"] = str(int(since))
+    if cfg.get("agent"):
+        query_params["agent"] = cfg["agent"]
+    if conv_id:
+        query_params["conversationId"] = conv_id
+    qs = urllib.parse.urlencode(query_params)
+    headers = {"x-conversation-id": conv_id} if conv_id else None
+    res = _http_request_json(
+        f"{http_url}/internal/board/read?{qs}",
+        method="GET",
+        token=cfg.get("token") or "",
+        headers=headers,
+        timeout=timeout,
+        cfg=cfg,
+    )
+    if not res.get("ok"):
+        return {"ok": False, "status": int(res.get("status") or 0), "data": None}
+    data = res.get("data")
+    if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+        return {"ok": False, "status": int(res.get("status") or 0), "data": None}
+    return {"ok": True, "status": int(res.get("status") or 200), "data": data}
+
+
+def _fetch_http_status(cfg: dict[str, str], *, timeout: float = 2.5) -> dict[str, Any] | None:
+    """Lightweight roster/channel metadata read via GET /internal/board/read?status=true."""
+    http_url = cfg.get("http_url") or ""
+    swarm_id = cfg.get("swarm_id") or ""
+    conv_id = cfg.get("conversation_id") or ""
+    if not http_url or not (swarm_id or conv_id):
+        return None
+    query_params: dict[str, str] = {"status": "true"}
+    if swarm_id:
+        query_params["swarmId"] = swarm_id
+    if conv_id:
+        query_params["conversationId"] = conv_id
+    qs = urllib.parse.urlencode(query_params)
+    headers = {"x-conversation-id": conv_id} if conv_id else None
+    res = _http_request_json(
+        f"{http_url}/internal/board/read?{qs}",
+        method="GET",
+        token=cfg.get("token") or "",
+        headers=headers,
+        timeout=timeout,
+        cfg=cfg,
+    )
+    if not res.get("ok"):
+        return None
+    data = res.get("data")
+    return data if isinstance(data, dict) else None
+
+
 def _find_member_ci(members_map: dict[str, dict[str, Any]], name: str) -> tuple[str | None, dict[str, Any] | None]:
     clean = str(name or "").strip().lstrip("@")
     if not clean:
@@ -2169,9 +2238,75 @@ def swarm_wait(
 
     last_etag = ""
     last_http_head = 0
+    cached_members_map: dict[str, dict[str, Any]] = {}
+    cached_channels_map: dict[str, dict[str, Any]] = {}
+    status_fetched = False
+    last_meta_refresh_at = 0.0
+    use_snapshot_fallback = False
+
+    def _ensure_http_channel_metadata(msgs: list[dict[str, Any]]) -> None:
+        nonlocal cached_members_map, cached_channels_map, status_fetched, last_meta_refresh_at
+        now_mono = time.monotonic()
+        if status_fetched and (now_mono - last_meta_refresh_at) < CHANNEL_META_REFRESH_SECONDS:
+            return
+        needs_meta = (not mentions_only) or any(
+            m.get("channelMentions") or m.get("channel_mentions")
+            for m in msgs
+        )
+        if not needs_meta:
+            return
+        if bfile is not None and bfile.is_file():
+            board = _normalize_board(_read_json_safe(bfile, None), cfg["swarm_id"])
+            cached_members_map = _members_as_map(board.get("members"))
+            cached_channels_map = _channels_as_map(board.get("channels"))
+            status_fetched = True
+            last_meta_refresh_at = now_mono
+            return
+        st_data = _fetch_http_status(cfg, timeout=2.5)
+        if st_data is not None:
+            cached_members_map = _members_as_map(st_data.get("members"))
+            cached_channels_map = _channels_as_map(st_data.get("channels"))
+            status_fetched = True
+            last_meta_refresh_at = time.monotonic()
 
     def _check_http() -> tuple[int, list[dict[str, Any]]] | None:
-        nonlocal last_etag, last_http_head
+        nonlocal last_etag, last_http_head, cached_members_map, cached_channels_map, status_fetched, last_meta_refresh_at, use_snapshot_fallback
+        if not use_snapshot_fallback:
+            read_res = _fetch_http_read(cfg, since=since_int, limit=100, timeout=2.5)
+            if read_res["ok"]:
+                snap = read_res["data"]
+                last_http_head = int(snap.get("head") or 0)
+                if "members" in snap:
+                    cached_members_map = _members_as_map(snap.get("members"))
+                if "channels" in snap:
+                    cached_channels_map = _channels_as_map(snap.get("channels"))
+                if "members" in snap and "channels" in snap:
+                    status_fetched = True
+                    last_meta_refresh_at = time.monotonic()
+                msgs = [
+                    m for m in (snap.get("messages") or [])
+                    if isinstance(m, dict) and int(m.get("seq") or 0) > since_int
+                ]
+                if not msgs:
+                    return last_http_head, []
+                _ensure_http_channel_metadata(msgs)
+                msgs.sort(key=lambda m: int(m.get("seq") or 0))
+                matched = [
+                    m for m in msgs
+                    if _message_matches_target(
+                        m,
+                        target=target,
+                        members_map=cached_members_map,
+                        channels_map=cached_channels_map,
+                        mentions_only=bool(mentions_only),
+                    )
+                ]
+                return last_http_head, matched
+            if read_res["status"] in (401, 403, 404, 405) and cfg.get("conversation_id"):
+                use_snapshot_fallback = True
+            else:
+                return None
+
         snap = _fetch_http_snapshot(cfg, etag=last_etag, timeout=2.5)
         if snap is None:
             return None
@@ -2199,25 +2334,34 @@ def swarm_wait(
         ]
         return last_http_head, matched
 
-    if bfile is None and not (cfg["http_url"] and cfg["conversation_id"]):
+    has_http = bool(cfg["http_url"] and (cfg["conversation_id"] or cfg["swarm_id"]))
+    if bfile is None and not has_http:
         return {"ok": False, "error": "Neither board_dir nor HTTP /board is configured"}
 
+    is_coordinator = target.strip().lower() == "coordinator" or (cfg.get("role") or "").strip().lower() == "coordinator"
     wait_ref_key = (cfg["swarm_id"], target.lower())
+    wait_entered = False
+    wait_exited = False
 
     def _set_disk_wait(waiting: bool, *, last_read_seq: int | None = None) -> None:
-        with _WAIT_REF_LOCK:
-            cur_count = _WAIT_REFCOUNTS.get(wait_ref_key, 0)
-            if waiting:
-                _WAIT_REFCOUNTS[wait_ref_key] = cur_count + 1
-                should_write_wait = True
-            else:
-                new_count = max(0, cur_count - 1)
-                if new_count == 0:
-                    _WAIT_REFCOUNTS.pop(wait_ref_key, None)
+        should_write_wait = False
+        if is_coordinator:
+            with _WAIT_REF_LOCK:
+                cur_count = _WAIT_REFCOUNTS.get(wait_ref_key, 0)
+                if waiting:
+                    _WAIT_REFCOUNTS[wait_ref_key] = cur_count + 1
                     should_write_wait = True
-                else:
-                    _WAIT_REFCOUNTS[wait_ref_key] = new_count
-                    should_write_wait = False
+                elif wait_entered:
+                    new_count = max(0, cur_count - 1)
+                    if new_count == 0:
+                        _WAIT_REFCOUNTS.pop(wait_ref_key, None)
+                        should_write_wait = True
+                    else:
+                        _WAIT_REFCOUNTS[wait_ref_key] = new_count
+                        should_write_wait = False
+        elif waiting:
+            # Non-coordinator workers watch board.json directly; skip waitSince disk writes on entry.
+            return
 
         if paths is None:
             return
@@ -2232,24 +2376,56 @@ def swarm_wait(
                 b_members = board.setdefault("members", {})
                 mkey, mrec = _find_member_ci(b_members, target)
                 if mkey is not None and mrec is not None:
-                    if waiting:
-                        mrec["waitSince"] = str(since_int)
+                    changed = False
+                    is_killed = bool(mrec.get("killed")) or str(mrec.get("state") or "").strip().lower() == "killed"
+                    if is_killed:
+                        if mrec.get("waitSince") is not None:
+                            mrec["waitSince"] = None
+                            changed = True
+                        if mrec.get("waiting"):
+                            mrec["waiting"] = False
+                            changed = True
+                    elif waiting:
+                        desired_wait = str(since_int)
+                        if mrec.get("waitSince") != desired_wait:
+                            mrec["waitSince"] = desired_wait
+                            changed = True
+                        if mrec.get("state") != "waiting":
+                            mrec["state"] = "waiting"
+                            changed = True
+                        if mrec.get("waiting") is not True:
+                            mrec["waiting"] = True
+                            changed = True
                     elif should_write_wait:
-                        mrec["waitSince"] = None
+                        if mrec.get("waitSince") is not None:
+                            mrec["waitSince"] = None
+                            changed = True
+                        if "waiting" in mrec and mrec.get("waiting") is not False:
+                            mrec["waiting"] = False
+                            changed = True
+                        if mrec.get("state") == "waiting":
+                            mrec["state"] = "working"
+                            changed = True
                     if last_read_seq is not None and int(last_read_seq) > 0:
-                        mrec["lastReadSeq"] = max(int(mrec.get("lastReadSeq") or 0), int(last_read_seq))
-                    ts = _now_iso()
-                    mrec["lastHeartbeatAt"] = ts
-                    mrec["updatedAt"] = ts
-                    _atomic_write_json(bpath, board)
+                        new_lr = int(last_read_seq)
+                        cur_lr = int(mrec.get("lastReadSeq") or 0)
+                        if new_lr > cur_lr:
+                            mrec["lastReadSeq"] = new_lr
+                            changed = True
+                    if changed:
+                        ts = _now_iso()
+                        mrec["lastHeartbeatAt"] = ts
+                        mrec["updatedAt"] = ts
+                        _atomic_write_json(bpath, board)
         except Exception:
             pass
 
-    _set_disk_wait(True, last_read_seq=since_int if since_int > 0 else None)
-
     def _finish_wake(source_name: str, head_val: int, matched_msgs: list[dict[str, Any]]) -> dict[str, Any]:
+        nonlocal wait_exited
         max_matched = max((int(m.get("seq") or 0) for m in matched_msgs), default=since_int)
-        _set_disk_wait(False, last_read_seq=max_matched)
+        wait_exited = True
+        if wait_entered or max_matched > 0:
+            _set_disk_wait(False, last_read_seq=max_matched if max_matched > 0 else None)
         record_bridge_state(cfg, last_read_seq=max_matched)
         return {
             "ok": True,
@@ -2264,11 +2440,12 @@ def swarm_wait(
     try:
         last_sig: tuple[int, int] | None = None
         last_head = 0
-        has_http = bool(cfg["http_url"] and cfg["conversation_id"])
-        http_backoff = 0.4
+        has_local_board = bool(bfile is not None and bfile.is_file())
+        http_poll_interval = 1.5 if has_local_board else 0.4
+        http_backoff = http_poll_interval
         next_http_poll_at = 0.0
 
-        if bfile is not None and bfile.is_file():
+        if has_local_board and bfile is not None:
             try:
                 st = bfile.stat()
                 last_sig = (st.st_mtime_ns, st.st_size)
@@ -2282,13 +2459,24 @@ def swarm_wait(
         if has_http:
             http_res = _check_http()
             if http_res is not None:
-                http_backoff = 0.4
+                http_backoff = http_poll_interval
                 last_head, matched = http_res
                 if matched:
                     return _finish_wake("http", last_head, matched)
+                next_http_poll_at = time.monotonic() + http_poll_interval
             else:
                 http_backoff = min(5.0, http_backoff * 2.0)
                 next_http_poll_at = time.monotonic() + random.uniform(0.1, http_backoff)
+
+        if is_coordinator:
+            _set_disk_wait(True, last_read_seq=since_int if since_int > 0 else None)
+            wait_entered = True
+            if bfile is not None and bfile.is_file():
+                try:
+                    st = bfile.stat()
+                    last_sig = (st.st_mtime_ns, st.st_size)
+                except OSError:
+                    pass
 
         while True:
             remaining = deadline - time.monotonic()
@@ -2306,7 +2494,7 @@ def swarm_wait(
                     "messages": [],
                 }
 
-            poll_interval = 0.15 if (bfile is not None) else 0.4
+            poll_interval = 0.15 if (bfile is not None) else http_poll_interval
             stop_event.wait(timeout=min(poll_interval, remaining))
 
             if bfile is not None:
@@ -2327,8 +2515,8 @@ def swarm_wait(
             if has_http and time.monotonic() >= next_http_poll_at:
                 http_res = _check_http()
                 if http_res is not None:
-                    http_backoff = 0.4
-                    next_http_poll_at = 0.0
+                    http_backoff = http_poll_interval
+                    next_http_poll_at = time.monotonic() + http_poll_interval
                     last_head, matched = http_res
                     if matched:
                         return _finish_wake("http", last_head, matched)
@@ -2336,7 +2524,8 @@ def swarm_wait(
                     http_backoff = min(5.0, http_backoff * 2.0)
                     next_http_poll_at = time.monotonic() + random.uniform(0.1, http_backoff)
     finally:
-        _set_disk_wait(False)
+        if wait_entered and not wait_exited:
+            _set_disk_wait(False)
 
 
 def swarm_channel(

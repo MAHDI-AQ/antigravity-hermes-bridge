@@ -90,16 +90,25 @@
     }
     if (document.documentElement.dataset.theme !== theme) document.documentElement.dataset.theme = theme;
   }
+  let applyingTheme = false;
+  let themeObserver = null;
   function applyTheme(vars) {
-    if (vars && typeof vars === 'object') {
-      for (const [k, v] of Object.entries(vars)) {
-        if (typeof k === 'string' && k.startsWith('--') && typeof v === 'string') {
-          document.documentElement.style.setProperty(k, v);
+    if (applyingTheme) return;
+    applyingTheme = true;
+    try {
+      if (vars && typeof vars === 'object') {
+        for (const [k, v] of Object.entries(vars)) {
+          if (typeof k === 'string' && k.startsWith('--') && typeof v === 'string') {
+            document.documentElement.style.setProperty(k, v);
+          }
         }
       }
+      syncScheme();
+      if (typeof postTheme === 'function') postTheme();
+      themeObserver?.takeRecords();
+    } finally {
+      applyingTheme = false;
     }
-    syncScheme();
-    if (typeof postTheme === 'function') postTheme();
   }
   syncScheme();
   if (lightMq) {
@@ -107,9 +116,11 @@
     if (typeof lightMq.addEventListener === 'function') lightMq.addEventListener('change', onMq);
     else if (typeof lightMq.addListener === 'function') lightMq.addListener(onMq);
   }
-  new MutationObserver(() => {
+  themeObserver = new MutationObserver(() => {
+    if (applyingTheme) return;
     applyTheme();
-  }).observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
+  });
+  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['style'] });
   window.addEventListener('message', (event) => {
     if (event.source !== window && event.source !== window.parent) return;
     if (event.data?.type === 'theme-change') {
@@ -247,9 +258,22 @@
 
   function recipientsHtml(m) {
     const sender = senderOf(m);
-    const names = collapseRecipientGroups((m.mentions || []).filter((n) => n !== sender));
-    const parts = names.map((n) => `<span>@${esc(n)}</span>`);
-    for (const c of channelMentionsOf(m)) parts.push(`<span>@#${esc(normChan(c))}</span>`);
+    const roster = members();
+    const names = collapseRecipientGroups((m.mentions || []).filter((n) => n !== sender), roster);
+    const parts = names.map((n) => {
+      const hit = roster.find((mem) => mem.name === n)
+        || roster.find((mem) => {
+          const match = mem.name.match(/^(.+)-\d+$/);
+          return Boolean(match && match[1] === n);
+        });
+      return hit
+        ? `<button type="button" class="msg-mention-btn" data-feed-member="${esc(hit.name)}" title="Open @${esc(hit.name)}">@${esc(n)}</button>`
+        : `<span>@${esc(n)}</span>`;
+    });
+    for (const c of channelMentionsOf(m)) {
+      const ch = normChan(c);
+      parts.push(`<button type="button" class="msg-mention-btn channel" data-channel="${esc(ch)}" title="Show only #${esc(ch)}">@#${esc(ch)}</button>`);
+    }
     if (m.all) parts.push('<span>@all</span>');
     return parts.length ? `<span class="msg-to">${ICON.arrow}${parts.join('')}</span>` : '';
   }
@@ -278,7 +302,7 @@
       const c = swarmChannels().find((x) => normChan(x.name) === name.toLowerCase());
       if (!c) return all;
       const tip = c.archived ? `#${normChan(c.name)} is archived: this addresses nobody` : `Everyone in #${normChan(c.name)}`;
-      return `${pre}<span class="mention channel${c.archived ? ' archived' : ''}" title="${esc(tip)}">@#${name}</span>`;
+      return `${pre}<button type="button" class="mention mention-btn channel${c.archived ? ' archived' : ''}" data-channel="${esc(normChan(c.name))}" title="${esc(tip)}">@#${name}</button>`;
     }));
   }
   function highlightMentions(html) {
@@ -288,7 +312,7 @@
       if (lower === 'all') return `${pre}<span class="mention all">@${name}</span>`;
       const m = memberByLower(lower);
       if (m) {
-        return `${pre}<span class="mention" title="${esc(m.name)} · ${esc(statusLabel(m.status))}">@${name}</span>`;
+        return `${pre}<button type="button" class="mention mention-btn" data-feed-member="${esc(m.name)}" title="${esc(m.name)} · ${esc(statusLabel(m.status))}">@${name}</button>`;
       }
       const group = members().filter((mem) => {
         const match = mem.name.toLowerCase().match(/^(.+)-\d+$/);
@@ -296,7 +320,7 @@
       });
       if (group.length) {
         const tip = group.map((mem) => mem.name).join(', ');
-        return `${pre}<span class="mention" title="${esc(tip)}">@${name}</span>`;
+        return `${pre}<button type="button" class="mention mention-btn" data-feed-member="${esc(group[0].name)}" title="${esc(tip)}">@${name}</button>`;
       }
       return all;
     }));
@@ -530,6 +554,25 @@
       state.pollGen++;
       state.pollAbort?.abort();
     }
+    stopAgentPoll();
+    state.openAgentTabs = [];
+    state.agentTabData = {};
+    state.agentDetailsOpen.clear();
+    renderAgentTabs();
+    if ($('agent-header')) $('agent-header').innerHTML = '';
+    if ($('agent-committed')) $('agent-committed').innerHTML = '';
+    if ($('agent-live-tail')) {
+      $('agent-live-tail').innerHTML = '';
+      $('agent-live-tail').classList.add('hidden');
+    }
+    if ($('agent-live-foot')) {
+      $('agent-live-foot').innerHTML = '';
+      $('agent-live-foot').classList.add('hidden');
+    }
+    $('agent-pane')?.classList.remove('has-live-foot');
+    if (typeof state.tab === 'string' && state.tab.startsWith('agent:')) {
+      selectTab('feed');
+    }
     state.swarm = id;
     state.etag = '';
     state.snap = null;
@@ -545,6 +588,8 @@
     state.stick = true;
     $('f-agent').value = '';
     $('f-mention').value = '';
+    if ($('f-kind')) $('f-kind').value = '';
+    $('f-search').value = '';
     replayStop();
     closeGifModal();
     frameTeardown();
@@ -740,10 +785,7 @@
       member: (name, subSessionId = '') => {
         const target = name === 'coordinator' ? (window.SwarmHive?.leadName || 'coordinator') : name;
         const m = (state.snap?.members || []).find((x) => x.name === target);
-        const cid = convIdOf(m) || (target === 'coordinator' ? coordinatorConv() : '');
-        if (target === 'coordinator' && cid && canOpenConversation()) {
-          openConversation(cid);
-        } else if (m || target) {
+        if (m || target) {
           openAgentTab(m ? m.name : target, subSessionId);
         }
       },
@@ -860,9 +902,12 @@
 
   function renderFilters() {
     const names = members().map((m) => m.name);
-    const posters = [...new Set([...names, ...(state.snap.messages || []).map((m) => senderOf(m)).filter(Boolean)])];
+    const msgs = state.snap.messages || [];
+    const posters = [...new Set([...names, ...msgs.map((m) => senderOf(m)).filter(Boolean)])];
+    const kinds = [...new Set(['post', 'decision', 'handoff', 'escalation', 'blocker', ...msgs.filter((m) => !isControl(m)).map((m) => msgTypeOf(m)).filter(Boolean)])];
     const fill = (id, first, opts) => {
       const sel = $(id);
+      if (!sel) return;
       const prev = sel.value;
       const html = `<option value="">${first}</option>` + opts.map(([v, l]) => `<option value="${esc(v)}">${esc(l)}</option>`).join('');
       if (filterMarkup.get(id) !== html) {
@@ -876,6 +921,7 @@
     };
     fill('f-agent', 'From anyone', posters.map((n) => [n, `From ${n}`]));
     fill('f-mention', 'To anyone', [['@none', 'To no one'], ['@all', 'To @all'], ...names.map((n) => [n, `To ${n}`])]);
+    fill('f-kind', 'All kinds', kinds.map((k) => [k, `Kind: ${k}`]));
   }
 
   // ---------- channels ----------
@@ -956,11 +1002,11 @@
   }
 
   function filtersActive() {
-    return !!($('f-agent').value || $('f-mention').value || $('f-search').value.trim() || state.hiddenAgents.size || state.channel);
+    return !!($('f-agent').value || $('f-mention').value || $('f-kind')?.value || $('f-search').value.trim() || state.hiddenAgents.size || state.channel);
   }
 
   function updateFilterToggle() {
-    const hidden = !!($('f-agent').value || $('f-mention').value || state.hiddenAgents.size);
+    const hidden = !!($('f-agent').value || $('f-mention').value || $('f-kind')?.value || state.hiddenAgents.size || state.channel);
     const t = $('f-toggle');
     t.classList.toggle('active', hidden);
     t.title = hidden ? 'Filters (active)' : 'Filters';
@@ -974,6 +1020,7 @@
     const s = state.snap;
     const from = $('f-agent').value;
     const to = $('f-mention').value;
+    const kindFilter = $('f-kind')?.value || '';
     const q = $('f-search').value.trim().toLowerCase();
     const ch = state.channel;
     return (s.messages || []).filter((m) => {
@@ -982,10 +1029,25 @@
       const sender = senderOf(m);
       if (state.hiddenAgents.has(sender)) return false;
       if (from && sender !== from) return false;
+      if (kindFilter && (isControl(m) ? 'control' : msgTypeOf(m)) !== kindFilter) return false;
       if (to === '@none' && ((m.mentions || []).length || m.all || channelMentionsOf(m).length)) return false;
       if (to === '@all' && !m.all) return false;
       if (to && to[0] !== '@' && !(m.all || (m.mentions || []).includes(to) || viaChannelOf(m).includes(to))) return false;
-      if (q && !`#${m.seq}\n${sender}\n${textOf(m)}`.toLowerCase().includes(q)) return false;
+      if (q) {
+        const hay = [
+          `#${m.seq}`,
+          sender,
+          msgTypeOf(m),
+          mChan,
+          ...(m.mentions || []),
+          ...viaChannelOf(m),
+          ...channelMentionsOf(m).map((c) => `#${normChan(c)}`),
+          ...(Array.isArray(m.files) ? m.files : []),
+          m.summary || '',
+          textOf(m),
+        ].join('\n').toLowerCase();
+        if (!hay.includes(q)) return false;
+      }
       return true;
     });
   }
@@ -1020,7 +1082,7 @@
 
   function stripLeadingMentions(text) {
     const t = String(text || '');
-    const rest = t.replace(/^(\s*@[A-Za-z0-9_.-]+[,:]?)+\s*/, '');
+    const rest = t.replace(/^(\s*@#?[\p{L}\p{N}_.-]+[,:]?)+\s*/u, '');
     return rest || t;
   }
 
@@ -1047,9 +1109,12 @@
       : (typeof replyTo === 'string' && replyTo.trim() && !/^#?\d+$/.test(replyTo.trim())
         ? '<span class="msg-note">↩ reply</span>'
         : '');
+    const authorHtml = onRoster
+      ? `<button type="button" class="msg-author msg-author-btn" data-feed-member="${esc(sender)}" title="Open @${esc(sender)}">@${esc(sender)}</button>`
+      : `<span class="msg-author" title="Not on the roster">@${esc(sender)}</span>`;
     const head = `<header class="msg-head">
             <span class="msg-who">
-              <span class="msg-author" ${onRoster ? '' : 'title="Not on the roster"'}>@${esc(sender)}</span>
+              ${authorHtml}
               ${channelChipHtml(m)}
               ${kindPill}
               ${recipientsHtml(m)}
@@ -1202,7 +1267,10 @@
   }
 
   // ---------- graph + replay ----------
-  const graphMsgs = () => (state.snap?.messages || []).filter((m) => !isControl(m));
+  const graphMsgs = () => {
+    const roster = state.snap?.members || [];
+    return (state.snap?.messages || []).filter((m) => !isControl(m) && !isRoleWorker(senderOf(m), roster));
+  };
   const replay = { idx: null, playing: false, timer: null, animatedSeq: null };
 
   function edgeGeom(a, b) {
@@ -1407,10 +1475,10 @@
       const bw = 30 + 6 * String(bcast).length;
       const cid = convIdOf(n.m);
       const tip = n.m
-        ? `${n.id} · ${n.m.role}${n.m.model ? ' · ' + n.m.model : ''} · ${statusLabel(status)} · ${n.m.steps || 0} steps${n.m.toolCalls ? ` · ${n.m.toolCalls} tools` : ''}${n.m.tokens?.total ? ` · ${fmtTokCompact(n.m.tokens.total)} tok` : ''}${n.m.tps ? ` · ${fmtTpsCompact(n.m.tps)}` : ''} · ${n.m.posts || 0} posts · ${n.m.unread || 0} unread${ring ? ` · ${ring} unaddressed` : ''}${broadcasts.get(n.id) ? ` · ${broadcasts.get(n.id)} @all` : ''}${n.m.activity && status === 'working' ? `\n${n.m.activity}` : ''}${n.m.host ? `\non ${n.m.host.label}` : ''}${cid && n.m.local !== false && canOpenConversation() ? '\nClick to open conversation' : ''}`
+        ? `${n.id} · ${n.m.role}${n.m.model ? ' · ' + n.m.model : ''} · ${statusLabel(status)} · ${n.m.steps || 0} steps${n.m.toolCalls ? ` · ${n.m.toolCalls} tools` : ''}${n.m.tokens?.total ? ` · ${fmtTokCompact(n.m.tokens.total)} tok` : ''}${n.m.tps ? ` · ${fmtTpsCompact(n.m.tps)}` : ''} · ${n.m.posts || 0} posts · ${n.m.unread || 0} unread${ring ? ` · ${ring} unaddressed` : ''}${broadcasts.get(n.id) ? ` · ${broadcasts.get(n.id)} @all` : ''}${n.m.activity && status === 'working' ? `\n${n.m.activity}` : ''}${n.m.host ? `\non ${n.m.host.label}` : ''}\nClick to open agent tab`
         : `${n.id} (not on the roster)`;
       const cls = ['node', isActive(n.id) ? '' : 'inactive', hot ? 'hot' : '', status === 'killed' ? 'killed' : '', n.m ? '' : 'outsider'].filter(Boolean).join(' ');
-      nodesSvg += `<g class="${cls}" data-conv="${esc(cid)}">` +
+      nodesSvg += `<g class="${cls}" data-member="${esc(n.id)}" data-conv="${esc(cid)}">` +
         `<title>${esc(tip)}</title>` +
         (ring ? `<rect class="ring" x="${p.x - p.w / 2 - 4}" y="${p.y - p.h / 2 - 4}" width="${p.w + 8}" height="${p.h + 8}" rx="${p.h / 2 + 4}"/>` : '') +
         `<rect class="node-box" x="${p.x - p.w / 2}" y="${p.y - p.h / 2}" width="${p.w}" height="${p.h}" rx="${p.h / 2}"/>` +
@@ -2302,12 +2370,15 @@
     }
     const file = { board: 'board.json', meta: 'meta.json', members: 'members.json', view: 'view.json', archive: 'board_archive.jsonl' }[state.rawKind] || '';
     const lines = text ? text.split('\n').filter(Boolean).length : 0;
-    const dir = state.rawKind === 'view' ? s.view?.dir || s.dir : (s.dir || s.meta?.workspace || '');
-    const path = dir ? `${dir}/${file}` : file;
+    const rawDir = String(state.rawKind === 'view' ? s.view?.dir || s.dir : (s.dir || s.meta?.workspace || '')).replace(/[\\/]+$/, '');
+    const sep = rawDir.includes('\\') && !rawDir.includes('/') ? '\\' : '/';
+    const path = rawDir ? `${rawDir}${sep}${file}` : file;
     $('raw-meta').innerHTML = `<span class="path" title="${esc(path)}"><span dir="ltr">${esc(path)}</span></span>` +
         `<span class="size">· ${esc(fmtBytes(text.length))}${lines ? ` · ${plural(lines, 'line')}` : ''}</span>`;
+    state.rawIsEmpty = !text;
     const shown = text || '(empty)';
     if ($('raw').textContent !== shown) $('raw').textContent = shown;
+    if ($('raw-copy')) $('raw-copy').disabled = state.rawIsEmpty;
     document.querySelectorAll('.raw-btn').forEach((b) => {
       const on = b.dataset.raw === state.rawKind;
       b.classList.toggle('on', on);
@@ -2564,6 +2635,12 @@
   const overviewOn = () => builtinOn() || viewExists();
   const graphOn = () => state.snap?.graphTab !== false;
   const rawOn = () => state.snap?.rawTab !== false;
+  const isValidConvId = (id) => typeof id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{2,127}$/.test(id.trim());
+  const primaryConv = () => {
+    const s = state.snap;
+    const cid = String(s?.primaryConversationId || s?.meta?.primaryConversationId || '').trim();
+    return isValidConvId(cid) ? cid : '';
+  };
   const coordinatorConv = () => {
     const s = state.snap;
     const m = (s?.members || []).find((x) => x.role === 'coordinator');
@@ -2650,14 +2727,17 @@
     $('ov-status').classList.toggle('hidden', !status);
 
     const sys = s.systemAttention || [];
-    const canOpen = canOpenConversation();
     const sysHtml = sys.map((it) => {
       const since = it.kind === 'stuck' && it.since ? ` for ${fmtDur(Date.now() - it.since)}` : '';
+      const memName = it.member && memberOf(it.member) ? it.member : '';
       const cid = it.conversationId || it.conversation_id || '';
+      const openBtn = memName
+        ? `<button type="button" class="ghost-btn sm" data-open-member="${esc(memName)}">Open</button>`
+        : (canOpenConversation() && cid ? `<button type="button" class="ghost-btn sm" data-open="${esc(cid)}">Open</button>` : '');
       return `<div class="ov-sys ${esc(it.kind)}" role="listitem" data-testid="swarm-overview-system-item" title="${esc(it.detail || '')}">` +
           `<span class="ov-sys-icon" aria-hidden="true">⚠</span>` +
           `<span class="ov-sys-text"><b>system:</b> ${esc(it.text)}${esc(since)}</span>` +
-          (canOpen && cid ? `<button type="button" class="ghost-btn sm" data-open="${esc(cid)}">Open</button>` : '') +
+          openBtn +
           `</div>`;
     }).join('');
     if ($('ov-system').innerHTML !== sysHtml) $('ov-system').innerHTML = sysHtml;
@@ -2670,8 +2750,9 @@
     if ($('ov-notice').innerHTML !== noticeText) $('ov-notice').innerHTML = noticeText;
     $('ov-notice').classList.toggle('hidden', !noticeText);
 
-    $('ov-footer').classList.toggle('hidden', !n && !ov.model);
-    $('ov-open-coord').classList.toggle('hidden', !canOpen || !coordinatorConv());
+    const hasCoord = !!(s.members || []).find((m) => m.role === 'coordinator' || m.name === 'coordinator');
+    $('ov-footer').classList.toggle('hidden', !n && !ov.model && !hasCoord);
+    $('ov-open-coord').classList.toggle('hidden', !hasCoord && !coordinatorConv());
     const ack = v?.feedback_ack;
     const ackHtml = ack ? `Last change: “${esc(ack.text)}”${ack.through_seq ? ` <button type="button" class="ref" data-ov-seq="${ack.through_seq}">#${ack.through_seq}</button>` : ''}` : '';
     if ($('ov-ack').innerHTML !== ackHtml) $('ov-ack').innerHTML = ackHtml;
@@ -2741,9 +2822,15 @@
     }
     if (a.type === 'open_conv') {
       const m = memberOf(a.target);
-      const cid = convIdOf(m);
-      if (m.local === false || canOpenConversation()) openConversation(cid);
-      else toast(`Opening ${a.target}'s conversation needs the app.`);
+      if (m && m.local === false) {
+        const cid = convIdOf(m);
+        if (cid) openConversation(cid);
+        else toast(`${m.name} runs on ${m.host?.label || 'another machine'}; open it there.`);
+      } else if (m) {
+        openAgentTab(m.name);
+      } else {
+        toast(`Opening ${a.target}'s conversation needs the app.`);
+      }
     } else if (a.type === 'board_post') {
       goToPost(a.target);
     } else if (a.type === 'url') {
@@ -2758,9 +2845,11 @@
   function clearFilters() {
     $('f-agent').value = '';
     $('f-mention').value = '';
+    if ($('f-kind')) $('f-kind').value = '';
     $('f-search').value = '';
     $('f-agent').classList.remove('set');
     $('f-mention').classList.remove('set');
+    $('f-kind')?.classList.remove('set');
     state.hiddenAgents.clear();
     state.channel = '';
     renderAgents();
@@ -2802,13 +2891,14 @@
     if (typeof id !== 'string' || !ITEM_ID_RE.test(id) || !ov.model?.ids.has(id)) return;
     const text = `user feedback on card ${id}: `;
     const copied = await copyText(text);
-    const conv = coordinatorConv();
-    const remote = members().find((m) => convIdOf(m) === conv && m.local === false);
-    if (remote) {
-      toast(`${copied ? `Copied “${text.trim()}”. Paste it` : `Tell it “${text.trim()} …”`} to the coordinator on ${remote.host?.label || 'its machine'}.`);
+    const prim = primaryConv();
+    const coord = memberOf(window.SwarmHive?.leadName || 'coordinator');
+    if (coord && coord.local === false) {
+      toast(`${copied ? `Copied “${text.trim()}”. Paste it` : `Tell it “${text.trim()} …”`} to the coordinator on ${coord.host?.label || 'its machine'}.`);
       return;
     }
-    if (canOpenConversation() && conv) openConversation(conv);
+    if (canOpenConversation() && prim) openConversation(prim);
+    else openAgentTab(window.SwarmHive?.leadName || 'coordinator');
     toast(copied ? `Copied “${text.trim()}”. Paste it to the coordinator and say what you want changed.` :
       `Tell the coordinator: “${text.trim()} …”`);
   }
@@ -3093,6 +3183,7 @@
         reqGen: 0,
         lastCommittedSig: '',
         lastLiveSig: '',
+        seenDKeys: new Set(),
         prevTab: state.tab && !state.tab.startsWith('agent:') ? state.tab : 'members',
       };
     }
@@ -3272,6 +3363,7 @@
         currentTool: res.currentTool ?? null,
         state: normalizeAgentStatus(res.state || '', !!m?.killed),
         model: res.model || '',
+        workspace: res.workspace || res.worktreePath || res.workdir || '',
       };
       const nextLive = (!m?.killed && !reqSub && res.live && typeof res.live === 'object') ? res.live : null;
       const prevLiveSig = JSON.stringify(data.live || null);
@@ -3309,6 +3401,7 @@
         data.live = null;
         data.lastCommittedSig = '';
         data.lastLiveSig = '';
+        data.seenDKeys?.clear();
         data.stick = true;
         data.hasNewWhileScrolled = false;
       }
@@ -3316,6 +3409,7 @@
     if (!state.openAgentTabs.includes(name)) state.openAgentTabs.push(name);
     renderAgentTabs();
     selectTab(`agent:${name}`, false, true);
+    document.querySelector(`.tabs .tab-agent[data-agent-tab="${CSS.escape(name)}"]`)?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
   function closeAgentTab(name) {
@@ -3436,17 +3530,43 @@
     return TOOL_HUMAN_LABELS[key] || '';
   }
 
-  function unwrapUserPrompt(rawContent) {
-    const text = String(rawContent || '').replace(/\r\n?/g, '\n');
-    const sysTask = text.match(/^\s*\[SYSTEM\s*\/\s*ROLE\]\s*\n([\s\S]*?)\n+\[TASK\]\s*\n([\s\S]*)$/i);
-    if (sysTask) {
-      const systemBrief = sysTask[1].trim();
-      const taskText = sysTask[2].trim();
-      return { systemBrief, taskText: taskText || text.trim() };
+  function contentToText(rawContent) {
+    if (rawContent == null) return '';
+    if (typeof rawContent === 'string') return rawContent;
+    if (Array.isArray(rawContent)) {
+      return rawContent.map((p) => {
+        if (typeof p === 'string') return p;
+        if (p && typeof p === 'object') return String(p.text ?? p.content ?? '');
+        return '';
+      }).filter(Boolean).join('\n');
     }
-    const taskOnly = text.match(/^\s*\[TASK\]\s*\n([\s\S]*)$/i);
+    if (typeof rawContent === 'object') {
+      return String(rawContent.text ?? rawContent.content ?? '');
+    }
+    return String(rawContent);
+  }
+
+  function unwrapUserPrompt(rawContent) {
+    const text = contentToText(rawContent).replace(/\r\n?/g, '\n');
+    const sysStart = text.match(/^\s*\[SYSTEM\s*\/\s*ROLE\]\s*\n([\s\S]*)$/i);
+    if (sysStart) {
+      const rest = sysStart[1];
+      const splitLast = rest.match(/^([\s\S]*)\n+\[TASK\]\s*(?:\n([\s\S]*))?$/i);
+      if (splitLast) {
+        const systemBrief = splitLast[1].trim();
+        const taskText = String(splitLast[2] || '').trim();
+        return { systemBrief, taskText: taskText || '(See System / Role brief)' };
+      }
+      const leadTask = rest.match(/^\[TASK\]\s*(?:\n([\s\S]*))?$/i);
+      if (leadTask) {
+        const taskText = String(leadTask[1] || '').trim();
+        return { systemBrief: '', taskText: taskText || '(No task text)' };
+      }
+    }
+    const taskOnly = text.match(/^\s*\[TASK\]\s*(?:\n([\s\S]*))?$/i);
     if (taskOnly) {
-      return { systemBrief: '', taskText: taskOnly[1].trim() || text.trim() };
+      const taskText = String(taskOnly[1] || '').trim();
+      return { systemBrief: '', taskText: taskText || '(No task text)' };
     }
     return { systemBrief: '', taskText: text };
   }
@@ -3524,7 +3644,68 @@
   const FILE_MUTATE_RE = /^(?:edit_file|write_file|write_to_file|create_file|patch|patch_file|apply_patch|str_replace_editor|replace_file_content|multi_replace_file_content|delete_file)$/i;
   function countLines(strVal) {
     if (typeof strVal !== 'string' || !strVal.length) return 0;
-    return strVal.replace(/\r\n?/g, '\n').split('\n').length;
+    const norm = strVal.replace(/\r\n?/g, '\n');
+    const lines = norm.split('\n');
+    return norm.endsWith('\n') ? Math.max(1, lines.length - 1) : lines.length;
+  }
+  const normSlashPath = (p) => String(p || '').trim().replace(/\\/g, '/').replace(/\/{2,}/g, '/').replace(/\/+$/, '');
+  const cmpPathKey = (p) => normSlashPath(p).replace(/^[A-Z]:/, (d) => d.toLowerCase());
+  function workspaceRootsFor(name, data) {
+    const m = memberOf(name);
+    const primary = [
+      m?.worktreePath,
+      m?.workspace,
+      m?.workdir,
+      data?.telemetry?.workspace,
+      state.snap?.workspace,
+      state.snap?.meta?.workspace,
+    ].map((r) => normSlashPath(r)).filter(Boolean);
+    const list = primary.length
+      ? primary
+      : [state.snap?.dir, state.snap?.view?.dir].map((r) => normSlashPath(r)).filter(Boolean);
+    const seen = new Set();
+    const out = [];
+    for (const r of list) {
+      const cmp = cmpPathKey(r).toLowerCase();
+      if (!seen.has(cmp)) {
+        seen.add(cmp);
+        out.push({ raw: r, cmp, isWin: /^[a-z]:\//i.test(r) });
+      }
+    }
+    return out;
+  }
+  function normalizeFileForTurn(rawPath, roots) {
+    if (!rawPath || typeof rawPath !== 'string') return null;
+    if (rawPath.includes('\0') || rawPath.includes('%') || rawPath.startsWith('\\\\')) return null;
+    const norm = normSlashPath(rawPath);
+    if (!norm) return null;
+    const segs = norm.split('/').filter(Boolean);
+    if (!segs.length || segs.includes('..')) return null;
+    const isAbs = /^(?:\/|[a-zA-Z]:\/)/.test(norm);
+    const normCmp = cmpPathKey(norm);
+    const normCmpLower = normCmp.toLowerCase();
+    const isScratch = /(?:^|\/)(?:appdata\/local\/)?\.?hermes\/(?:cache|scratch)(?:\/|$)/i.test(normCmpLower);
+    if (isScratch && !roots.some((r) => normCmpLower === r.cmp || normCmpLower.startsWith(`${r.cmp}/`))) {
+      return null;
+    }
+    if (isAbs) {
+      for (const r of roots) {
+        const hit = r.isWin
+          ? (normCmpLower === r.cmp || normCmpLower.startsWith(`${r.cmp}/`))
+          : (normCmp === r.raw || normCmp.startsWith(`${r.raw}/`));
+        if (hit) {
+          const rel = norm.slice(r.raw.length).replace(/^\/+/, '');
+          if (!rel) return null;
+          return { key: r.isWin ? rel.toLowerCase() : rel, path: rel };
+        }
+      }
+      if (roots.length > 0) return null;
+      return { key: normCmpLower, path: norm };
+    }
+    const rel = norm.replace(/^\.\//, '');
+    if (!rel) return null;
+    const winWorkspace = roots.some((r) => r.isWin) || rawPath.includes('\\');
+    return { key: winWorkspace ? rel.toLowerCase() : rel, path: rel };
   }
   function extractToolFileChange(tcName, tcArgs, resMsg) {
     if (!FILE_MUTATE_RE.test(String(tcName || '').trim())) return null;
@@ -3602,39 +3783,58 @@
     </details>`;
   }
 
-  function groupAgentTimeline(messages, { name, st }) {
+  function groupAgentTimeline(messages, { name, st, data = null }) {
     const toolResultsById = new Map();
-    for (const msg of messages) {
-      if (msg && msg.role === 'tool' && msg.toolCallId) {
+    let lastUserIdx = -1;
+    for (let idx = 0; idx < messages.length; idx++) {
+      const msg = messages[idx];
+      if (!msg) continue;
+      if (msg.role === 'user') lastUserIdx = idx;
+      if (msg.role === 'tool' && msg.toolCallId) {
         toolResultsById.set(msg.toolCallId, msg);
       }
     }
+    const subKey = data?.selectedSubagent || 'main';
+    const liveWgKey = `live-wg:${name}:${subKey}`;
+    const liveThinkKey = `live-think:${name}:${subKey}`;
+    const wsRoots = workspaceRootsFor(name, data);
     const pairedToolIds = new Set();
     const committedToolCallIds = new Set();
     const timeline = [];
     let curWork = null;
     let turnFiles = new Map();
     let turnKey = '0';
+    let prevEndMs = NaN;
 
     const recordFileChange = (fc) => {
       if (!fc) return;
-      const prev = turnFiles.get(fc.path) || { path: fc.path, added: 0, deleted: 0 };
+      const scoped = normalizeFileForTurn(fc.path, wsRoots);
+      if (!scoped) return;
+      const prev = turnFiles.get(scoped.key) || { path: scoped.path, added: 0, deleted: 0 };
       prev.added += fc.added;
       prev.deleted += fc.deleted;
-      turnFiles.set(fc.path, prev);
+      turnFiles.set(scoped.key, prev);
     };
 
     const flushWork = () => {
       if (!curWork) return;
       const dKey = `wg:${name}:${curWork.firstId}`;
+      if (curWork.inCurrentTurn && data?.seenDKeys && !data.seenDKeys.has(dKey)) {
+        if (state.agentDetailsOpen.has(liveWgKey)) state.agentDetailsOpen.add(dKey);
+        data.seenDKeys.add(dKey);
+      }
       const isOpen = state.agentDetailsOpen.has(dKey);
-      const label = formatWorkedLabel(curWork.minMs, curWork.maxMs);
+      const startMs = (curWork.tools === 0 && Number.isFinite(curWork.minMs) && Number.isFinite(curWork.maxMs)
+        && curWork.minMs === curWork.maxMs && Number.isFinite(curWork.prevEndMs) && curWork.prevEndMs < curWork.maxMs)
+        ? curWork.prevEndMs
+        : curWork.minMs;
+      const label = formatWorkedLabel(startMs, curWork.maxMs);
       const tip = `${plural(curWork.steps, 'step')}${curWork.tools ? ` · ${plural(curWork.tools, 'tool call')}` : ''}`;
       const html = `<details class="ag-work-group" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
         <summary title="${esc(tip)}"><span>${esc(label)}</span><span class="ag-work-chev" aria-hidden="true"></span></summary>
         <div class="ag-work-rail">${curWork.parts.join('')}</div>
       </details>`;
-      const sig = `${curWork.parts.length}|${curWork.minMs}|${curWork.maxMs}|${curWork.parts.join('\0').length}|${curWork.lastSig}`;
+      const sig = `${curWork.parts.length}|${startMs}|${curWork.maxMs}|${curWork.parts.join('\0').length}|${curWork.lastSig}`;
       timeline.push({ key: `wg:${curWork.firstId}`, sig, html });
       curWork = null;
     };
@@ -3672,18 +3872,23 @@
       turnFiles = new Map();
     };
 
-    const ensureWork = (id, tsMs) => {
+    const ensureWork = (id, tsMs, inCurrentTurn) => {
       if (!curWork) {
-        curWork = { firstId: id, minMs: tsMs, maxMs: tsMs, steps: 0, tools: 0, parts: [], lastSig: '' };
-      } else if (Number.isFinite(tsMs)) {
-        curWork.minMs = Number.isFinite(curWork.minMs) ? Math.min(curWork.minMs, tsMs) : tsMs;
-        curWork.maxMs = Number.isFinite(curWork.maxMs) ? Math.max(curWork.maxMs, tsMs) : tsMs;
+        curWork = { firstId: id, minMs: tsMs, maxMs: tsMs, prevEndMs, inCurrentTurn, steps: 0, tools: 0, parts: [], lastSig: '' };
+      } else {
+        if (inCurrentTurn) curWork.inCurrentTurn = true;
+        if (Number.isFinite(tsMs)) {
+          curWork.minMs = Number.isFinite(curWork.minMs) ? Math.min(curWork.minMs, tsMs) : tsMs;
+          curWork.maxMs = Number.isFinite(curWork.maxMs) ? Math.max(curWork.maxMs, tsMs) : tsMs;
+        }
       }
       return curWork;
     };
 
-    for (const msg of messages) {
+    for (let idx = 0; idx < messages.length; idx++) {
+      const msg = messages[idx];
       if (!msg) continue;
+      const inCurrentTurn = idx > lastUserIdx;
       if (msg.compacted) {
         flushWork();
         const cmpHtml = '<div class="ag-compacted" role="separator"><span>Context compacted</span></div>';
@@ -3702,16 +3907,18 @@
           <div class="ag-sys-body md">${md(msg.content || '')}</div>
         </details>`;
         timeline.push({ key: `sys:${msg.id}`, sig: `${msg.id}|${String(msg.content || '').length}`, html: sysHtml });
+        if (Number.isFinite(tsMs)) prevEndMs = tsMs;
         continue;
       }
 
       if (msg.role === 'tool') {
         if (msg.toolCallId && pairedToolIds.has(msg.toolCallId)) continue;
-        const w = ensureWork(msg.id, tsMs);
+        const w = ensureWork(msg.id, tsMs, inCurrentTurn);
         w.tools += 1;
         const dKey = `tool:${name}:${msg.id}`;
         w.parts.push(renderToolCardHtml(name, dKey, msg.toolName || 'tool', '', msg, { st }));
         w.lastSig = `t:${msg.id}`;
+        if (Number.isFinite(tsMs)) prevEndMs = tsMs;
         continue;
       }
 
@@ -3734,17 +3941,23 @@
           ${tsStr ? `<div class="ag-user-meta"><span class="ag-msg-ts" title="${esc(tsTitle)}">${esc(tsStr)}</span></div>` : ''}
         </div>`;
         timeline.push({ key: `u:${msg.id}`, sig: `${msg.id}|${taskText.length}|${systemBrief.length}`, html: uHtml });
+        if (Number.isFinite(tsMs)) prevEndMs = tsMs;
         continue;
       }
 
       // assistant
       const tcs = Array.isArray(msg.toolCalls) ? msg.toolCalls : [];
       const hasWork = Boolean(msg.reasoning || tcs.length > 0);
+      let stepEndMs = tsMs;
       if (hasWork) {
-        const w = ensureWork(msg.id, tsMs);
+        const w = ensureWork(msg.id, tsMs, inCurrentTurn);
         w.steps += 1;
         if (msg.reasoning) {
           const dKey = `think:${name}:${msg.id}`;
+          if (inCurrentTurn && data?.seenDKeys && !data.seenDKeys.has(dKey)) {
+            if (state.agentDetailsOpen.has(liveThinkKey)) state.agentDetailsOpen.add(dKey);
+            data.seenDKeys.add(dKey);
+          }
           const isOpen = state.agentDetailsOpen.has(dKey);
           const rTok = Number(msg.reasoningTokens) || 0;
           w.parts.push(`<details class="ag-think" data-ag-dkey="${esc(dKey)}"${isOpen ? ' open' : ''}>
@@ -3763,14 +3976,19 @@
           if (resMsg) {
             if (tcId) pairedToolIds.add(tcId);
             const resMs = normalizeTsMs(resMsg.timestampMs ?? resMsg.timestamp ?? resMsg.ts);
-            if (Number.isFinite(resMs) && Number.isFinite(tsMs)) {
-              tcDur = Math.max(0, resMs - tsMs);
+            if (Number.isFinite(resMs)) {
+              if (Number.isFinite(tsMs)) tcDur = Math.max(0, resMs - tsMs);
               w.maxMs = Number.isFinite(w.maxMs) ? Math.max(w.maxMs, resMs) : resMs;
+              stepEndMs = Number.isFinite(stepEndMs) ? Math.max(stepEndMs, resMs) : resMs;
             }
           }
           recordFileChange(extractToolFileChange(tcName, tcArgs, resMsg));
           w.tools += 1;
           const dKey = `tc:${name}:${msg.id}:${tcId || i}`;
+          if (tcId && data?.seenDKeys && !data.seenDKeys.has(dKey)) {
+            if (state.agentDetailsOpen.has(`live-tc:${name}:${tcId}`)) state.agentDetailsOpen.add(dKey);
+            data.seenDKeys.add(dKey);
+          }
           w.parts.push(renderToolCardHtml(name, dKey, tcName, tcArgs, resMsg, { st, durationMs: tcDur }));
         }
         w.lastSig = `a:${msg.id}:${w.tools}:${String(msg.reasoning || '').length}`;
@@ -3788,6 +4006,7 @@
         </div>`;
         timeline.push({ key: `r:${msg.id}`, sig: `${msg.id}|${rawReply.length}|${tsStr}`, html: rHtml });
       }
+      if (Number.isFinite(stepEndMs)) prevEndMs = stepEndMs;
     }
 
     flushWork();
@@ -3796,6 +4015,7 @@
   }
 
   function reconcileCommitted(committedEl, timeline) {
+    let deferred = false;
     const existingByKey = new Map();
     for (const child of [...committedEl.children]) {
       if (child.dataset?.agKey) existingByKey.set(child.dataset.agKey, child);
@@ -3803,7 +4023,10 @@
     }
     const desiredKeys = new Set(timeline.map((b) => b.key));
     for (const [k, node] of existingByKey) {
-      if (!desiredKeys.has(k)) node.remove();
+      if (!desiredKeys.has(k)) {
+        if (hasSelectionInside(node)) deferred = true;
+        else node.remove();
+      }
     }
     let cursor = committedEl.firstElementChild;
     for (const item of timeline) {
@@ -3819,16 +4042,20 @@
         continue;
       }
       if (node.dataset.agSig !== item.sig) {
-        const wasCursor = cursor === node;
-        const tmp = document.createElement('div');
-        tmp.innerHTML = item.html;
-        const fresh = tmp.firstElementChild;
-        if (fresh) {
-          fresh.dataset.agKey = item.key;
-          fresh.dataset.agSig = item.sig;
-          committedEl.replaceChild(fresh, node);
-          node = fresh;
-          if (wasCursor) cursor = fresh;
+        if (hasSelectionInside(node)) {
+          deferred = true;
+        } else {
+          const wasCursor = cursor === node;
+          const tmp = document.createElement('div');
+          tmp.innerHTML = item.html;
+          const fresh = tmp.firstElementChild;
+          if (fresh) {
+            fresh.dataset.agKey = item.key;
+            fresh.dataset.agSig = item.sig;
+            committedEl.replaceChild(fresh, node);
+            node = fresh;
+            if (wasCursor) cursor = fresh;
+          }
         }
       }
       if (node !== cursor) {
@@ -3837,10 +4064,44 @@
         cursor = cursor.nextElementSibling;
       }
     }
+    return deferred;
   }
 
-  function renderLiveTailHtml(name, data, st, committedToolCallIds) {
-    if (st !== 'working') return '';
+  function stripCommittedPrefix(rawLive, committedList) {
+    let rem = String(rawLive || '').trim();
+    if (!rem || !committedList.length) return rem;
+    if (committedList[committedList.length - 1] === rem) return '';
+    let i = 0;
+    while (i < committedList.length && !rem.startsWith(committedList[i])) i++;
+    while (i < committedList.length && rem) {
+      const chunk = committedList[i];
+      i++;
+      if (!chunk) continue;
+      if (rem === chunk) return '';
+      if (rem.startsWith(chunk) && /^\s/.test(rem.slice(chunk.length))) {
+        rem = rem.slice(chunk.length).trimStart();
+      }
+    }
+    if (rem && committedList.includes(rem)) return '';
+    return rem;
+  }
+
+  function hasSelectionInside(el) {
+    if (!el) return false;
+    const sel = window.getSelection?.();
+    if (!sel || sel.isCollapsed || !sel.rangeCount) return false;
+    return el.contains(sel.anchorNode) || el.contains(sel.focusNode);
+  }
+
+  const fmtModAgent = (m) => {
+    let s = String(m || '').trim();
+    if (!s) return '';
+    if (s.includes('/')) s = s.split('/').pop();
+    return s.replace(/-(?:dropdown|high|medium|low)$/i, '');
+  };
+
+  function buildLiveTailSpec(name, data, st, committedToolCallIds) {
+    if (st !== 'working') return null;
     const live = data.live && typeof data.live === 'object' ? data.live : null;
     const tel = data.telemetry || {};
     const m = memberOf(name);
@@ -3855,25 +4116,30 @@
     const summaryText = curLabel
       ? `Working${durSuffix} · ${curLabel}`
       : `Working${durSuffix || '…'}`;
-    let lastAsst = null;
+
+    let lastUserIdx = -1;
     for (let i = data.messages.length - 1; i >= 0; i--) {
-      if (data.messages[i]?.role === 'assistant') { lastAsst = data.messages[i]; break; }
+      if (data.messages[i]?.role === 'user') { lastUserIdx = i; break; }
     }
-    const lastContent = String(lastAsst?.content || '').trim();
-    const lastReasoning = String(lastAsst?.reasoning || '').trim();
-    const liveReasoning = String(live?.reasoning || '').trim();
-    const liveTranscript = String(live?.transcript || '').trim();
-    const showLiveReasoning = Boolean(liveReasoning && liveReasoning !== lastReasoning);
-    const showLiveTranscript = Boolean(liveTranscript && liveTranscript !== lastContent);
+    const turnAssts = data.messages.slice(lastUserIdx + 1).filter((msg) => msg?.role === 'assistant');
+    const committedTexts = turnAssts.map((msg) => String(msg.content || '').trim()).filter(Boolean);
+    const committedReasonings = turnAssts.map((msg) => String(msg.reasoning || '').trim()).filter(Boolean);
+
+    const dedupedReasoning = stripCommittedPrefix(live?.reasoning, committedReasonings);
+    const dedupedTranscript = stripCommittedPrefix(live?.transcript, committedTexts);
 
     const liveParts = [];
-    if (showLiveReasoning) {
+    if (dedupedReasoning) {
       const rKey = `live-think:${name}:${data.selectedSubagent || 'main'}`;
       const rOpen = state.agentDetailsOpen.has(rKey);
-      liveParts.push(`<details class="ag-think" data-ag-dkey="${esc(rKey)}"${rOpen ? ' open' : ''}>
-        <summary>Thought process</summary>
-        <div class="ag-think-body md">${md(live.reasoning)}</div>
-      </details>`);
+      liveParts.push({
+        key: rKey,
+        sig: `${dedupedReasoning.length}|${dedupedReasoning.slice(-40)}`,
+        html: `<details class="ag-think" data-ag-dkey="${esc(rKey)}"${rOpen ? ' open' : ''}>
+          <summary>Thought process</summary>
+          <div class="ag-think-body md">${md(dedupedReasoning)}</div>
+        </details>`,
+      });
     }
     for (let i = 0; i < liveTools.length; i++) {
       const tc = liveTools[i] || {};
@@ -3882,21 +4148,125 @@
       const tcArgs = tc.arguments ?? tc.preview ?? '';
       const hasRes = tc.status === 'ok' || tc.status === 'error' || tc.result != null || tc.output != null;
       const resMsg = hasRes ? { content: tc.result ?? tc.output ?? '', status: tc.status } : null;
-      liveParts.push(renderToolCardHtml(name, dKey, tc.name || 'tool', tcArgs, resMsg, {
+      const html = renderToolCardHtml(name, dKey, tc.name || 'tool', tcArgs, resMsg, {
         st: 'working',
         durationMs: Number.isFinite(Number(tc.durationMs)) ? Number(tc.durationMs) : NaN,
-      }));
+      });
+      liveParts.push({
+        key: dKey,
+        sig: `${tc.status || ''}|${tc.durationMs || ''}|${String(tcArgs).length}|${String(tc.result ?? tc.output ?? '').length}`,
+        html,
+      });
     }
+
     const wgKey = `live-wg:${name}:${data.selectedSubagent || 'main'}`;
     const wgOpen = state.agentDetailsOpen.has(wgKey);
-    const workHtml = `<details class="ag-work-group ag-live-work" data-ag-dkey="${esc(wgKey)}"${wgOpen ? ' open' : ''}>
-      <summary><span class="live-dot" aria-hidden="true"></span><span class="animate-shimmer-text">${esc(summaryText)}</span>${liveParts.length ? '<span class="ag-work-chev" aria-hidden="true"></span>' : ''}</summary>
-      ${liveParts.length ? `<div class="ag-work-rail">${liveParts.join('')}</div>` : ''}
-    </details>`;
-    const transcriptHtml = showLiveTranscript
-      ? `<div class="ag-reply ag-live-reply md">${md(live.transcript)}</div>`
-      : '';
-    return workHtml + transcriptHtml;
+    const transcriptHtml = dedupedTranscript ? md(dedupedTranscript) : '';
+    const transcriptSig = dedupedTranscript ? `${dedupedTranscript.length}|${dedupedTranscript.slice(-64)}` : '';
+    return { wgKey, wgOpen, summaryText, liveParts, transcriptHtml, transcriptSig };
+  }
+
+  function reconcileLiveTail(liveTail, spec) {
+    let wgEl = liveTail.querySelector(':scope > details.ag-live-work');
+    if (wgEl && wgEl.dataset.agDkey !== spec.wgKey) {
+      liveTail.innerHTML = '';
+      wgEl = null;
+    }
+    if (!wgEl) {
+      const tmp = document.createElement('div');
+      tmp.innerHTML = `<details class="ag-work-group ag-live-work" data-ag-dkey="${esc(spec.wgKey)}"${spec.wgOpen ? ' open' : ''}>
+        <summary><span class="live-dot" aria-hidden="true"></span><span class="animate-shimmer-text">${esc(spec.summaryText)}</span></summary>
+        <div class="ag-work-rail"></div>
+      </details>`;
+      wgEl = tmp.firstElementChild;
+      liveTail.prepend(wgEl);
+    } else {
+      if (wgEl.open !== spec.wgOpen && state.agentDetailsOpen.has(spec.wgKey)) {
+        wgEl.open = true;
+      }
+      const shim = wgEl.querySelector(':scope > summary .animate-shimmer-text');
+      if (shim && shim.textContent !== spec.summaryText) {
+        shim.textContent = spec.summaryText;
+      }
+    }
+    const summaryEl = wgEl.querySelector(':scope > summary');
+    let chev = summaryEl?.querySelector('.ag-work-chev');
+    if (spec.liveParts.length && summaryEl && !chev) {
+      chev = document.createElement('span');
+      chev.className = 'ag-work-chev';
+      chev.setAttribute('aria-hidden', 'true');
+      summaryEl.appendChild(chev);
+    } else if (!spec.liveParts.length && chev) {
+      chev.remove();
+    }
+
+    let rail = wgEl.querySelector(':scope > .ag-work-rail');
+    if (spec.liveParts.length) {
+      if (!rail) {
+        rail = document.createElement('div');
+        rail.className = 'ag-work-rail';
+        wgEl.appendChild(rail);
+      }
+      const existing = new Map();
+      for (const ch of [...rail.children]) {
+        if (ch.dataset?.agKey) existing.set(ch.dataset.agKey, ch);
+        else ch.remove();
+      }
+      const wanted = new Set(spec.liveParts.map((p) => p.key));
+      for (const [k, node] of existing) {
+        if (!wanted.has(k)) node.remove();
+      }
+      let cursor = rail.firstElementChild;
+      for (const part of spec.liveParts) {
+        let node = existing.get(part.key);
+        if (!node) {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = part.html;
+          node = tmp.firstElementChild;
+          if (!node) continue;
+          node.dataset.agKey = part.key;
+          node.dataset.agSig = part.sig;
+          rail.insertBefore(node, cursor);
+          continue;
+        }
+        if (node.dataset.agSig !== part.sig && !hasSelectionInside(node)) {
+          const tmp = document.createElement('div');
+          tmp.innerHTML = part.html;
+          const fresh = tmp.firstElementChild;
+          if (fresh) {
+            const wasOpen = node.open;
+            const nSum = node.querySelector(':scope > summary');
+            const fSum = fresh.querySelector(':scope > summary');
+            if (nSum && fSum && nSum.innerHTML !== fSum.innerHTML) nSum.innerHTML = fSum.innerHTML;
+            const nBody = node.querySelector(':scope > .ag-think-body, :scope > .ag-tool-detail');
+            const fBody = fresh.querySelector(':scope > .ag-think-body, :scope > .ag-tool-detail');
+            if (nBody && fBody && nBody.innerHTML !== fBody.innerHTML) nBody.innerHTML = fBody.innerHTML;
+            node.open = wasOpen || state.agentDetailsOpen.has(part.key);
+            node.dataset.agSig = part.sig;
+          }
+        }
+        if (node !== cursor) rail.insertBefore(node, cursor);
+        else cursor = cursor.nextElementSibling;
+      }
+    } else if (rail) {
+      rail.remove();
+    }
+
+    let replyEl = liveTail.querySelector(':scope > .ag-live-reply');
+    if (spec.transcriptHtml) {
+      if (!replyEl) {
+        replyEl = document.createElement('div');
+        replyEl.className = 'ag-reply ag-live-reply md';
+        replyEl.dataset.agSig = spec.transcriptSig;
+        replyEl.innerHTML = spec.transcriptHtml;
+        liveTail.appendChild(replyEl);
+      } else if (replyEl.dataset.agSig !== spec.transcriptSig && !hasSelectionInside(replyEl)) {
+        replyEl.dataset.agSig = spec.transcriptSig;
+        replyEl.innerHTML = spec.transcriptHtml;
+      }
+    } else if (replyEl && !hasSelectionInside(replyEl)) {
+      replyEl.remove();
+    }
   }
 
   function renderAgentPane(name, { olderRestore = null } = {}) {
@@ -3918,44 +4288,71 @@
     const m = memberOf(name);
     const tel = data.telemetry || {};
     const st = effectiveAgentStatus(name, data, m);
-    const model = tel.model || m?.model || '';
-    const tok = (tel.tokens && typeof tel.tokens === 'object') ? tel.tokens : (m?.tokens || {});
+    const subId = String(data.selectedSubagent || '').trim();
+    const paneKey = `${name}:${subId}`;
+    if (committed.dataset.agPaneOwner !== paneKey) {
+      committed.dataset.agPaneOwner = paneKey;
+      data.lastCommittedSig = '';
+      data.lastLiveSig = '';
+    }
+    const subList = (Array.isArray(data.subagents) && data.subagents.length ? data.subagents : m?.subagents) || [];
+    const subObj = subId ? (subList.find((s) => s && String(s.sessionId || s.id || '') === subId) || null) : null;
+    const snapSub = subId && Array.isArray(m?.subagents)
+      ? (m.subagents.find((s) => s && String(s.sessionId || s.id || '') === subId) || null)
+      : null;
+    const fallbackRec = subId ? (subObj || snapSub) : m;
+    const hasKeys = (o) => Boolean(o && typeof o === 'object' && Object.keys(o).length > 0);
+    const model = tel.model || fallbackRec?.model || '';
+    const tok = hasKeys(tel.tokens) ? tel.tokens : (hasKeys(fallbackRec?.tokens) ? fallbackRec.tokens : (subId && hasKeys(snapSub?.tokens) ? snapSub.tokens : {}));
     const processed = Number(tok.totalProcessed ?? tok.total) || 0;
     const pure = Number(tok.pureInput ?? tok.uncachedInput ?? tok.input) || 0;
     const cached = Number(tok.cachedInput ?? tok.cacheRead) || 0;
+    const outTok = Number(tok.output) || 0;
     const ctxUsed = Number(tok.contextUsed) || 0;
     const ctxLimit = Number(tok.contextLimit) || 0;
     let ctxPct = Number(tok.contextPct) || 0;
     if (ctxPct <= 0 && ctxUsed > 0 && ctxLimit > 0) ctxPct = (ctxUsed / ctxLimit) * 100;
     const ctxCls = ctxPct >= 85 ? 'crit' : (ctxPct >= 70 ? 'warn' : '');
-    const tps = Number(tel.tps ?? m?.tps) || 0;
-    const tpsEst = !!(tel.tps != null ? tel.tpsEstimated : m?.tpsEstimated);
+    const tps = Number((tel.tps != null && tel.tps > 0) ? tel.tps : (fallbackRec?.tps ?? snapSub?.tps ?? tel.tps)) || 0;
+    const tpsEst = !!(tel.tps != null && tel.tps > 0 ? tel.tpsEstimated : (fallbackRec?.tpsEstimated ?? snapSub?.tpsEstimated ?? tel.tpsEstimated));
     const color = window.SwarmHive?.colorOf ? window.SwarmHive.colorOf(name) : '#8a8f98';
     const avatar = window.SwarmHive?.avatarHtml ? window.SwarmHive.avatarHtml(name)
       : `<span class="msg-av" style="--av:${esc(color)}" aria-hidden="true">${esc(name.charAt(0).toUpperCase())}</span>`;
 
-    const subPills = data.subagents && data.subagents.length
+    const subPills = subList.length
       ? `<div class="agent-sub-pills" role="group" aria-label="Session switcher">
           <button type="button" class="agent-sub-pill ${!data.selectedSubagent ? 'active' : ''}" data-sub-id="">Main</button>
-          ${data.subagents.map((s) => {
+          ${subList.map((s) => {
             const sid = String(s.sessionId || s.id || '');
-            const lbl = String(s.label || s.title || sid.slice(0, 12));
-            const sSt = normalizeAgentStatus(s.state || s.status || 'waiting', false);
-            const stepsStr = Number(s.steps) > 0 ? ` · ${s.steps}` : '';
-            return `<button type="button" class="agent-sub-pill ${data.selectedSubagent === sid ? 'active' : ''}" data-sub-id="${esc(sid)}" title="${esc(sid)}"><span class="agent-sub-dot ${esc(sSt)}" aria-hidden="true"></span><span>${esc(lbl)}${esc(stepsStr)}</span></button>`;
+            const snapMatch = Array.isArray(m?.subagents) ? m.subagents.find((x) => x && String(x.sessionId || x.id || '') === sid) : null;
+            const lbl = String(s.label || s.name || s.title || snapMatch?.name || sid.slice(0, 12));
+            const sSt = normalizeAgentStatus(s.state || s.status || snapMatch?.status || 'waiting', false);
+            const stepsVal = Number(s.steps ?? snapMatch?.steps) || 0;
+            const sTokObj = hasKeys(s.tokens) ? s.tokens : snapMatch?.tokens;
+            const sTok = sTokObj ? (Number(sTokObj.totalProcessed ?? sTokObj.total) || ((Number(sTokObj.pureInput ?? sTokObj.uncachedInput ?? sTokObj.input) || 0) + (Number(sTokObj.output) || 0))) : 0;
+            const sTps = Number(s.tps ?? snapMatch?.tps) || 0;
+            const metaBits = [];
+            if (stepsVal > 0) metaBits.push(String(stepsVal));
+            if (sTok > 0) metaBits.push(fmtTokCompact(sTok));
+            if (sTps > 0) metaBits.push(fmtTpsCompact(sTps));
+            const metaStr = metaBits.length ? ` · ${metaBits.join(' · ')}` : '';
+            return `<button type="button" class="agent-sub-pill ${data.selectedSubagent === sid ? 'active' : ''}" data-sub-id="${esc(sid)}" title="${esc(sid)}"><span class="agent-sub-dot ${esc(sSt)}" aria-hidden="true"></span><span>${esc(lbl)}${esc(metaStr)}</span></button>`;
           }).join('')}
         </div>`
       : '';
 
+    const isCoord = name === (window.SwarmHive?.leadName || 'coordinator') || m?.role === 'coordinator';
+    const primCid = isCoord && canOpenConversation() ? primaryConv() : '';
     const headHtml = `
       <div class="agent-head-top">
         <div class="agent-head-id">
           ${avatar}
           <span class="agent-head-name">${esc(name)}</span>
           <span class="agent-status-chip ${esc(st)}">${esc(statusLabel(st))}</span>
-          ${model ? `<span class="agent-model-badge" title="${esc(model)}">${esc(model.split('/').pop())}</span>` : ''}
+          ${model ? `<span class="agent-model-badge" title="${esc(model)}">${esc(fmtModAgent(model))}</span>` : ''}
         </div>
         <div class="agent-head-actions">
+          ${primCid ? `<button type="button" class="ghost-btn sm" data-ag-open-primary="${esc(primCid)}" title="Open Primary Chat (${esc(primCid)})">Open Primary Chat</button>` : ''}
           ${data.hasMore ? '<button type="button" class="ghost-btn sm" data-ag-older>Show older</button>' : ''}
           <button type="button" class="ghost-btn sm" data-ag-refresh>Refresh</button>
           <button type="button" class="ghost-btn sm" data-ag-close="${esc(name)}">Close</button>
@@ -3970,6 +4367,7 @@
         ${processed > 0 ? `<span>${fmtTokCompact(processed)} proc</span>` : ''}
         ${pure > 0 ? `<span>${fmtTokCompact(pure)} pure</span>` : ''}
         ${cached > 0 ? `<span>${fmtTokCompact(cached)} cached</span>` : ''}
+        ${outTok > 0 ? `<span>${fmtTokCompact(outTok)} out</span>` : ''}
         ${tps > 0 ? `<span>${tpsEst ? '~' : ''}${esc(fmtTpsCompact(tps))}</span>` : ''}
       </div>
       ${subPills}`;
@@ -3977,6 +4375,7 @@
 
     const wasNearBottom = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 60;
     const prevTop = feed.scrollTop;
+    let committedChanged = false;
 
     let committedToolIds = new Set();
     if (data.loading && !data.messages.length) {
@@ -3984,50 +4383,64 @@
       if (data.lastCommittedSig !== 'loading') {
         data.lastCommittedSig = 'loading';
         committed.innerHTML = loadHtml;
+        committedChanged = true;
       }
     } else if (data.error && !data.messages.length) {
       const errSig = `err:${data.error}`;
       if (data.lastCommittedSig !== errSig) {
         data.lastCommittedSig = errSig;
         committed.innerHTML = `<div class="ag-empty">${esc(data.error)}</div>`;
+        committedChanged = true;
       }
     } else if (!data.messages.length) {
       if (data.lastCommittedSig !== 'empty') {
         data.lastCommittedSig = 'empty';
         committed.innerHTML = '<div class="ag-empty">No session history recorded yet.</div>';
+        committedChanged = true;
       }
     } else {
-      const { timeline, committedToolCallIds } = groupAgentTimeline(data.messages, { name, st });
+      const { timeline, committedToolCallIds } = groupAgentTimeline(data.messages, { name, st, data });
       committedToolIds = committedToolCallIds;
       const cSig = timeline.map((b) => `${b.key}=${b.sig}`).join('\n');
       if (data.lastCommittedSig !== cSig) {
-        data.lastCommittedSig = cSig;
-        reconcileCommitted(committed, timeline);
+        const deferred = reconcileCommitted(committed, timeline);
+        if (!deferred) data.lastCommittedSig = cSig;
+        committedChanged = true;
       }
     }
 
-    const tailHtml = renderLiveTailHtml(name, data, st, committedToolIds);
-    if (tailHtml) {
-      if (data.lastLiveSig !== tailHtml) {
-        data.lastLiveSig = tailHtml;
-        liveTail.innerHTML = tailHtml;
+    const tailSpec = buildLiveTailSpec(name, data, st, committedToolIds);
+    let tailChanged = false;
+    if (tailSpec) {
+      const nextTailSig = JSON.stringify({
+        s: tailSpec.summaryText,
+        p: tailSpec.liveParts.map((x) => [x.key, x.sig]),
+        t: tailSpec.transcriptSig,
+      });
+      if (data.lastLiveSig !== nextTailSig) {
+        data.lastLiveSig = nextTailSig;
+        reconcileLiveTail(liveTail, tailSpec);
+        tailChanged = true;
       }
       liveTail.classList.remove('hidden');
     } else {
       data.lastLiveSig = '';
       if (!liveTail.classList.contains('hidden')) liveTail.classList.add('hidden');
-      if (liveTail.innerHTML !== '') liveTail.innerHTML = '';
+      if (liveTail.innerHTML !== '' && !hasSelectionInside(liveTail)) liveTail.innerHTML = '';
     }
 
     if (olderRestore) {
       feed.scrollTop = olderRestore.prevTop + Math.max(0, feed.scrollHeight - olderRestore.prevHeight);
-    } else if (data.stick || wasNearBottom) {
-      feed.scrollTop = feed.scrollHeight;
+    } else if ((data.stick || wasNearBottom) && !hasSelectionInside(feed)) {
+      if (committedChanged || tailChanged || prevTop === 0) {
+        feed.scrollTop = feed.scrollHeight;
+      }
     } else if (prevTop > 0) {
       feed.scrollTop = prevTop;
     }
 
-    if (st === 'working' && !m?.killed) {
+    const showFoot = st === 'working' && !m?.killed;
+    if (showFoot) {
       const curTool = formatCurrentToolLabel(tel.currentTool ?? data.live?.currentTool) || (m?.activity ? String(m.activity) : 'Thinking…');
       const footHtml = `<span class="live-dot" aria-hidden="true"></span>` +
         `<span class="ag-live-tool">${esc(curTool)}</span>` +
@@ -4038,11 +4451,17 @@
       foot.classList.add('hidden');
       if (foot.innerHTML !== '') foot.innerHTML = '';
     }
+    $('agent-pane')?.classList.toggle('has-live-foot', showFoot);
     updateAgentJump(name);
   }
 
   // ---------- events ----------
   $('tab-overview').addEventListener('click', (e) => {
+    const openMem = e.target.closest('[data-open-member]');
+    if (openMem) {
+      window.SwarmHive?.hooks?.member?.(openMem.dataset.openMember, openMem.dataset.openSubagent || '');
+      return;
+    }
     const open = e.target.closest('[data-open]');
     if (open) return openConversation(open.dataset.open);
     const seq = e.target.closest('[data-ov-seq]');
@@ -4058,7 +4477,10 @@
     lsSet(PLAIN_KEY, prefs.plain ? null : '0');
     renderOverview();
   });
-  $('ov-open-coord').addEventListener('click', () => openConversation(coordinatorConv()));
+  $('ov-open-coord').addEventListener('click', () => {
+    const coordName = window.SwarmHive?.leadName || 'coordinator';
+    openAgentTab(coordName);
+  });
 
   const TABS = ['overview', 'feed', 'members', 'graph', 'raw'];
   function selectTab(tab, focus = false, byUser = false) {
@@ -4131,6 +4553,10 @@
   $('agent-header')?.addEventListener('click', (e) => {
     if (!state.tab.startsWith('agent:')) return;
     const name = state.tab.slice(6);
+    const primBtn = e.target.closest('[data-ag-open-primary]');
+    if (primBtn && isValidConvId(primBtn.dataset.agOpenPrimary)) {
+      return openConversation(primBtn.dataset.agOpenPrimary);
+    }
     const closeBtn = e.target.closest('[data-ag-close]');
     if (closeBtn) return closeAgentTab(closeBtn.dataset.agClose);
     if (e.target.closest('[data-ag-refresh]')) return fetchAgentHistory(name, { incremental: false });
@@ -4144,6 +4570,7 @@
       data.live = null;
       data.lastCommittedSig = '';
       data.lastLiveSig = '';
+      data.seenDKeys?.clear();
       data.stick = true;
       data.hasNewWhileScrolled = false;
       fetchAgentHistory(name, { incremental: false });
@@ -4177,6 +4604,8 @@
       const uri = resolveAllowedFileUri(fileBtn.dataset.agFile || '');
       if (uri && window.sidecar?.ui?.toggleAuxPane) {
         window.sidecar.ui.toggleAuxPane({ tabType: 'fileView', uri });
+      } else {
+        toast('Opening files needs the app.');
       }
       return;
     }
@@ -4208,7 +4637,7 @@
     }
   }, { passive: true });
 
-  ['f-agent', 'f-mention'].forEach((id) => $(id).addEventListener('input', () => {
+  ['f-agent', 'f-mention', 'f-kind'].forEach((id) => $(id)?.addEventListener('input', () => {
     $(id).classList.toggle('set', !!$(id).value);
     if (state.snap) renderFeed();
   }));
@@ -4279,7 +4708,12 @@
       clearFilters();
       return;
     }
-    const chip = e.target.closest('.msg-channel[data-channel]');
+    const openMem = e.target.closest('[data-feed-member], [data-open-member]');
+    if (openMem) {
+      window.SwarmHive?.hooks?.member?.(openMem.dataset.feedMember || openMem.dataset.openMember, openMem.dataset.openSubagent || '');
+      return;
+    }
+    const chip = e.target.closest('.msg-channel[data-channel], .msg-mention-btn[data-channel], .mention-btn[data-channel]');
     if (chip) {
       setChannel(chip.dataset.channel);
       return;
@@ -4293,7 +4727,7 @@
     let more = e.target.closest('.msg-more');
     if (!more) {
       const row = e.target.closest('.feed .msg');
-      if (!row || e.target.closest('a, button, input, [data-seq-ref]')) return;
+      if (!row || e.target.closest('a, button, input, pre, code, details, summary, [data-seq-ref], [data-feed-member], [data-open-member]')) return;
       if (String(window.getSelection?.() || '').length) return;
       const btn = row.querySelector('.msg-more');
       if (!btn || btn.classList.contains('hidden')) return;
@@ -4306,6 +4740,7 @@
     more.setAttribute('aria-expanded', String(open));
     if (open) state.expanded.add(seq); else state.expanded.delete(seq);
     if (open) state.stick = false;
+    updateJump();
   });
   $('jump-latest').addEventListener('click', () => scrollToLatest('smooth'));
   $('jump-top')?.addEventListener('click', () => {
@@ -4323,9 +4758,6 @@
     $('tab-feed').querySelector('.toolbar').classList.toggle('stuck', f.scrollTop > 0);
     updateJump();
   }, { passive: true });
-  new ResizeObserver(() => {
-    $('board').style.setProperty('--header-h', `${document.querySelector('.header').offsetHeight}px`);
-  }).observe(document.querySelector('.header'));
   new ResizeObserver(keepPinned).observe($('feed'));
   document.querySelectorAll('.gview-btn').forEach((b) => b.addEventListener('click', () => {
     state.graphView = b.dataset.gview;
@@ -4333,9 +4765,28 @@
   }));
   $('graph').addEventListener('click', (e) => {
     const g = e.target.closest('.node');
-    if (g?.dataset.conv) openConversation(g.dataset.conv);
+    if (!g) return;
+    const mem = g.dataset.member;
+    if (mem && memberOf(mem)) {
+      window.SwarmHive?.hooks?.member?.(mem);
+    } else if (g.dataset.conv) {
+      openConversation(g.dataset.conv);
+    }
   });
-  $('replay-caption').addEventListener('click', (e) => {
+  $('replay-caption').addEventListener('click', async (e) => {
+    const copyCodeBtn = e.target.closest('[data-copy-code]');
+    if (copyCodeBtn) {
+      const codeEl = copyCodeBtn.closest('.ag-codeblock')?.querySelector('pre code');
+      const ok = await copyText(codeEl?.textContent || '');
+      copyCodeBtn.textContent = ok ? 'Copied' : 'Failed';
+      setTimeout(() => { copyCodeBtn.textContent = 'Copy'; }, 1200);
+      return;
+    }
+    const openMem = e.target.closest('[data-feed-member], [data-open-member]');
+    if (openMem) {
+      window.SwarmHive?.hooks?.member?.(openMem.dataset.feedMember || openMem.dataset.openMember);
+      return;
+    }
     const seqRef = e.target.closest('[data-seq-ref], [data-ov-seq]');
     if (seqRef) {
       const targetSeq = Number(seqRef.dataset.seqRef || seqRef.dataset.ovSeq);
@@ -4347,6 +4798,7 @@
     if (state.snap) renderRaw();
   }));
   $('raw-copy').addEventListener('click', async () => {
+    if (state.rawIsEmpty) return toast('Nothing to copy.');
     const label = $('raw-copy-label');
     const ok = await copyText($('raw').textContent);
     label.textContent = ok ? 'Copied' : 'Copy failed';

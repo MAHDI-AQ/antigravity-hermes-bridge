@@ -35,7 +35,7 @@ If you prefer installing each side through its own CLI after cloning:
   ```bash
   agy plugin install ./packages/antigravity-plugin
   ```
-  *(Still register `packages/mcp-server` in `~/.gemini/antigravity/mcp_config.json`, or let `./scripts/install.sh` / `install.py` set up the MCP `.venv` and config for you.)*
+  *(Still register `packages/mcp-server` in `~/.gemini/config/mcp_config.json`, or let `./scripts/install.sh` / `install.py` set up the MCP `.venv` and config for you.)*
 - **Hermes Agent side:**
   ```bash
   hermes plugins install https://github.com/MAHDI-AQ/antigravity-hermes-bridge --yes-deps --enable
@@ -47,7 +47,7 @@ If you prefer installing each side through its own CLI after cloning:
 2. Creates `.venv` inside the MCP server directory and installs `packages/mcp-server` via `pip install -e`.
 3. Copies `packages/antigravity-plugin` to `~/.gemini/config/plugins/hermes-swarm`.
 4. Copies `packages/hermes-bridge` to `<HERMES_HOME>/plugins/hermes-swarm-bridge` (100% Python stdlib — zero pip packages added to Hermes).
-5. Backs up `~/.gemini/antigravity/mcp_config.json` (`mcp_config.json.bak.<timestamp>`) and registers `"hermes-a2a"`.
+5. Backs up `~/.gemini/config/mcp_config.json` (`mcp_config.json.bak.<timestamp>`, only when the entry changes) and registers `"hermes-a2a"` with `PYTHONUTF8=1` and `PYTHONIOENCODING=utf-8`.
 6. Runs `scripts/doctor.py` and prints a PASS/FAIL verification report.
 
 ---
@@ -57,8 +57,8 @@ If you prefer installing each side through its own CLI after cloning:
 | Flag | Default | Purpose |
 |---|---|---|
 | `--mcp-dir <path>` | `~/.local/share/hermes-swarm/mcp-server` | Where the MCP server & its `.venv` live |
-| `--antigravity-config-dir <path>` | `~/.gemini/config` | Antigravity plugins directory parent |
-| `--gemini-dir <path>` | `~/.gemini/antigravity` | Location of `mcp_config.json` |
+| `--antigravity-config-dir <path>` | `~/.gemini/config` | Antigravity config & plugins root (`mcp_config.json` and `plugins/`) |
+| `--gemini-dir <path>` | `~/.gemini/antigravity` | Legacy Antigravity root (derives config dir when `--antigravity-config-dir` is omitted; legacy fallback in `doctor.py`) |
 | `--hermes-dir <path>` | `%LOCALAPPDATA%\hermes` (Win) / `~/.hermes` (Unix) | Hermes Agent root (`HERMES_HOME`) |
 | `--dry-run` | off | Print planned actions without touching disk |
 | `--non-interactive` | off | Safe zero-prompt mode for automation & AI agents |

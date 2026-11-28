@@ -4064,3 +4064,117 @@ for raw in sys.stdin:
   assert.match(mismatchJson.error, /scope validation/i);
   assert.match(sidecarProc.getOutput().stderr, /GET \/api\/member\/history rejected 403/);
 });
+
+test('wakeup_bridge regressions: waitSince == 0 ignores lastReadSeq suppression, 401 HERMES_A2A_HTTP_TOKEN falls back to internal_token, and dispatches log cleanly', async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'hermes-wakeup-reg-'));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+
+  const appData = join(tempDir, 'appData');
+  mkdirSync(join(appData, 'brain', 'conv-prim-reg'), { recursive: true });
+  mkdirSync(join(appData, 'brain', 'conv-coord-reg'), { recursive: true });
+
+  const internalToken = 'internal-secret-fallback-tok';
+  const mismatchedEnvToken = 'stale-mismatched-env-tok';
+  const tokenFile = join(tempDir, 'internal_token');
+  writeFileSync(tokenFile, `${internalToken}\n`, 'utf-8');
+
+  const authHeadersSeen = [];
+  const server = createServer((req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    const auth = req.headers.authorization || '';
+    authHeadersSeen.push({ path: reqUrl.pathname, auth });
+    if (auth !== `Bearer ${internalToken}`) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    if (reqUrl.pathname === '/board') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        swarmId: 'sw-reg',
+        primaryConversationId: 'conv-prim-reg',
+        coordinatorConversationId: 'conv-coord-reg',
+        coordinatorWaiting: false,
+        members: [
+          {
+            name: 'coordinator',
+            role: 'coordinator',
+            status: 'working',
+            waitSince: null,
+            lastReadSeq: 50,
+          },
+        ],
+        messages: [
+          {
+            seq: 42,
+            id: 'm-42',
+            sender: 'coder',
+            senderRole: 'worker',
+            kind: 'handoff',
+            status: 'open',
+            mentions: ['coordinator'],
+            summary: '@coordinator [done] waitSince zero must still wake',
+          },
+        ],
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const port = await listenServer(server);
+  t.after(() => closeServer(server));
+
+  const sent = [];
+  const infoLogs = [];
+  const warnLogs = [];
+  const bridge = wakeup.createWakeupBridge({
+    sendMessage: async (convId, message) => {
+      sent.push({ convId, message });
+    },
+    config: {
+      conversationId: 'conv-prim-reg',
+      stateDir: tempDir,
+      tokenFile,
+      fallbackBoardUrl: `http://127.0.0.1:${port}`,
+      envHttpToken: mismatchedEnvToken,
+      hasEnvHttpToken: true,
+      httpToken: mismatchedEnvToken,
+    },
+    appDataDirs: [appData],
+    cursorStore: wakeup.createCursorStore(join(tempDir, 'cursors.json')),
+    env: { ANTIGRAVITY_EXECUTABLE_DATA_DIR: appData },
+    logger: {
+      info: (...args) => infoLogs.push(args.map(String).join(' ')),
+      warn: (...args) => warnLogs.push(args.map(String).join(' ')),
+      error: (...args) => warnLogs.push(args.map(String).join(' ')),
+    },
+  });
+  t.after(() => bridge.stop());
+
+  // 1) waitSince=0/null with lastReadSeq=50 >= seq=42 MUST NOT suppress wakeup;
+  //    401 with mismatched envHttpToken MUST fall back to internal_token.
+  const rec = await bridge.reconcileOnce();
+  assert.equal(rec.reconciled, true);
+  assert.equal(rec.wakeups, 1);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].convId, 'conv-coord-reg');
+  assert.match(sent[0].message, /waitSince zero must still wake/);
+
+  assert.ok(
+    authHeadersSeen.some((h) => h.auth === `Bearer ${mismatchedEnvToken}`),
+    'Initial request should try env token first',
+  );
+  assert.ok(
+    authHeadersSeen.some((h) => h.auth === `Bearer ${internalToken}`),
+    '401 mismatch must fall back to internal_token',
+  );
+  assert.ok(
+    warnLogs.some((l) => l.includes('falling back to internal_token')),
+    `Expected token fallback warning, got: ${JSON.stringify(warnLogs)}`,
+  );
+  assert.ok(
+    infoLogs.some((l) => l.includes('dispatched coordinator wakeup') && l.includes('sw-reg')),
+    `Expected wakeup dispatch info log, got: ${JSON.stringify(infoLogs)}`,
+  );
+});

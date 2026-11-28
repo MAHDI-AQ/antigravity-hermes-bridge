@@ -99,6 +99,13 @@ _PREVIEW_KEY_ORDER = (
 )
 _CONTEXT_YAML_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
 _CONTEXT_YAML_LOCK = threading.Lock()
+_SQLITE_SCHEMA_CACHE: dict[tuple[str, str], tuple[int, set[str]]] = {}
+_SQLITE_SCHEMA_CACHE_LOCK = threading.Lock()
+_COMMITTED_TC_CACHE: dict[tuple[str, str, int], tuple[int, int, set[str], set[str]]] = {}
+_COMMITTED_TC_CACHE_LOCK = threading.Lock()
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+_CONV_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
+_TRANSCRIPT_COMPLETED_AT_RE = re.compile(r"^Completed At:\s*(\S+)", re.MULTILINE)
 _DEFAULT_CONTEXT_LIMITS: tuple[tuple[str, int], ...] = (
     ("900k", 900_000),
     ("1m", 1_000_000),
@@ -489,28 +496,56 @@ def _query_hermes_session_stats(
         uri = f"{db_path.resolve().as_uri()}?mode=ro"
         con = sqlite3.connect(uri, uri=True, timeout=2.0)
         con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA busy_timeout = 2000")
+            con.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            pass
+        sess_cols = _sqlite_table_columns(con, "sessions", db_path=db_path)
+        if not sess_cols or "id" not in sess_cols:
+            return {}, None, {}
+        wanted = [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "estimated_cost_usd",
+            "actual_cost_usd",
+            "model",
+            "model_config",
+            "message_count",
+            "tool_call_count",
+            "started_at",
+            "ended_at",
+            "billing_provider",
+            "billing_base_url",
+        ]
+        sel_cols = [c if c in sess_cols else f"NULL AS {c}" for c in wanted]
         row = con.execute(
-            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, "
-            "reasoning_tokens, estimated_cost_usd, actual_cost_usd, model, model_config, "
-            "message_count, tool_call_count, started_at, ended_at, billing_provider, billing_base_url "
-            "FROM sessions WHERE id = ?",
+            f"SELECT {', '.join(sel_cols)} FROM sessions WHERE id = ?",
             (session_id,),
         ).fetchone()
         if row is None:
             return {}, None, {}
         d = dict(row)
         ctx_used = 0
+        gw_prov = ""
         raw_mc = d.get("model_config")
         if isinstance(raw_mc, str) and raw_mc.strip():
             try:
                 mc = json.loads(raw_mc)
-                anchor = mc.get("_usage_anchor") if isinstance(mc, dict) else None
-                if isinstance(anchor, dict):
-                    ctx_used = int(anchor.get("prompt_tokens") or 0) + int(anchor.get("completion_tokens") or 0)
+                if isinstance(mc, dict):
+                    anchor = mc.get("_usage_anchor")
+                    if isinstance(anchor, dict):
+                        ctx_used = int(anchor.get("prompt_tokens") or 0) + int(anchor.get("completion_tokens") or 0)
+                    gw_rt = mc.get("gateway_runtime")
+                    if isinstance(gw_rt, dict):
+                        gw_prov = str(gw_rt.get("provider") or "").strip()
             except Exception:
                 pass
         eff_model = str(d.get("model") or model or "").strip() or None
-        eff_prov = str(d.get("billing_provider") or provider or "").strip() or None
+        eff_prov = str(d.get("billing_provider") or gw_prov or provider or "").strip() or None
         eff_base = str(d.get("billing_base_url") or base_url or "").strip() or None
         ctx_limit = _resolve_context_limit(eff_model, eff_prov, eff_base)
         tokens = _normalize_tokens_dict(
@@ -522,8 +557,8 @@ def _query_hermes_session_stats(
                 "cache_write_tokens": int(d.get("cache_write_tokens") or 0),
                 "reasoning_tokens": int(d.get("reasoning_tokens") or 0),
             },
-            context_used=ctx_used,
             context_limit=ctx_limit,
+            context_used=ctx_used,
         )
         actual = d.get("actual_cost_usd")
         est = d.get("estimated_cost_usd")
@@ -552,6 +587,7 @@ def _query_hermes_session_stats(
         extra = {
             "model": eff_model,
             "billingProvider": eff_prov,
+            "gatewayProvider": gw_prov or None,
             "messageCount": int(d.get("message_count") or 0),
             "toolCallCount": int(d.get("tool_call_count") or 0),
             "startedAtEpoch": d.get("started_at"),
@@ -580,6 +616,11 @@ def _query_hermes_subagent_sessions(parent_session_id: str) -> list[dict[str, An
         uri = f"{db_path.resolve().as_uri()}?mode=ro"
         con = sqlite3.connect(uri, uri=True, timeout=2.0)
         con.row_factory = sqlite3.Row
+        try:
+            con.execute("PRAGMA busy_timeout = 2000")
+            con.execute("PRAGMA query_only = ON")
+        except sqlite3.Error:
+            pass
         rows = con.execute(
             "SELECT id, model, started_at, ended_at, message_count, tool_call_count, "
             "input_tokens, output_tokens, model_config "
@@ -740,8 +781,70 @@ def build_worker_preamble(
         f'   - Read / status / wait: swarm_read({tool_ctx_args}, since=0) | swarm_status({tool_ctx_args}) | swarm_wait({tool_ctx_args}, since=<LAST_SEQ>, mentions_only=true, timeout_seconds=120)\n'
         f'   - Claim / release scope: swarm_claim({tool_ctx_args}, scope="path/or/lane", notes="...") | swarm_release({tool_ctx_args}, scope="path/or/lane")\n'
         f"5. Emergency fallback ONLY if native `swarm_post`/`swarm_wait` is unavailable: {board_cmd} post --channel main --kind <post|question|handoff|escalation> --summary \"@coordinator [done] ...\" --details \"...\"\n"
-        "6. If blocked waiting on `@coordinator`, post a `question`/`escalation` on the board AND end your turn with a line starting with `[INPUT_REQUIRED]`."
+        "6. NEVER wrap `swarm_*` calls (especially `swarm_post` or `swarm_release`) inside a batched `tool_call(calls=...)` JSON wrapper — always call `swarm_post` directly as its own native tool call so Markdown/JSON escaping never fails. NEVER send diagnostic/test probe posts (such as \"Probe post.\") to the board, and NEVER include `[done]` in `summary` until your final report is genuinely complete.\n"
+        "7. If blocked waiting on `@coordinator`, post a `question`/`escalation` on the board AND end your turn with a line starting with `[INPUT_REQUIRED]`."
     )
+
+
+_PREAMBLE_LINE_RE = re.compile(
+    r"^(?:You\s+are\s+[`'\"*]?[\w-]+[`'\"*]?\s+in\s+(?:this\s+)?(?:Hermes\s+)?swarm\b.*|\[SYSTEM\s*/\s*ROLE\]|\[TASK\]|Ownership(?:\s*&\s*Locks)?\s*:|Rules\s*:|Constraints\s*:|Completion\s*:)\s*$",
+    re.IGNORECASE,
+)
+_PREAMBLE_INLINE_SWARM_RE = re.compile(
+    r"^You\s+are\s+[`'\"*]?[\w-]+[`'\"*]?\s+in\s+(?:this\s+)?(?:Hermes\s+)?swarm\b(?:\s*\([^)]*(?:\)|$))?[.:—–\-\s]*",
+    re.IGNORECASE,
+)
+_TASK_HEADER_RE = re.compile(r"^\s*(?:#+\s*)?(?:task|assignment|goal)\s*:\s*(.*)$", re.IGNORECASE)
+_SECTION_STOP_RE = re.compile(r"^\s*(?:#+\s*)?(?:ownership(?:\s*&\s*locks)?|completion|rules|constraints)\s*:\s*$", re.IGNORECASE)
+
+
+def _extract_task_assignment(prompt_body: str) -> str:
+    """Extract a concise human-readable task summary from `prompt_body` without swarm/ownership boilerplate."""
+    text = str(prompt_body or "").strip()
+    if not text:
+        return ""
+    lines = [ln.strip() for ln in text.replace("\r\n", "\n").splitlines()]
+
+    def _clean_line(s: str) -> str:
+        s = re.sub(r"^\s*(?:[-*]|\d+[.)]|#+)\s+", "", s)
+        s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+        s = s.replace("`", "").replace("__", "")
+        return re.sub(r"\s+", " ", s).strip()
+
+    for idx, raw_ln in enumerate(lines):
+        m_hdr = _TASK_HEADER_RE.match(raw_ln)
+        if m_hdr:
+            inline = _clean_line(m_hdr.group(1) or "")
+            if inline:
+                return inline[:240]
+            for sub in lines[idx + 1 :]:
+                if not sub:
+                    continue
+                if _SECTION_STOP_RE.match(sub):
+                    break
+                cleaned = _clean_line(sub)
+                if cleaned:
+                    return cleaned[:240]
+
+    in_ignored_section = False
+    for raw_ln in lines:
+        if not raw_ln:
+            in_ignored_section = False
+            continue
+        if _SECTION_STOP_RE.match(raw_ln) or _PREAMBLE_LINE_RE.match(raw_ln):
+            in_ignored_section = True
+            continue
+        stripped_swarm = _PREAMBLE_INLINE_SWARM_RE.sub("", raw_ln).strip()
+        if not stripped_swarm:
+            continue
+        if in_ignored_section and raw_ln.startswith(("-", "*")):
+            continue
+        in_ignored_section = False
+        cleaned = _clean_line(stripped_swarm)
+        if cleaned:
+            return cleaned[:240]
+
+    return text[:240]
 
 
 class SwarmRuntime:
@@ -1024,6 +1127,14 @@ class SwarmRuntime:
                 txt = txt[-_LIVE_TRANSCRIPT_MAX_CHARS:]
             buf["liveReasoning"] = txt
 
+    def _reset_live_step_buffers(self, task_id: str) -> None:
+        """Clear active-step transcript/reasoning when advancing past a committed tool/step boundary."""
+        with self._state_rlock:
+            buf = self._live_buffers.get(task_id)
+            if buf is not None:
+                buf["liveTranscript"] = ""
+                buf["liveReasoning"] = ""
+
     def _append_live_tool_trace(self, task_id: str, entry: dict[str, Any]) -> None:
         with self._state_rlock:
             buf = self._live_buffers.setdefault(
@@ -1277,7 +1388,20 @@ class SwarmRuntime:
                 board = self._board.read_board(self.swarm_id)
                 plan = board.get("plan")
                 if isinstance(plan, dict) and plan.get("tasks"):
-                    plan_lines = [f"- {t.get('title', t.get('id', 'task'))} [{t.get('state', 'pending')}]" for t in plan["tasks"][:12] if isinstance(t, dict)]
+                    raw_ptasks = plan["tasks"]
+                    plan_lines: list[str] = []
+                    if isinstance(raw_ptasks, dict):
+                        for pk, pv in list(raw_ptasks.items())[:12]:
+                            if isinstance(pv, dict):
+                                plan_lines.append(f"- {pv.get('title', pk)} [{pv.get('state') or pv.get('status') or 'pending'}]")
+                            else:
+                                plan_lines.append(f"- {pk}: {pv}")
+                    elif isinstance(raw_ptasks, list):
+                        plan_lines = [
+                            f"- {t.get('title', t.get('id', 'task'))} [{t.get('state', 'pending')}]"
+                            for t in raw_ptasks[:12]
+                            if isinstance(t, dict)
+                        ]
                     if plan_lines:
                         chunks.append("Current plan:\n" + "\n".join(plan_lines))
                 coord_posts = [
@@ -1538,14 +1662,15 @@ class SwarmRuntime:
 
         assignment_val: str | None = None
         if is_new_task and not preserve_assignment:
+            extracted_assign = _extract_task_assignment(prompt_body) or prompt_body[:240]
             try:
                 cur_board = self._board.read_board(self.swarm_id)
                 cur_mem = (cur_board.get("members") or {}).get(worker_name)
                 cur_assign = str((cur_mem or {}).get("assignment") or "").strip() if isinstance(cur_mem, dict) else ""
                 if not cur_assign:
-                    assignment_val = prompt_body[:240]
+                    assignment_val = extracted_assign
             except Exception:
-                assignment_val = prompt_body[:240]
+                assignment_val = extracted_assign
 
         try:
             self._board.upsert_member(
@@ -1723,7 +1848,7 @@ class SwarmRuntime:
                     act["currentTool"] = None
 
             async def _refresh_live_db_stats(*, force: bool = False) -> bool:
-                nonlocal last_db_poll, db_poll_in_flight
+                nonlocal last_db_poll, db_poll_in_flight, init_model
                 if not hermes_session_id or db_poll_in_flight:
                     return False
                 now_m = time.monotonic()
@@ -1732,25 +1857,45 @@ class SwarmRuntime:
                 last_db_poll = now_m
                 db_poll_in_flight = True
                 try:
-                    db_toks, db_cost, _ = await asyncio.to_thread(
+                    db_toks, db_cost, db_extra = await asyncio.to_thread(
                         _query_hermes_session_stats,
                         hermes_session_id,
                         model=init_model or cfg.model,
                         provider=cfg.provider,
                         base_url=cfg.base_url,
                     )
+                    db_model = str((db_extra or {}).get("model") or init_model or cfg.model or "").strip() or None
+                    db_prov = str((db_extra or {}).get("billingProvider") or (db_extra or {}).get("gatewayProvider") or cfg.provider or "").strip() or None
+                    if db_model and not init_model:
+                        init_model = db_model
                     changed = False
-                    if db_toks or db_cost is not None:
+                    board_model_sync: tuple[str | None, str | None] | None = None
+                    if db_toks or db_cost is not None or db_model or db_prov:
                         now_m = time.monotonic()
                         with self._state_rlock:
                             t = self._tasks.get(task_id)
                             if t:
                                 meta = t.setdefault("metadata", {})
                                 act = meta.setdefault("liveActivity", {})
+                                wcfg_live = meta.setdefault("workerConfig", {})
                                 el_ms = max(0, int((now_m - turn_started_mono) * 1000))
                                 cur_llm_ms = _current_llm_active_ms(now_m)
                                 act["elapsedMs"] = el_ms
                                 act["llmActiveMs"] = cur_llm_ms
+                                prev_live_model = str(wcfg_live.get("model") or meta.get("resolvedModel") or "").strip() or None
+                                prev_live_prov = str(wcfg_live.get("provider") or meta.get("resolvedProvider") or "").strip() or None
+                                if db_model:
+                                    meta["resolvedModel"] = db_model
+                                    act["model"] = db_model
+                                    if not wcfg_live.get("model"):
+                                        wcfg_live["model"] = db_model
+                                if db_prov:
+                                    meta["resolvedProvider"] = db_prov
+                                    if not wcfg_live.get("provider"):
+                                        wcfg_live["provider"] = db_prov
+                                if (db_model and db_model != prev_live_model) or (db_prov and db_prov != prev_live_prov):
+                                    board_model_sync = (db_model, db_prov)
+                                    changed = True
                                 if db_toks:
                                     prev_tot = (meta.get("tokens") or {}).get("total")
                                     prev_ctx = (meta.get("tokens") or {}).get("contextUsed")
@@ -1772,6 +1917,19 @@ class SwarmRuntime:
                                         changed = True
                                 if db_cost is not None:
                                     meta["costUsd"] = db_cost
+                    if board_model_sync is not None:
+                        try:
+                            await asyncio.to_thread(
+                                self._board.upsert_member,
+                                worker_name,
+                                role=cfg.role,
+                                model=board_model_sync[0],
+                                provider=board_model_sync[1],
+                                session_id=hermes_session_id or None,
+                                swarm_id=self.swarm_id,
+                            )
+                        except Exception:
+                            pass
                     running_subs = [
                         (sid, rec) for sid, rec in active_subagents.items()
                         if str(rec.get("status") or rec.get("state") or "") == "working"
@@ -1908,18 +2066,27 @@ class SwarmRuntime:
 
                         ev_type = ev.get("type")
                         if ev_type == "system" and ev.get("subtype") == "init":
-                            init_model = ev.get("model") or init_model
+                            ev_model = str(ev.get("model") or "").strip()
+                            if ev_model:
+                                init_model = ev_model
                             hermes_session_id = ev.get("session_id") or hermes_session_id
                             if llm_span_start_mono is None:
                                 llm_span_start_mono = time.monotonic()
                             with self._state_rlock:
                                 t = self._tasks.get(task_id)
                                 if t:
-                                    act = t["metadata"]["liveActivity"]
+                                    t_meta = t.setdefault("metadata", {})
+                                    act = t_meta["liveActivity"]
                                     act["lastEventAt"] = models.now_iso()
                                     act["steps"] = max(int(act.get("steps") or 0), steps_count)
                                     if hermes_session_id:
                                         act["hermesSessionId"] = hermes_session_id
+                                    if init_model:
+                                        t_meta["resolvedModel"] = init_model
+                                        act["model"] = init_model
+                                        wcfg_live = t_meta.setdefault("workerConfig", {})
+                                        if not wcfg_live.get("model"):
+                                            wcfg_live["model"] = init_model
                             self._emit_observer_event("task_progress", {"taskId": task_id})
 
                         elif ev_type in ("thinking", "reasoning", "thought"):
@@ -1935,10 +2102,11 @@ class SwarmRuntime:
                             if r_delta:
                                 if llm_span_start_mono is None:
                                     llm_span_start_mono = time.monotonic()
-                                self._append_live_reasoning(task_id, r_delta)
                                 if saw_tool_result:
                                     steps_count += 1
                                     saw_tool_result = False
+                                    self._reset_live_step_buffers(task_id)
+                                self._append_live_reasoning(task_id, r_delta)
                                 streamed_chars += len(r_delta)
                                 with self._state_rlock:
                                     t = self._tasks.get(task_id)
@@ -1962,10 +2130,11 @@ class SwarmRuntime:
                                 if llm_span_start_mono is None:
                                     llm_span_start_mono = time.monotonic()
                                 text_chunks.append(delta)
-                                self._append_live_transcript(task_id, delta)
                                 if saw_tool_result:
                                     steps_count += 1
                                     saw_tool_result = False
+                                    self._reset_live_step_buffers(task_id)
+                                self._append_live_transcript(task_id, delta)
                                 streamed_chars += len(delta)
                                 with self._state_rlock:
                                     t = self._tasks.get(task_id)
@@ -2009,6 +2178,7 @@ class SwarmRuntime:
                             if saw_tool_result:
                                 steps_count += 1
                                 saw_tool_result = False
+                                self._reset_live_step_buffers(task_id)
                             entry = {
                                 "event": "tool_use",
                                 "name": tname,
@@ -2422,23 +2592,28 @@ class SwarmRuntime:
                     provider=cfg.provider,
                     base_url=cfg.base_url,
                 )
-            eff_prov_final = str(db_extra.get("billingProvider") or cfg.provider or "").strip().lower()
+            final_model = str(init_model or db_extra.get("model") or cfg.model or "").strip() or None
+            final_provider = str(db_extra.get("billingProvider") or db_extra.get("gatewayProvider") or cfg.provider or "").strip() or None
+            eff_prov_final = str(final_provider or "").lower()
             if cost_usd == 0.0 and (eff_prov_final == "custom" or db_cost is None):
                 cost_usd = None
             if cost_usd is None and db_cost is not None:
                 cost_usd = db_cost
 
-            ctx_limit_final = _resolve_context_limit(init_model or cfg.model, cfg.provider, cfg.base_url)
+            ctx_limit_final = _resolve_context_limit(final_model, final_provider, cfg.base_url)
             if raw_result_tokens and any(raw_result_tokens.values()):
                 merged_tok = dict(raw_result_tokens)
                 raw_had_cache_read = any(
                     raw_result_tokens.get(k) not in (None, 0, False)
                     for k in ("cacheRead", "cache_read", "cache_read_tokens")
                 )
+                db_supplied_cache = False
                 if db_toks:
                     for fk in ("cacheRead", "cacheWrite", "reasoning", "contextUsed", "contextLimit", "contextPct"):
                         if not merged_tok.get(fk) and db_toks.get(fk):
                             merged_tok[fk] = db_toks[fk]
+                            if fk == "cacheRead":
+                                db_supplied_cache = True
                 if (
                     not raw_had_cache_read
                     and "uncachedInput" not in merged_tok
@@ -2447,7 +2622,17 @@ class SwarmRuntime:
                 ):
                     raw_in_val = merged_tok.get("input") or merged_tok.get("input_tokens") or merged_tok.get("prompt_tokens")
                     if raw_in_val is not None:
-                        merged_tok["uncachedInput"] = raw_in_val
+                        try:
+                            raw_in_int = int(raw_in_val)
+                        except (TypeError, ValueError):
+                            raw_in_int = 0
+                        db_pure_int = int(db_toks.get("pureInput") or 0) if db_toks else 0
+                        db_cache_int = int(merged_tok.get("cacheRead") or 0)
+                        if db_supplied_cache and db_cache_int > 0 and raw_in_int >= (db_pure_int + db_cache_int):
+                            # raw_in_val already includes cacheRead; let _normalize_tokens_dict deduct cacheRead
+                            pass
+                        else:
+                            merged_tok["uncachedInput"] = raw_in_val
                 tokens_out = _normalize_tokens_dict(merged_tok, context_limit=ctx_limit_final)
             elif db_toks:
                 tokens_out = db_toks
@@ -2577,8 +2762,8 @@ class SwarmRuntime:
                         )
                     usage_payload = {
                         "hermesSessionId": hermes_session_id or None,
-                        "model": init_model or cfg.model,
-                        "provider": cfg.provider,
+                        "model": final_model,
+                        "provider": final_provider,
                         "exitCode": result_rc,
                         "tokens": tokens_out,
                         "costUsd": cost_usd,
@@ -2590,6 +2775,16 @@ class SwarmRuntime:
                         "worktreeDiffStat": wt_diff.get("diffStat") if worktree_path else None,
                         "turn": turn_num,
                     }
+                    if final_model:
+                        task["metadata"]["resolvedModel"] = final_model
+                        wcfg_final = task["metadata"].setdefault("workerConfig", {})
+                        if not wcfg_final.get("model"):
+                            wcfg_final["model"] = final_model
+                    if final_provider:
+                        task["metadata"]["resolvedProvider"] = final_provider
+                        wcfg_final = task["metadata"].setdefault("workerConfig", {})
+                        if not wcfg_final.get("provider"):
+                            wcfg_final["provider"] = final_provider
                     if worktree_path and (wt_diff.get("status") or wt_diff.get("diffStat")):
                         new_arts.append(
                             models.new_artifact(
@@ -2696,8 +2891,8 @@ class SwarmRuntime:
                     task_id=task_id,
                     context_id=task["contextId"],
                     session_id=hermes_session_id or None,
-                    model=init_model or cfg.model,
-                    provider=cfg.provider,
+                    model=final_model,
+                    provider=final_provider,
                     workdir=cfg.workdir,
                     worktree_path=worktree_path,
                     worktree_branch=worktree_branch,
@@ -3550,18 +3745,57 @@ class SwarmRuntime:
 
     async def diff_worker(
         self,
-        name_or_task_id: str,
+        name_or_task_id: str | None = None,
         *,
         include_patch: bool = True,
         max_bytes: int = 200_000,
     ) -> dict[str, Any]:
-        """Inspect git diff for a worker name or task ID."""
+        """Inspect git diff for one worker/task ID, or aggregate diffs across all workers when omitted."""
+        clean_target = str(name_or_task_id or "").strip()
+        if not clean_target:
+            with self._state_rlock:
+                all_tasks = list(self._tasks.values())
+            latest_by_worker: dict[str, dict[str, Any]] = {}
+            all_tasks.sort(
+                key=lambda t: str(((t.get("status") or {}).get("timestamp")) or ((t.get("metadata") or {}).get("createdAt")) or ""),
+                reverse=True,
+            )
+            for t in all_tasks:
+                wcfg = (t.get("metadata") or {}).get("workerConfig") or {}
+                wn = str(wcfg.get("worker_name") or t.get("id") or "").strip()
+                if wn and wn.lower() not in latest_by_worker:
+                    latest_by_worker[wn.lower()] = dict(t)
+            if not latest_by_worker:
+                return {"workers": [], "count": 0}
+            cached_diffs: dict[tuple[str, str], dict[str, Any]] = {}
+            diffs_out: list[dict[str, Any]] = []
+            for key in sorted(latest_by_worker):
+                task = latest_by_worker[key]
+                meta = task.get("metadata") or {}
+                wcfg = meta.get("workerConfig") or {}
+                target_dir = meta.get("worktreePath") or wcfg.get("workdir")
+                branch_hint = meta.get("worktreeBranch")
+                cache_key = (str(target_dir or ""), str(branch_hint or ""))
+                if cache_key not in cached_diffs:
+                    cached_diffs[cache_key] = await worktree_mod.inspect_git_diff(
+                        target_dir,
+                        include_patch=include_patch,
+                        max_bytes=max_bytes,
+                        branch_hint=branch_hint,
+                    )
+                diffs_out.append({
+                    "taskId": task.get("id"),
+                    "worker": wcfg.get("worker_name"),
+                    **cached_diffs[cache_key],
+                })
+            return {"workers": diffs_out, "count": len(diffs_out)}
+
         with self._state_rlock:
-            task = self._tasks.get(name_or_task_id)
+            task = self._tasks.get(clean_target)
         if not task:
-            task = self.find_latest_worker_task(name_or_task_id)
+            task = self.find_latest_worker_task(clean_target)
         if not task:
-            raise KeyError(f"Worker or task '{name_or_task_id}' not found in swarm '{self.swarm_id}'.")
+            raise KeyError(f"Worker or task '{clean_target}' not found in swarm '{self.swarm_id}'.")
         meta = task.get("metadata") or {}
         wcfg = meta.get("workerConfig") or {}
         target_dir = meta.get("worktreePath") or wcfg.get("workdir")
@@ -4246,10 +4480,548 @@ def _normalize_member_history_state(
     return mem_norm or task_norm or "waiting"
 
 
-def _sqlite_table_columns(con: sqlite3.Connection, table: str) -> set[str]:
+def resolve_antigravity_brain_roots() -> list[Path]:
+    """Return candidate Antigravity `brain` directories in priority order (without creating dirs)."""
+    candidates: list[Path] = []
+    app_data = (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+    if app_data:
+        app_brain = Path(store.normalize_local_path(app_data)) / "brain"
+        if app_brain.is_dir():
+            candidates.append(app_brain)
+            return candidates
+    exec_data = (os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "").strip()
+    if exec_data:
+        cur = Path(store.normalize_local_path(exec_data))
+        for parent in [cur, *cur.parents]:
+            if parent.name == "sidecar_data":
+                candidates.append(parent.parent / "brain")
+                break
+    gemini_root = Path.home() / ".gemini"
+    default_brain = gemini_root / "antigravity" / "brain"
+    candidates.append(default_brain)
+    if gemini_root.is_dir():
+        try:
+            for child in sorted(gemini_root.iterdir()):
+                if child.is_dir():
+                    cand = child / "brain"
+                    if cand not in candidates:
+                        candidates.append(cand)
+        except OSError:
+            pass
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for c in candidates:
+        try:
+            key = os.path.normcase(os.path.realpath(str(c)))
+        except OSError:
+            key = os.path.normcase(str(c))
+        if key not in seen:
+            seen.add(key)
+            deduped.append(c)
+    return deduped
+
+
+def _discover_coordinator_subagent_candidates(primary_cid: str | None) -> list[str]:
+    """Read `<brain>/<primary_cid>/.system_generated/subagents/*.json` for valid coordinator IDs."""
+    pcid = str(primary_cid or "").strip()
+    if not pcid or not _CONV_ID_RE.match(pcid):
+        return []
+    found: list[str] = []
+    for root in resolve_antigravity_brain_roots():
+        sub_dir = root / pcid / ".system_generated" / "subagents"
+        if not sub_dir.is_dir():
+            continue
+        try:
+            for f in sorted(sub_dir.glob("*.json")):
+                try:
+                    doc = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+                except Exception:
+                    doc = None
+                cid = str((doc or {}).get("conversationId") or f.stem).strip()
+                if cid and cid not in found:
+                    found.append(cid)
+        except OSError:
+            continue
+    return found
+
+
+def validate_coordinator_conversation_id(
+    ccid: str,
+    primary_cid: str | None = None,
+) -> tuple[bool, str | None]:
+    """Validate `coordinator_conversation_id` against local Antigravity brain storage when present."""
+    clean_ccid = str(ccid or "").strip()
+    if not clean_ccid:
+        return False, "`coordinator_conversation_id` is required for action='bind_coordinator'."
+    if ".." in clean_ccid or "/" in clean_ccid or "\\" in clean_ccid or not _CONV_ID_RE.match(clean_ccid):
+        return False, (
+            f"Invalid `coordinator_conversation_id` {clean_ccid!r}. "
+            "Copy the exact conversationId returned by `invoke_subagent` verbatim."
+        )
+    if (os.environ.get("HERMES_A2A_SKIP_BRAIN_CHECK") or "").strip() == "1":
+        return True, None
+
+    roots = resolve_antigravity_brain_roots()
+    existing_roots = [r for r in roots if r.is_dir()]
+    if not existing_roots:
+        return True, None
+
+    clean_prim = str(primary_cid or "").strip() or None
+    for root in existing_roots:
+        cand = root / clean_ccid
+        if store.is_path_within(cand, [root]) and cand.is_dir():
+            return True, None
+        if clean_prim and _CONV_ID_RE.match(clean_prim):
+            sub_file = root / clean_prim / ".system_generated" / "subagents" / f"{clean_ccid}.json"
+            if store.is_path_within(sub_file, [root]) and sub_file.is_file():
+                return True, None
+
+    primary_in_brain = bool(
+        clean_prim
+        and _CONV_ID_RE.match(clean_prim)
+        and any((r / clean_prim).is_dir() for r in existing_roots)
+    )
+    if not primary_in_brain:
+        return True, None
+
+    candidates = _discover_coordinator_subagent_candidates(clean_prim)
+    hint = f" Valid subagent conversationIds for {clean_prim}: {candidates}." if candidates else ""
+    return False, (
+        f"Coordinator conversationId '{clean_ccid}' was not found in local Antigravity brain directory "
+        f"({existing_roots[0]}). Copy the exact conversationId returned by `invoke_subagent` verbatim "
+        f"(never hand-type or splice UUID segments).{hint}"
+    )
+
+
+def _resolve_antigravity_transcript_file(
+    conv_ids: list[str],
+    *,
+    primary_cid: str | None = None,
+) -> tuple[str | None, Path | None]:
+    """Locate `transcript_full.jsonl` (fallback `transcript.jsonl`) safely inside Antigravity brain roots."""
+    roots = [r for r in resolve_antigravity_brain_roots() if r.is_dir()]
+    if not roots:
+        return None, None
+    cands: list[str] = []
+    for c in conv_ids:
+        cs = str(c or "").strip()
+        if cs and _CONV_ID_RE.match(cs) and cs not in cands:
+            cands.append(cs)
+    for cid in cands:
+        for root in roots:
+            logs_dir = root / cid / ".system_generated" / "logs"
+            for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                fpath = logs_dir / fname
+                if store.is_path_within(fpath, [root]) and fpath.is_file():
+                    return cid, fpath
+    # Fallback: look up Swarm Coordinator subagent under primary conversation if stored coord_cid was missing/invalid.
+    for cid in _discover_coordinator_subagent_candidates(primary_cid):
+        if cid in cands or not _CONV_ID_RE.match(cid):
+            continue
+        for root in roots:
+            logs_dir = root / cid / ".system_generated" / "logs"
+            for fname in ("transcript_full.jsonl", "transcript.jsonl"):
+                fpath = logs_dir / fname
+                if store.is_path_within(fpath, [root]) and fpath.is_file():
+                    return cid, fpath
+    return None, None
+
+
+def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
+    """Parse an Antigravity JSONL transcript into Agent Chat messages and telemetry."""
+    messages: list[dict[str, Any]] = []
+    pending_tools: list[tuple[str, str]] = []
+    model_name: str | None = None
+    pure_in_sum = 0
+    cached_in_sum = 0
+    out_sum = 0
+    last_ctx_used = 0
+    planner_steps = 0
+    tool_calls_count = 0
+    first_ts_ms: int | None = None
+    last_ts_ms: int | None = None
+    prev_ready_ms: int | None = None
+    llm_active_ms = 0
+    last_step_status = ""
+    last_id = 0
+    live_active = False
+    live_transcript = ""
+    live_reasoning = ""
+    live_tool_calls: list[dict[str, Any]] = []
+    live_tool_trace: list[dict[str, Any]] = []
+    live_current_tool: dict[str, Any] | None = None
+    live_recent_tools: list[str] = []
+
+    def _empty_live() -> dict[str, Any]:
+        return {
+            "active": False,
+            "transcript": "",
+            "reasoning": "",
+            "toolCalls": [],
+            "toolTrace": [],
+            "currentTool": None,
+            "recentTools": [],
+        }
+
+    def _clear_live() -> None:
+        nonlocal live_active, live_transcript, live_reasoning, live_tool_calls, live_tool_trace, live_current_tool
+        live_active = False
+        live_transcript = ""
+        live_reasoning = ""
+        live_tool_calls = []
+        live_tool_trace = []
+        live_current_tool = None
+
     try:
-        rows = con.execute(f"PRAGMA table_info({table})").fetchall()
-        return {str(r[1]) for r in rows if len(r) > 1}
+        raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return {
+            "messages": [],
+            "model": None,
+            "provider": None,
+            "tokens": {},
+            "tps": 0.0,
+            "steps": 0,
+            "toolCalls": 0,
+            "elapsedMs": 0,
+            "llmActiveMs": 0,
+            "lastStatus": "",
+            "live": _empty_live(),
+        }
+
+    for line_idx, raw_line in enumerate(raw_lines):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            step = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(step, dict):
+            continue
+
+        raw_si = step.get("step_index")
+        try:
+            step_idx = int(raw_si) if raw_si is not None else line_idx
+        except (TypeError, ValueError):
+            step_idx = line_idx
+
+        step_type = str(step.get("type") or "").strip().upper()
+        step_status = str(step.get("status") or "").strip().upper()
+        last_step_status = step_status
+        created_at = step.get("created_at")
+        ts_ms = _normalize_epoch_ms(created_at)
+        if ts_ms is not None:
+            if first_ts_ms is None or ts_ms < first_ts_ms:
+                first_ts_ms = ts_ms
+            if last_ts_ms is None or ts_ms > last_ts_ms:
+                last_ts_ms = ts_ms
+            if prev_ready_ms is None:
+                prev_ready_ms = ts_ms
+
+        step_model = str(step.get("model") or "").strip()
+        if step_model:
+            model_name = step_model
+
+        if step_type == "SYSTEM_MESSAGE":
+            _clear_live()
+            msg_id = max(last_id + 1, step_idx + 1)
+            last_id = msg_id
+            messages.append({
+                "id": msg_id,
+                "role": "system",
+                "timestamp": created_at,
+                "timestampMs": ts_ms,
+                "content": step.get("content") or "",
+                "reasoning": None,
+                "reasoningTokens": 0,
+                "toolCalls": [],
+                "toolName": None,
+                "toolCallId": None,
+                "compacted": False,
+            })
+        elif step_type == "USER_INPUT":
+            _clear_live()
+            msg_id = max(last_id + 1, step_idx + 1)
+            last_id = msg_id
+            messages.append({
+                "id": msg_id,
+                "role": "user",
+                "timestamp": created_at,
+                "timestampMs": ts_ms,
+                "content": step.get("content") or "",
+                "reasoning": None,
+                "reasoningTokens": 0,
+                "toolCalls": [],
+                "toolName": None,
+                "toolCallId": None,
+                "compacted": False,
+            })
+        elif step_type == "PLANNER_RESPONSE":
+            raw_tcs = step.get("tool_calls") if isinstance(step.get("tool_calls"), list) else []
+            tcs_out: list[dict[str, Any]] = []
+            for tc_i, tc in enumerate(raw_tcs):
+                if not isinstance(tc, dict):
+                    continue
+                tc_id = str(tc.get("id") or tc.get("tool_call_id") or f"s{step_idx}-tc{tc_i}")
+                tc_name = str(tc.get("name") or "tool")
+                tc_args = tc.get("args") if "args" in tc else (tc.get("arguments") or {})
+                tcs_out.append({
+                    "id": tc_id,
+                    "toolCallId": tc_id,
+                    "name": tc_name,
+                    "arguments": tc_args,
+                })
+
+            if step_status == "RUNNING":
+                live_active = True
+                live_transcript = str(step.get("content") or "")
+                live_reasoning = str(step.get("thinking") or step.get("reasoning") or "")
+                live_tool_calls = list(tcs_out)
+                live_tool_trace = [
+                    {
+                        "event": "tool_use",
+                        "name": tc["name"],
+                        "tool_call_id": tc["id"],
+                        "toolCallId": tc["id"],
+                        "arguments": tc["arguments"],
+                    }
+                    for tc in tcs_out
+                ]
+                if tcs_out:
+                    last_tc = tcs_out[-1]
+                    live_current_tool = {
+                        "name": last_tc["name"],
+                        "preview": _format_tool_preview(last_tc["name"], last_tc["arguments"]),
+                        "startedAt": created_at,
+                    }
+                    for tc in tcs_out:
+                        if tc["name"] and (not live_recent_tools or live_recent_tools[-1] != tc["name"]):
+                            live_recent_tools.append(tc["name"])
+                    live_recent_tools = live_recent_tools[-8:]
+                else:
+                    live_current_tool = None
+                continue
+
+            _clear_live()
+            is_err = step_status in ("ERROR", "INVALID") or bool(step.get("error"))
+            err_detail = str(step.get("error") or "").strip()
+            content_val = step.get("content") or ""
+            if not str(content_val).strip() and err_detail:
+                content_val = err_detail if err_detail.lower().startswith("error") else f"Error: {err_detail}"
+            reasoning_val = step.get("thinking") or step.get("reasoning") or None
+            if is_err and not str(content_val).strip() and not reasoning_val and not tcs_out:
+                continue
+
+            planner_steps += 1
+            if ts_ms is not None and prev_ready_ms is not None and ts_ms >= prev_ready_ms:
+                llm_active_ms += ts_ms - prev_ready_ms
+            if ts_ms is not None:
+                prev_ready_ms = ts_ms
+
+            s_in = max(0, int(step.get("input_tokens") or 0))
+            s_cached = max(0, int(step.get("cache_read_tokens") or 0))
+            s_out = max(0, int(step.get("output_tokens") or 0))
+            pure_in_sum += s_in
+            cached_in_sum += s_cached
+            out_sum += s_out
+            if (s_in + s_cached + s_out) > 0:
+                last_ctx_used = s_in + s_cached + s_out
+
+            for tc in tcs_out:
+                pending_tools.append((tc["id"], tc["name"]))
+                tool_calls_count += 1
+                if tc["name"] and (not live_recent_tools or live_recent_tools[-1] != tc["name"]):
+                    live_recent_tools.append(tc["name"])
+            live_recent_tools = live_recent_tools[-8:]
+
+            msg_id = max(last_id + 1, step_idx + 1)
+            last_id = msg_id
+            msg_entry: dict[str, Any] = {
+                "id": msg_id,
+                "role": "assistant",
+                "timestamp": created_at,
+                "timestampMs": ts_ms,
+                "content": content_val,
+                "reasoning": reasoning_val,
+                "reasoningTokens": 0,
+                "toolCalls": tcs_out,
+                "toolName": None,
+                "toolCallId": None,
+                "compacted": False,
+            }
+            if is_err:
+                msg_entry["status"] = "error"
+                msg_entry["isError"] = True
+            messages.append(msg_entry)
+        elif step_type == "GENERIC":
+            tc_id, tc_name = pending_tools.pop(0) if pending_tools else (f"s{step_idx}-tool", "tool")
+            if step_status == "RUNNING":
+                live_active = True
+                live_current_tool = {
+                    "name": tc_name,
+                    "preview": "",
+                    "startedAt": created_at,
+                }
+                if not any((x.get("toolCallId") or x.get("id")) == tc_id for x in live_tool_trace):
+                    live_tool_trace.append({
+                        "event": "tool_use",
+                        "name": tc_name,
+                        "tool_call_id": tc_id,
+                        "toolCallId": tc_id,
+                        "arguments": "",
+                    })
+                if tc_name and (not live_recent_tools or live_recent_tools[-1] != tc_name):
+                    live_recent_tools.append(tc_name)
+                live_recent_tools = live_recent_tools[-8:]
+                continue
+
+            raw_content = str(step.get("content") or "")
+            comp_ms: int | None = None
+            m_comp = _TRANSCRIPT_COMPLETED_AT_RE.search(raw_content[:300])
+            if m_comp:
+                comp_ms = _normalize_epoch_ms(m_comp.group(1))
+            if comp_ms is not None:
+                if last_ts_ms is None or comp_ms > last_ts_ms:
+                    last_ts_ms = comp_ms
+                prev_ready_ms = comp_ms
+            elif ts_ms is not None:
+                prev_ready_ms = ts_ms
+
+            is_err = step_status in ("ERROR", "INVALID") or bool(step.get("error"))
+            msg_id = max(last_id + 1, step_idx + 1)
+            last_id = msg_id
+            messages.append({
+                "id": msg_id,
+                "role": "tool",
+                "timestamp": created_at,
+                "timestampMs": comp_ms or ts_ms,
+                "content": step.get("error") or raw_content,
+                "reasoning": None,
+                "reasoningTokens": 0,
+                "toolCalls": [],
+                "toolName": tc_name,
+                "toolCallId": tc_id,
+                "status": "error" if is_err else "ok",
+                "compacted": False,
+            })
+        elif step_type == "ERROR_MESSAGE":
+            if step_status == "RUNNING":
+                continue
+            _clear_live()
+            err_raw = str(step.get("content") or "").strip()
+            err_detail = str(step.get("error") or "").strip()
+            if not err_raw and err_detail:
+                err_raw = err_detail if err_detail.lower().startswith("error") else f"Error: {err_detail}"
+            if not err_raw:
+                continue
+            msg_id = max(last_id + 1, step_idx + 1)
+            last_id = msg_id
+            messages.append({
+                "id": msg_id,
+                "role": "assistant",
+                "timestamp": created_at,
+                "timestampMs": ts_ms,
+                "content": err_raw,
+                "reasoning": None,
+                "reasoningTokens": 0,
+                "toolCalls": [],
+                "toolName": None,
+                "toolCallId": None,
+                "status": "error",
+                "isError": True,
+                "stepType": "ERROR_MESSAGE",
+                "compacted": False,
+            })
+
+    elapsed_ms = max(0, last_ts_ms - first_ts_ms) if (first_ts_ms is not None and last_ts_ms is not None) else 0
+    ctx_limit = _resolve_context_limit(model_name, None, None)
+    tokens = _normalize_tokens_dict(
+        {
+            "uncachedInput": pure_in_sum,
+            "cacheRead": cached_in_sum,
+            "output": out_sum,
+        },
+        context_used=last_ctx_used,
+        context_limit=ctx_limit,
+    )
+    tps_ms = llm_active_ms if llm_active_ms >= 250 else elapsed_ms
+    tps = _compute_tps(out_sum, tps_ms)
+    return {
+        "messages": messages,
+        "model": model_name,
+        "provider": "antigravity" if model_name else None,
+        "tokens": tokens,
+        "tps": tps,
+        "steps": planner_steps,
+        "toolCalls": tool_calls_count,
+        "elapsedMs": elapsed_ms,
+        "llmActiveMs": llm_active_ms,
+        "lastStatus": last_step_status,
+        "live": {
+            "active": live_active,
+            "transcript": live_transcript,
+            "reasoning": live_reasoning,
+            "toolCalls": live_tool_calls,
+            "toolTrace": live_tool_trace,
+            "currentTool": live_current_tool,
+            "recentTools": live_recent_tools,
+        },
+    }
+
+
+def extract_antigravity_transcript_summary(
+    conv_ids: list[str],
+    *,
+    primary_cid: str | None = None,
+) -> dict[str, Any]:
+    """Read Antigravity transcript summary (model, tokens, tps, steps, toolCalls) for Coordinator."""
+    resolved_cid, log_path = _resolve_antigravity_transcript_file(conv_ids, primary_cid=primary_cid)
+    if log_path is None:
+        return {}
+    parsed = _parse_antigravity_transcript(log_path)
+    parsed["conversationId"] = resolved_cid
+    parsed.pop("messages", None)
+    parsed.pop("live", None)
+    return parsed
+
+
+def _sqlite_table_columns(
+    con: sqlite3.Connection,
+    table: str,
+    *,
+    db_path: Path | None = None,
+    schema_version: int | None = None,
+) -> set[str]:
+    clean_table = re.sub(r"[^A-Za-z0-9_]", "", str(table or ""))
+    if not clean_table:
+        return set()
+    cache_key: tuple[str, str] | None = None
+    ver = schema_version
+    if db_path is not None:
+        try:
+            cache_key = (os.path.normcase(os.path.realpath(str(db_path))), clean_table)
+        except OSError:
+            cache_key = (os.path.normcase(str(db_path)), clean_table)
+        if ver is None:
+            try:
+                ver_row = con.execute("PRAGMA schema_version").fetchone()
+                ver = int(ver_row[0]) if ver_row is not None else -1
+            except sqlite3.Error:
+                ver = -1
+        with _SQLITE_SCHEMA_CACHE_LOCK:
+            cached = _SQLITE_SCHEMA_CACHE.get(cache_key)
+            if cached is not None and cached[0] == ver and cached[1]:
+                return set(cached[1])
+    try:
+        rows = con.execute(f"PRAGMA table_info({clean_table})").fetchall()
+        cols = {str(r[1]) for r in rows if len(r) > 1}
+        if cache_key is not None and cols:
+            with _SQLITE_SCHEMA_CACHE_LOCK:
+                if len(_SQLITE_SCHEMA_CACHE) > 64:
+                    _SQLITE_SCHEMA_CACHE.clear()
+                _SQLITE_SCHEMA_CACHE[cache_key] = (ver if ver is not None else -1, set(cols))
+        return cols
     except sqlite3.Error:
         return set()
 
@@ -4265,7 +5037,7 @@ def query_member_session_history(
     subagent_session_id: str | None = None,
     runtime: SwarmRuntime | None = None,
 ) -> dict[str, Any]:
-    """Read paginated message history and live telemetry for a swarm worker (or its Tier-3 subagent)."""
+    """Read paginated message history and live telemetry for a swarm member (Coordinator, worker, or Tier-3 subagent)."""
     clamped_limit = max(1, min(300, int(limit or 100)))
     since_id = max(0, int(after_id or 0))
     before_val = max(0, int(before_id or 0))
@@ -4289,6 +5061,130 @@ def query_member_session_history(
         if hit_name and isinstance(hit_rec, dict):
             canonical_name = hit_name
             member_rec = hit_rec
+
+    is_coordinator = (
+        canonical_name.lower() == models.Role.COORDINATOR.value
+        or str(member_rec.get("role") or "").strip().lower() == models.Role.COORDINATOR.value
+    )
+    if is_coordinator:
+        coord_cid = str(meta_coord or member_rec.get("conversationId") or "").strip()
+        board_killed = bool(member_rec.get("killed")) or str(member_rec.get("state") or "").strip().lower() == models.MemberState.KILLED.value
+        worker_state = _normalize_member_history_state(member_rec.get("state") or "working", killed=board_killed)
+        req_sub = str(subagent_session_id or "").strip()
+        if req_sub:
+            return {
+                "ok": True,
+                "swarm": sid,
+                "swarmId": sid,
+                "primaryConversationId": meta_primary,
+                "coordinatorConversationId": meta_coord,
+                "conversationId": meta_primary or meta_coord,
+                "conversationIds": meta_conv_ids,
+                "member": canonical_name or models.Role.COORDINATOR.value,
+                "sessionId": None,
+                "parentSessionId": coord_cid or None,
+                "messages": [],
+                "hasMore": False,
+                "totalCount": 0,
+                "lastId": since_id,
+                "tokens": {},
+                "tps": 0.0,
+                "tpsEstimated": False,
+                "currentTool": None,
+                "state": worker_state,
+                "model": member_rec.get("model"),
+                "provider": member_rec.get("provider"),
+                "workspace": swarm_meta.get("workspace"),
+                "workdir": member_rec.get("workdir") or swarm_meta.get("workspace"),
+                "worktreePath": None,
+                "worktreeBranch": None,
+                "subagents": [],
+                "subagentRejected": True,
+                "live": {
+                    "active": False,
+                    "transcript": "",
+                    "reasoning": "",
+                    "currentTool": None,
+                    "recentTools": [],
+                    "toolTrace": [],
+                    "startedAt": None,
+                    "elapsedMs": 0,
+                },
+            }
+
+        resolved_cid, log_path = _resolve_antigravity_transcript_file(
+            [c for c in (coord_cid, str(member_rec.get("conversationId") or "")) if c],
+            primary_cid=meta_primary,
+        )
+        parsed = _parse_antigravity_transcript(log_path) if log_path is not None else {
+            "messages": [],
+            "model": None,
+            "provider": None,
+            "tokens": {},
+            "tps": 0.0,
+            "steps": 0,
+            "toolCalls": 0,
+            "elapsedMs": 0,
+            "llmActiveMs": 0,
+            "lastStatus": "",
+        }
+        all_msgs: list[dict[str, Any]] = parsed.get("messages") or []
+        total_count = len(all_msgs)
+        if before_val > 0:
+            cand = [m for m in all_msgs if int(m.get("id") or 0) < before_val]
+            has_more = len(cand) > clamped_limit
+            messages = cand[-clamped_limit:]
+        elif since_id > 0:
+            cand = [m for m in all_msgs if int(m.get("id") or 0) > since_id]
+            has_more = len(cand) > clamped_limit
+            messages = cand[:clamped_limit]
+        else:
+            has_more = len(all_msgs) > clamped_limit
+            messages = all_msgs[-clamped_limit:]
+        last_id = max(since_id, int(messages[-1]["id"])) if messages else since_id
+        coord_model = member_rec.get("model") or parsed.get("model")
+        coord_provider = member_rec.get("provider") or parsed.get("provider")
+        parsed_live = parsed.get("live") if isinstance(parsed.get("live"), dict) else {}
+        coord_live_active = bool(parsed_live.get("active")) or worker_state == "working"
+        return {
+            "ok": True,
+            "swarm": sid,
+            "swarmId": sid,
+            "primaryConversationId": meta_primary,
+            "coordinatorConversationId": resolved_cid or meta_coord,
+            "conversationId": meta_primary or resolved_cid or meta_coord,
+            "conversationIds": meta_conv_ids,
+            "member": canonical_name or models.Role.COORDINATOR.value,
+            "sessionId": resolved_cid or coord_cid or None,
+            "parentSessionId": resolved_cid or coord_cid or None,
+            "messages": messages,
+            "hasMore": has_more,
+            "totalCount": total_count,
+            "lastId": last_id,
+            "tokens": parsed.get("tokens") or {},
+            "tps": float(parsed.get("tps") or 0.0),
+            "tpsEstimated": False,
+            "currentTool": parsed_live.get("currentTool"),
+            "state": worker_state,
+            "model": coord_model,
+            "provider": coord_provider,
+            "workspace": swarm_meta.get("workspace"),
+            "workdir": member_rec.get("workdir") or swarm_meta.get("workspace"),
+            "worktreePath": None,
+            "worktreeBranch": None,
+            "subagents": [],
+            "live": {
+                "active": coord_live_active,
+                "transcript": str(parsed_live.get("transcript") or ""),
+                "reasoning": str(parsed_live.get("reasoning") or ""),
+                "toolCalls": list(parsed_live.get("toolCalls") or []),
+                "currentTool": parsed_live.get("currentTool"),
+                "recentTools": list(parsed_live.get("recentTools") or []),
+                "toolTrace": list(parsed_live.get("toolTrace") or []),
+                "startedAt": all_msgs[0].get("timestamp") if all_msgs else None,
+                "elapsedMs": int(parsed.get("elapsedMs") or 0),
+            },
+        }
 
     raw_tasks_doc = store.read_json_safe(paths.tasks_file, {})
     tasks_map = raw_tasks_doc.get("tasks") if isinstance(raw_tasks_doc, dict) else {}
@@ -4349,7 +5245,8 @@ def query_member_session_history(
     is_killed = board_killed or overlay_killed
     eff_task_state = (live_overlay.get("rawState") or live_overlay.get("state")) if live_overlay else (task_rec.get("status") or {}).get("state")
     worker_state = _normalize_member_history_state(member_rec.get("state"), killed=is_killed, task_state=eff_task_state)
-    worker_model = member_rec.get("model") or (live_overlay or {}).get("model") or wcfg.get("model")
+    worker_model = member_rec.get("model") or (live_overlay or {}).get("model") or meta.get("resolvedModel") or wcfg.get("model")
+    worker_provider = member_rec.get("provider") or meta.get("resolvedProvider") or wcfg.get("provider")
 
     req_sub = str(subagent_session_id or "").strip()
     if worker_state == "working" and not req_sub:
@@ -4372,6 +5269,10 @@ def query_member_session_history(
     subagent_rejected = False
     committed_use_ids: set[str] = set()
     committed_result_ids: set[str] = set()
+    last_asst_content = ""
+    last_asst_reasoning = ""
+    db_sess_model: str | None = None
+    db_sess_provider: str | None = None
 
     if req_sub and not hermes_session_id:
         target_session_id = None
@@ -4385,6 +5286,7 @@ def query_member_session_history(
     if hermes_session_id and db_path.is_file():
         con: sqlite3.Connection | None = None
         try:
+            db_st = db_path.stat()
             uri = f"{db_path.resolve().as_uri()}?mode=ro"
             con = sqlite3.connect(uri, uri=True, timeout=2.0)
             con.row_factory = sqlite3.Row
@@ -4394,10 +5296,17 @@ def query_member_session_history(
             except sqlite3.Error:
                 pass
 
-            sess_cols = _sqlite_table_columns(con, "sessions")
-            msg_cols = _sqlite_table_columns(con, "messages")
+            try:
+                sv_row = con.execute("PRAGMA schema_version").fetchone()
+                schema_ver = int(sv_row[0]) if sv_row is not None else -1
+            except sqlite3.Error:
+                schema_ver = -1
+
+            sess_cols = _sqlite_table_columns(con, "sessions", db_path=db_path, schema_version=schema_ver)
+            msg_cols = _sqlite_table_columns(con, "messages", db_path=db_path, schema_version=schema_ver)
 
             valid_sub_ids: set[str] = set()
+            now_s = time.time()
             if sess_cols and {"id", "parent_session_id", "source"}.issubset(sess_cols):
                 sess_select = [
                     "id",
@@ -4407,6 +5316,11 @@ def query_member_session_history(
                     "ended_at" if "ended_at" in sess_cols else "NULL AS ended_at",
                     "message_count" if "message_count" in sess_cols else "0 AS message_count",
                     "tool_call_count" if "tool_call_count" in sess_cols else "0 AS tool_call_count",
+                    "input_tokens" if "input_tokens" in sess_cols else "0 AS input_tokens",
+                    "output_tokens" if "output_tokens" in sess_cols else "0 AS output_tokens",
+                    "cache_read_tokens" if "cache_read_tokens" in sess_cols else "0 AS cache_read_tokens",
+                    "cache_write_tokens" if "cache_write_tokens" in sess_cols else "0 AS cache_write_tokens",
+                    "reasoning_tokens" if "reasoning_tokens" in sess_cols else "0 AS reasoning_tokens",
                     "model_config" if "model_config" in sess_cols else "NULL AS model_config",
                 ]
                 order_col = "started_at ASC" if "started_at" in sess_cols else "id ASC"
@@ -4432,13 +5346,49 @@ def query_member_session_history(
                         b_sub.get("state")
                         or (models.MemberState.DONE.value if sd.get("ended_at") is not None else models.MemberState.WORKING.value)
                     )
+                    sub_model = sd.get("model") or b_sub.get("model")
+                    sub_started = sd.get("started_at")
+                    sub_ended = sd.get("ended_at")
+                    if sub_started is not None:
+                        sub_el_ms = max(0, int(((float(sub_ended) if sub_ended is not None else now_s) - float(sub_started)) * 1000))
+                    else:
+                        sub_el_ms = max(0, int(b_sub.get("elapsedMs") or 0))
+                    s_in_raw = int(sd.get("input_tokens") or 0)
+                    s_out_raw = int(sd.get("output_tokens") or 0)
+                    s_cr_raw = int(sd.get("cache_read_tokens") or 0)
+                    s_cw_raw = int(sd.get("cache_write_tokens") or 0)
+                    s_reas_raw = int(sd.get("reasoning_tokens") or 0)
+                    if s_in_raw > 0 or s_out_raw > 0 or s_cr_raw > 0:
+                        sub_toks = _normalize_tokens_dict(
+                            {
+                                "input_tokens": s_in_raw,
+                                "uncachedInput": s_in_raw,
+                                "output_tokens": s_out_raw,
+                                "cache_read_tokens": s_cr_raw,
+                                "cache_write_tokens": s_cw_raw,
+                                "reasoning_tokens": s_reas_raw,
+                            },
+                            context_limit=_resolve_context_limit(sub_model, None, None),
+                        )
+                    elif isinstance(b_sub.get("tokens"), dict) and b_sub["tokens"]:
+                        sub_toks = _normalize_tokens_dict(
+                            b_sub["tokens"],
+                            context_limit=_resolve_context_limit(sub_model, None, None),
+                        )
+                    else:
+                        sub_toks = _normalize_tokens_dict({})
+                    sub_tps = float(b_sub.get("tps") or _compute_tps(int(sub_toks.get("output") or 0), sub_el_ms))
                     subagents.append({
                         "sessionId": s_id,
                         "label": label,
                         "title": title,
                         "state": sub_state,
                         "steps": steps,
-                        "model": sd.get("model") or b_sub.get("model"),
+                        "toolCalls": tc_cnt,
+                        "model": sub_model,
+                        "tokens": sub_toks,
+                        "elapsedMs": sub_el_ms,
+                        "tps": sub_tps,
                     })
 
                 # Also collect nested Tier-3 descendants within this worker's own subagent tree (depth-capped)
@@ -4466,12 +5416,33 @@ def query_member_session_history(
                     target_session_id = None
                     subagent_rejected = True
 
+            if target_session_id and sess_cols and "id" in sess_cols:
+                m_sel = [
+                    "model" if "model" in sess_cols else "NULL AS model",
+                    "billing_provider" if "billing_provider" in sess_cols else "NULL AS billing_provider",
+                    "model_config" if "model_config" in sess_cols else "NULL AS model_config",
+                ]
+                s_meta_row = con.execute(
+                    f"SELECT {', '.join(m_sel)} FROM sessions WHERE id = ?",
+                    (target_session_id,),
+                ).fetchone()
+                if s_meta_row is not None:
+                    db_sess_model = str(s_meta_row["model"] or "").strip() or None
+                    db_sess_provider = str(s_meta_row["billing_provider"] or "").strip() or None
+                    if not db_sess_provider and s_meta_row["model_config"]:
+                        mc_row = _safe_json_loads(s_meta_row["model_config"], {})
+                        gw_rt = mc_row.get("gateway_runtime") if isinstance(mc_row, dict) else None
+                        if isinstance(gw_rt, dict) and gw_rt.get("provider"):
+                            db_sess_provider = str(gw_rt["provider"]).strip() or None
+
+            db_max_id = 0
             if target_session_id and msg_cols and {"id", "session_id"}.issubset(msg_cols):
                 cnt_row = con.execute(
-                    "SELECT COUNT(*) AS cnt FROM messages WHERE session_id = ?",
+                    "SELECT COUNT(*) AS cnt, COALESCE(MAX(id), 0) AS max_id FROM messages WHERE session_id = ?",
                     (target_session_id,),
                 ).fetchone()
                 total_count = int(cnt_row["cnt"]) if cnt_row else 0
+                db_max_id = int(cnt_row["max_id"]) if cnt_row else 0
 
                 msg_select = [
                     "id",
@@ -4524,7 +5495,7 @@ def query_member_session_history(
                         reasoning_tokens = 0
                     t_calls = _safe_json_loads(md.get("tool_calls"), [])
                     raw_ts = md.get("timestamp")
-                    messages.append({
+                    msg_obj = {
                         "id": int(md["id"]),
                         "role": str(md.get("role") or ""),
                         "timestamp": raw_ts,
@@ -4536,37 +5507,141 @@ def query_member_session_history(
                         "toolName": md.get("tool_name"),
                         "toolCallId": md.get("tool_call_id"),
                         "compacted": bool(md.get("compacted")),
-                    })
+                    }
+                    messages.append(msg_obj)
+                    if msg_obj["role"] == "assistant":
+                        last_asst_content = str(msg_obj.get("content") or "").strip()
+                        last_asst_reasoning = str(msg_obj.get("reasoning") or "").strip()
                 if messages:
                     last_id = max(last_id, messages[-1]["id"])
 
-                # Collect ALL committed toolCallIds for target_session_id so live.toolTrace
-                # deduplicates cleanly even across incremental `after_id > 0` polls.
+                # Incremental-cached committed toolCallId tracking (avoids full-session scans on `after_id > 0` polls).
                 if live_overlay and live_overlay.get("active") and worker_state == "working" and not req_sub:
-                    if "tool_call_id" in msg_cols:
-                        for tr in con.execute(
-                            "SELECT DISTINCT tool_call_id FROM messages "
-                            "WHERE session_id = ? AND tool_call_id IS NOT NULL AND tool_call_id != ''",
+                    if not last_asst_content and not last_asst_reasoning and "role" in msg_cols:
+                        la_sel = [
+                            "content" if "content" in msg_cols else "NULL AS content",
+                            "reasoning" if "reasoning" in msg_cols else "NULL AS reasoning",
+                            "reasoning_content" if "reasoning_content" in msg_cols else "NULL AS reasoning_content",
+                        ]
+                        la_row = con.execute(
+                            f"SELECT {', '.join(la_sel)} FROM messages WHERE session_id = ? AND role = 'assistant' ORDER BY id DESC LIMIT 1",
                             (target_session_id,),
-                        ).fetchall():
-                            tid_val = str(tr["tool_call_id"] or "").strip()
-                            if tid_val:
-                                committed_result_ids.add(tid_val)
-                    if "tool_calls" in msg_cols:
-                        for tcr in con.execute(
-                            "SELECT tool_calls FROM messages "
-                            "WHERE session_id = ? AND tool_calls IS NOT NULL AND tool_calls != '' AND tool_calls != '[]'",
-                            (target_session_id,),
-                        ).fetchall():
-                            for tc_item in _safe_json_loads(tcr["tool_calls"], []):
-                                if not isinstance(tc_item, dict):
-                                    continue
-                                tc_cid = str(
-                                    tc_item.get("id") or tc_item.get("tool_call_id") or tc_item.get("toolCallId") or ""
-                                ).strip()
-                                if tc_cid:
-                                    committed_use_ids.add(tc_cid)
-        except sqlite3.Error:
+                        ).fetchone()
+                        if la_row is not None:
+                            last_asst_content = str(la_row["content"] or "").strip()
+                            last_asst_reasoning = str(la_row["reasoning"] or la_row["reasoning_content"] or "").strip()
+
+                    resolved_db_key = os.path.normcase(os.path.realpath(str(db_path)))
+                    tc_cache_key = (
+                        resolved_db_key,
+                        target_session_id,
+                        int(getattr(db_st, "st_ino", 0)),
+                    )
+                    with _COMMITTED_TC_CACHE_LOCK:
+                        cached_tc = _COMMITTED_TC_CACHE.get(tc_cache_key)
+                    cache_valid = False
+                    if cached_tc is not None:
+                        cached_cnt, cached_max_id, c_use, c_res = cached_tc
+                        if total_count == cached_cnt and db_max_id == cached_max_id:
+                            committed_use_ids.update(c_use)
+                            committed_result_ids.update(c_res)
+                            cache_valid = True
+                        elif total_count > cached_cnt and db_max_id > cached_max_id:
+                            delta_sel = [
+                                "id",
+                                "tool_call_id" if "tool_call_id" in msg_cols else "NULL AS tool_call_id",
+                                "tool_calls" if "tool_calls" in msg_cols else "NULL AS tool_calls",
+                            ]
+                            delta_rows = con.execute(
+                                f"SELECT {', '.join(delta_sel)} FROM messages WHERE session_id = ? AND id > ? ORDER BY id ASC",
+                                (target_session_id, cached_max_id),
+                            ).fetchall()
+                            if cached_cnt + len(delta_rows) == total_count:
+                                committed_use_ids.update(c_use)
+                                committed_result_ids.update(c_res)
+                                new_max_id = cached_max_id
+                                for dr in delta_rows:
+                                    dr_id = int(dr["id"] or 0)
+                                    if dr_id > new_max_id:
+                                        new_max_id = dr_id
+                                    tid_val = str(dr["tool_call_id"] or "").strip()
+                                    if tid_val:
+                                        committed_result_ids.add(tid_val)
+                                    for tc_item in _safe_json_loads(dr["tool_calls"], []):
+                                        if isinstance(tc_item, dict):
+                                            tc_cid = str(
+                                                tc_item.get("id") or tc_item.get("tool_call_id") or tc_item.get("toolCallId") or ""
+                                            ).strip()
+                                            if tc_cid:
+                                                committed_use_ids.add(tc_cid)
+                                with _COMMITTED_TC_CACHE_LOCK:
+                                    _COMMITTED_TC_CACHE[tc_cache_key] = (
+                                        total_count,
+                                        new_max_id,
+                                        set(committed_use_ids),
+                                        set(committed_result_ids),
+                                    )
+                                cache_valid = True
+                    if not cache_valid:
+                        if since_id == 0 and not has_more:
+                            new_max_id = 0
+                            for m_item in messages:
+                                mid = int(m_item.get("id") or 0)
+                                if mid > new_max_id:
+                                    new_max_id = mid
+                                tid_val = str(m_item.get("toolCallId") or "").strip()
+                                if tid_val:
+                                    committed_result_ids.add(tid_val)
+                                for tc_item in m_item.get("toolCalls") or []:
+                                    if isinstance(tc_item, dict):
+                                        tc_cid = str(
+                                            tc_item.get("id") or tc_item.get("tool_call_id") or tc_item.get("toolCallId") or ""
+                                        ).strip()
+                                        if tc_cid:
+                                            committed_use_ids.add(tc_cid)
+                            with _COMMITTED_TC_CACHE_LOCK:
+                                if len(_COMMITTED_TC_CACHE) > 128:
+                                    _COMMITTED_TC_CACHE.clear()
+                                _COMMITTED_TC_CACHE[tc_cache_key] = (
+                                    total_count,
+                                    max(new_max_id, db_max_id),
+                                    set(committed_use_ids),
+                                    set(committed_result_ids),
+                                )
+                        else:
+                            new_max_id = 0
+                            init_sel = [
+                                "id",
+                                "tool_call_id" if "tool_call_id" in msg_cols else "NULL AS tool_call_id",
+                                "tool_calls" if "tool_calls" in msg_cols else "NULL AS tool_calls",
+                            ]
+                            for ir in con.execute(
+                                f"SELECT {', '.join(init_sel)} FROM messages WHERE session_id = ? ORDER BY id ASC",
+                                (target_session_id,),
+                            ).fetchall():
+                                ir_id = int(ir["id"] or 0)
+                                if ir_id > new_max_id:
+                                    new_max_id = ir_id
+                                tid_val = str(ir["tool_call_id"] or "").strip()
+                                if tid_val:
+                                    committed_result_ids.add(tid_val)
+                                for tc_item in _safe_json_loads(ir["tool_calls"], []):
+                                    if isinstance(tc_item, dict):
+                                        tc_cid = str(
+                                            tc_item.get("id") or tc_item.get("tool_call_id") or tc_item.get("toolCallId") or ""
+                                        ).strip()
+                                        if tc_cid:
+                                            committed_use_ids.add(tc_cid)
+                            with _COMMITTED_TC_CACHE_LOCK:
+                                if len(_COMMITTED_TC_CACHE) > 128:
+                                    _COMMITTED_TC_CACHE.clear()
+                                _COMMITTED_TC_CACHE[tc_cache_key] = (
+                                    total_count,
+                                    max(new_max_id, db_max_id),
+                                    set(committed_use_ids),
+                                    set(committed_result_ids),
+                                )
+        except (sqlite3.Error, OSError):
             pass
         finally:
             if con is not None:
@@ -4575,21 +5650,46 @@ def query_member_session_history(
                 except Exception:
                     pass
 
+    if db_sess_model and not req_sub and not worker_model:
+        worker_model = db_sess_model
+    if db_sess_provider and not req_sub and not worker_provider:
+        worker_provider = db_sess_provider
+
     if subagent_rejected:
         tokens = {}
         tps = 0.0
         tps_estimated = False
         current_tool = None
     elif req_sub and target_session_id:
-        sub_toks, _, _ = _query_hermes_session_stats(target_session_id, model=worker_model)
-        tokens = sub_toks or {}
-        tps = 0.0
+        sub_toks, _, sub_extra = _query_hermes_session_stats(target_session_id, model=worker_model)
+        matched_sub = next((s for s in subagents if s.get("sessionId") == target_session_id), None)
+        tokens = sub_toks or (dict(matched_sub.get("tokens") or {}) if matched_sub else {})
+        if sub_extra.get("model"):
+            worker_model = sub_extra["model"]
+        elif matched_sub and matched_sub.get("model"):
+            worker_model = matched_sub["model"]
+        if sub_extra.get("billingProvider"):
+            worker_provider = sub_extra["billingProvider"]
+        sub_out_tok = int(tokens.get("output") or 0)
+        sub_started = sub_extra.get("startedAtEpoch")
+        sub_ended = sub_extra.get("endedAtEpoch")
+        if sub_started is not None:
+            sub_el = max(0, int(((float(sub_ended) if sub_ended is not None else time.time()) - float(sub_started)) * 1000))
+        elif matched_sub:
+            sub_el = int(matched_sub.get("elapsedMs") or 0)
+        else:
+            sub_el = 0
+        tps = float(matched_sub.get("tps") or 0.0) if (matched_sub and matched_sub.get("tps")) else _compute_tps(sub_out_tok, sub_el)
         tps_estimated = False
         current_tool = None
-    elif not tokens and target_session_id:
-        db_toks, _, _ = _query_hermes_session_stats(target_session_id, model=worker_model)
-        if db_toks:
+    elif target_session_id and (not tokens or not worker_model or not worker_provider):
+        db_toks, _, db_extra = _query_hermes_session_stats(target_session_id, model=worker_model, provider=worker_provider)
+        if not tokens and db_toks:
             tokens = db_toks
+        if not worker_model and db_extra.get("model"):
+            worker_model = db_extra["model"]
+        if not worker_provider and db_extra.get("billingProvider"):
+            worker_provider = db_extra["billingProvider"]
 
     is_main_live = bool(
         live_overlay
@@ -4614,10 +5714,16 @@ def query_member_session_history(
             if tc_id and not entry_copy.get("toolCallId"):
                 entry_copy["toolCallId"] = tc_id
             filtered_trace.append(entry_copy)
+        live_transcript_txt = str(live_overlay.get("transcript") or "")
+        live_reasoning_txt = str(live_overlay.get("reasoning") or "")
+        if live_transcript_txt.strip() and last_asst_content and live_transcript_txt.strip() == last_asst_content:
+            live_transcript_txt = ""
+        if live_reasoning_txt.strip() and last_asst_reasoning and live_reasoning_txt.strip() == last_asst_reasoning:
+            live_reasoning_txt = ""
         live_payload: dict[str, Any] = {
             "active": True,
-            "transcript": str(live_overlay.get("transcript") or ""),
-            "reasoning": str(live_overlay.get("reasoning") or ""),
+            "transcript": live_transcript_txt,
+            "reasoning": live_reasoning_txt,
             "currentTool": live_overlay.get("currentTool"),
             "recentTools": list(live_overlay.get("recentTools") or []),
             "toolTrace": filtered_trace,
@@ -4640,6 +5746,10 @@ def query_member_session_history(
             "elapsedMs": max(0, int((live_overlay or {}).get("elapsedMs") or act.get("elapsedMs") or 0)) if not req_sub else 0,
         }
 
+    member_workdir = member_rec.get("workdir") or wcfg.get("workdir") or swarm_meta.get("workspace")
+    member_worktree_path = meta.get("worktreePath") or member_rec.get("worktreePath")
+    member_worktree_branch = meta.get("worktreeBranch") or member_rec.get("worktreeBranch")
+
     result: dict[str, Any] = {
         "ok": True,
         "swarm": sid,
@@ -4661,6 +5771,11 @@ def query_member_session_history(
         "currentTool": current_tool,
         "state": worker_state,
         "model": worker_model,
+        "provider": worker_provider,
+        "workspace": swarm_meta.get("workspace"),
+        "workdir": member_workdir,
+        "worktreePath": member_worktree_path,
+        "worktreeBranch": member_worktree_branch,
         "subagents": subagents,
         "live": live_payload,
     }

@@ -716,12 +716,32 @@ def migrate_board_v1_to_v2(raw: dict[str, Any] | None, swarm_id: str) -> dict[st
 
     if isinstance(raw.get("plan"), dict):
         raw_plan = raw["plan"]
-        base["plan"] = {
+        raw_tasks = raw_plan.get("tasks")
+        if isinstance(raw_tasks, dict):
+            tasks_out: dict[str, Any] | list[dict[str, Any]] = {
+                str(k).strip(): (dict(v) if isinstance(v, dict) else str(v))
+                for k, v in raw_tasks.items()
+                if str(k).strip()
+            }
+        elif isinstance(raw_tasks, list):
+            tasks_out = [dict(t) for t in raw_tasks if isinstance(t, dict)]
+        else:
+            tasks_out = []
+        plan_out: dict[str, Any] = {
             "summary": str(raw_plan.get("summary") or ""),
             "threads": [dict(t) for t in (raw_plan.get("threads") or []) if isinstance(t, dict)],
-            "tasks": [dict(t) for t in (raw_plan.get("tasks") or []) if isinstance(t, dict)],
+            "tasks": tasks_out,
             "updatedAt": str(raw_plan.get("updatedAt") or base["plan"]["updatedAt"]),
         }
+        raw_goal = raw_plan.get("goal")
+        if isinstance(raw_goal, dict):
+            plan_out["goal"] = {
+                "title": str(raw_goal.get("title") or "").strip(),
+                "line": str(raw_goal.get("line") or "").strip(),
+            }
+        elif isinstance(raw_goal, str) and raw_goal.strip():
+            plan_out["goal"] = {"title": raw_goal.strip(), "line": ""}
+        base["plan"] = plan_out
 
     if isinstance(raw.get("pendingMentions"), dict):
         base["pendingMentions"] = {

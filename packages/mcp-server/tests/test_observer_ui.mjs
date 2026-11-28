@@ -1873,7 +1873,7 @@ test('Observer UI verifies alive telemetry strip, expandable recent tools, Tier-
       return { act, tel };
     });
     assert.ok(runningCheck.act.some((t) => t.includes('Running read_file(board_ui/hive.js:480-530)')), `Missing Overview currentTool: ${JSON.stringify(runningCheck)}`);
-    assert.ok(runningCheck.tel.some((t) => t.includes('65.4k tok') && t.includes('82 t/s')), `Missing Overview running telemetry: ${JSON.stringify(runningCheck)}`);
+    assert.ok(runningCheck.tel.some((t) => t.includes('65.4k proc') && t.includes('11.4k out') && t.includes('82 t/s')), `Missing Overview running telemetry: ${JSON.stringify(runningCheck)}`);
 
     if (saveShots) {
       await page.screenshot({ path: join(screenshotDir, 'overview_dark.png'), fullPage: true });
@@ -1903,7 +1903,7 @@ test('Observer UI verifies alive telemetry strip, expandable recent tools, Tier-
     });
     assert.ok(initialMembers.workingDotCount >= 3, `Expected working pulsing dots, got ${initialMembers.workingDotCount}`);
     assert.equal(initialMembers.toolPill, 'Running read_file(board_ui/hive.js:480-530)');
-    assert.deepEqual(initialMembers.metricsSpans, ['18 steps', '29 tools', '65.4k proc', '54.0k pure', '82 t/s', '65.4k/200k 33%', '$0.21']);
+    assert.deepEqual(initialMembers.metricsSpans, ['18 steps', '29 tools', '65.4k proc', '54.0k pure', '11.4k out', '82 t/s', '65.4k/200k 33%', '$0.21']);
     assert.equal(initialMembers.detailsExists, true);
     assert.equal(initialMembers.detailsOpen, false, '<details class="o2-tools"> must start CLOSED by default');
     assert.equal(initialMembers.summaryText, 'Recent activity (4)');
@@ -2328,6 +2328,20 @@ test('Phase-3 Observer UI: HEXD SVG, e.source guard, ov-system, ov-open-coord, N
       res.end(JSON.stringify(currentSnapshot));
       return;
     }
+    if (reqUrl.pathname === '/board/member/history') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        swarm: 'phase3-ui-swarm',
+        primaryConversationId: reqUrl.searchParams.get('conversationId') || 'conv-prim-p3',
+        member: reqUrl.searchParams.get('member') || 'coordinator',
+        state: 'waiting',
+        messages: [],
+        lastId: 0,
+        hasMore: false,
+      }));
+      return;
+    }
     res.writeHead(404);
     res.end('Not found');
   });
@@ -2416,12 +2430,15 @@ test('Phase-3 Observer UI: HEXD SVG, e.source guard, ov-system, ov-open-coord, N
     await page.waitForSelector('#ov-frame:not(.hidden) iframe[data-testid="swarm-overview-iframe"]', { timeout: 10000 });
     assert.equal(await page.evaluate(() => localStorage.getItem('swarm_board.narrator_plain')), '0');
 
-    // 3. ov-system & ov-open-coord (visible when plain=false / Narrator's page active)
+    // 3. ov-system & ov-open-coord (opens in-pane coordinator Agent Tab without calling toggleConversation)
     await page.waitForSelector('#ov-system:not(.hidden)', { timeout: 3000 });
     assert.match(await page.textContent('#ov-system'), /Action needed on Phase-3 check/);
     await page.waitForSelector('#ov-open-coord:not(.hidden)', { timeout: 3000 });
     await page.click('#ov-open-coord');
-    assert.deepEqual(await page.evaluate(() => window.__coordToggleCalls), ['conv-coord-p3']);
+    await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
+    assert.deepEqual(await page.evaluate(() => window.__coordToggleCalls), []);
+    await page.click('[data-close-agent="coordinator"]');
+    await page.waitForSelector('#tab-overview.active', { timeout: 3000 });
 
     // 4. Narrator NAVIGATE urlHosts & allowedFiles enforcement (fresh page at ?tab=overview so parentInputAt === -Infinity)
     async function triggerNavAction(btnSel) {
@@ -2767,7 +2784,7 @@ test('#161 regressions: anti-flicker Reconnecting recovery, honest telemetry, co
   const tempState = mkdtempSync(join(tmpdir(), 'hermes-ui-161-'));
   t.after(() => rmSync(tempState, { recursive: true, force: true }));
 
-  const screenshotDir = join(tempState, 'screenshots');
+  const screenshotDir = join(tempState, 'v5626_screenshots');
   mkdirSync(screenshotDir, { recursive: true });
 
   const nowMs = Date.now();
@@ -3706,7 +3723,7 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
   );
   assert.equal(await page.locator('#tab-agent.active').count(), 0);
 
-  // Clicking coordinator invokes window.sidecar.ui.toggleConversation when stubbed
+  // Clicking coordinator opens in-pane Agent Tab without calling toggleConversation; secondary Open Primary Chat opens primaryConversationId
   await page.click('#tabbtn-members');
   await page.waitForSelector('#tab-members.active');
   await page.evaluate(() => {
@@ -3719,8 +3736,11 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
     };
   });
   await page.click('#members [data-open-member="coordinator"]');
-  const toggledConvId = await page.evaluate(() => window.__toggledConvId);
-  assert.equal(toggledConvId, 'conv-v3-coord');
+  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
+  assert.equal(await page.evaluate(() => window.__toggledConvId), null, 'Clicking coordinator must NOT hijack to toggleConversation');
+  await page.waitForSelector('[data-ag-open-primary="conv-v3-primary"]', { timeout: 3000 });
+  await page.click('[data-ag-open-primary="conv-v3-primary"]');
+  assert.equal(await page.evaluate(() => window.__toggledConvId), 'conv-v3-primary');
 
   await context.close();
   const realFailed = obs.failedRequests.filter(
@@ -3734,6 +3754,7 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
   assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
   assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
 });
+
 test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrapped TASK, Worked for Xs, rich MD, epoch-sec timestamps, object currentTool, live tail scroll/details preservation, files changed, subagent switching, compacted, jump-to-live, zero textarea', async (t) => {
   const pw = await loadPlaywright();
   const executablePath = findBrowserExecutable();
@@ -3955,7 +3976,7 @@ test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrap
             '| :--- | ---: |',
             '| Markdown | pass |',
             '',
-            'See [safe docs](https://github.com/MAHDI-AQ/antigravity-hermes-bridge) and [bad](javascript:alert(1)).',
+            'See [safe docs](https://github.com/MAHDI-AQ/hermes-swarm) and [bad](javascript:alert(1)).',
             '',
             '```js',
             'const ok = true;',
@@ -4101,7 +4122,7 @@ test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrap
     assert.equal(checks.hasHr, true);
     assert.equal(checks.hasCodeBlock, true);
     assert.equal(checks.codeLang, 'js');
-    assert.deepEqual(checks.links, [{ href: 'https://github.com/MAHDI-AQ/antigravity-hermes-bridge', text: 'safe docs' }]);
+    assert.deepEqual(checks.links, [{ href: 'https://github.com/MAHDI-AQ/hermes-swarm', text: 'safe docs' }]);
     assert.equal(checks.has1970, false, 'Epoch-seconds timestamps must NEVER render as 1970');
     assert.equal(checks.footVisible, true, 'TASK_STATE_WORKING must normalize to working and show live foot');
     assert.equal(checks.footText.includes('[object Object]'), false, 'currentTool object must not render [object Object]');
@@ -4109,7 +4130,7 @@ test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrap
     assert.equal(checks.liveTailVisible, true);
     assert.equal(checks.liveHasUnclosedFenceCode, true, 'Unclosed streaming fence must still render codeblock cleanly');
     assert.equal(checks.liveDedupHit, false, 'Committed toolCallId must be deduplicated from live.toolTrace');
-    assert.match(checks.filesChangedSummary, /3 files changed/);
+    assert.match(checks.filesChangedSummary, /1 file changed/);
     assert.deepEqual(checks.openFileBtns, ['board_ui/app.js'], 'Only validated workspace-root path may be clickable; ../../etc/passwd and sibling prefix demo-img2-evil must not');
 
     // Expand "Worked for 15s" and verify oversized output is truncated cleanly, then scroll up and verify preservation across live ticks!
@@ -4207,4 +4228,825 @@ test('Image-2 parity worker chat view: dark/light themes, root & subpath, unwrap
   await runImg2Suite(`${sidecarProc.baseUrl}/?conversationId=conv-img2-primary`, sidecarProc.baseUrl, 'dark');
   await runImg2Suite(`http://127.0.0.1:${proxyPort}${SUBPATH_PREFIX}/?conversationId=conv-img2-primary`, `http://127.0.0.1:${proxyPort}`, 'light');
   assert.deepEqual(proxy.proxyLeaks, [], `Subpath proxy leaks: ${JSON.stringify(proxy.proxyLeaks)}`);
+});
+
+test('UI/UX hardening: coordinator in-pane tab, resetSwarm(), Mentions node click, #agent-live-tail dedup & <details> stability, workspace-scoped filesChanged, model badges, cleanAssignment, Board/Members/Raw/420px', async (t) => {
+  const pw = await loadPlaywright();
+  const executablePath = findBrowserExecutable();
+  const browser = await pw.chromium.launch({
+    headless: true,
+    args: ['--no-proxy-server', '--proxy-bypass-list=<-loopback>'],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  t.after(() => browser.close());
+
+  const tempState = mkdtempSync(join(tmpdir(), 'hermes-ux-hardening-'));
+  t.after(() => rmSync(tempState, { recursive: true, force: true }));
+
+  const baseMs = 1795820000000;
+  let commitLiveTool = false;
+  let livePollCountA = 0;
+  let workerHistoryPollsConvA = 0;
+
+  const snapA = {
+    swarm: 'swarm-ux-a',
+    id: 'swarm-ux-a',
+    etag: 'ux-a-1',
+    head: 4,
+    title: 'UX Hardening Swarm A',
+    dir: 'C:\\Projects\\taskflow-demo',
+    workspace: 'C:/Projects/taskflow-demo',
+    primaryConversationId: 'conv-ux-primary-a',
+    coordinatorConversationId: 'conv-ux-coord-fake',
+    builtinOverview: true,
+    meta: {
+      swarmId: 'swarm-ux-a',
+      title: 'UX Hardening Swarm A',
+      workspace: 'C:/Projects/taskflow-demo',
+      primaryConversationId: 'conv-ux-primary-a',
+      coordinatorConversationId: 'conv-ux-coord-fake',
+    },
+    plan: {
+      goal: { title: 'Harden Swarm UI', line: 'Verify all P0/P1/P2 UI fixes' },
+      threads: [
+        { id: 't-features', title: 'Core Features', workstreams: ['store-dev', 'cli-dev', 'verifier'], state: 'running' },
+      ],
+      tasks: {
+        'store-dev': { title: 'Implement task store', status: 'active', assignee: 'store-dev', note: '65/100 tests' },
+        'cli-dev': { title: 'Implement CLI commands', status: 'active', assignee: 'cli-dev' },
+        verifier: {
+          title: 'verifier in this Hermes swarm (swarm_id: 737e69ed-0042-4d71-8d92-6242a30408a9, workdir: C:\\sandbox\\Proj…',
+          status: 'active',
+          assignee: 'verifier',
+        },
+      },
+    },
+    channels: [
+      { name: 'main', topic: 'Main' },
+      { name: 'dev', topic: 'Dev' },
+    ],
+    members: [
+      {
+        name: 'coordinator',
+        role: 'coordinator',
+        status: 'working',
+        model: 'google/gemini-4-hydrogen-medium',
+        conversationId: 'conv-ux-coord-fake',
+        steps: 5,
+        posts: 2,
+        tokens: { totalProcessed: 42000, pureInput: 10000, cachedInput: 30000, output: 2000, contextUsed: 42000, contextLimit: 1048576 },
+        tps: 64.0,
+        now: 'Coordinating UX hardening',
+        subagents: [],
+      },
+      {
+        name: 'store-dev',
+        role: 'worker',
+        status: 'working',
+        model: 'anthropic/claude-sonnet-4-medium',
+        workspace: 'C:/Projects/taskflow-demo',
+        steps: 8,
+        posts: 1,
+        tokens: { totalProcessed: 120000, pureInput: 25000, cachedInput: 90000, output: 5000, contextUsed: 120000, contextLimit: 200000 },
+        tps: 55.2,
+        assignment: "You are `store-dev` in this Hermes swarm (`swarm_id`: `swarm-ux-a`, `workdir`: `C:/Projects/taskflow-demo`).\nOwnership & Locks: taskflow/store.py\nTask: Implement persistent JSON task store",
+        now: 'Implementing store.py',
+        subagents: [
+          {
+            id: 'sub-ux-1',
+            sessionId: 'sub-ux-1',
+            name: 'edge-auditor',
+            task: 'Check edge cases',
+            status: 'working',
+            model: 'google/gemini-2.5-flash-high',
+            steps: 3,
+            tokens: { totalProcessed: 9400, pureInput: 7200, output: 2200 },
+            tps: 88.5,
+          },
+        ],
+      },
+      {
+        name: 'cli-dev',
+        role: 'worker',
+        status: 'working',
+        model: 'openai/gpt-5.4-codex-high',
+        workspace: 'C:/Projects/taskflow-demo',
+        steps: 4,
+        posts: 1,
+        tokens: { totalProcessed: 35000, pureInput: 12000, cachedInput: 20000, output: 3000 },
+        tps: 41.0,
+        now: 'Building CLI',
+        subagents: [],
+      },
+      {
+        name: 'verifier',
+        role: 'worker',
+        status: 'waiting',
+        model: 'qwen3-coder-30b',
+        workspace: 'C:/Projects/taskflow-demo',
+        assignment: "You are `verifier` in this Hermes swarm (`swarm_id`: `737e69ed-0042-4d71-8d92-6242a30408a9`, `workdir`: `C:\\Projects\\taskflow-demo`).\nTask: Run pytest suite and verify parity",
+        now: 'Ready to verify',
+        subagents: [],
+      },
+    ],
+    messages: [
+      { seq: 1, id: 'ux-1', agent: 'coordinator', sender: 'coordinator', type: 'post', channel: 'main', text: '@store-dev @cli-dev Start UX wave', mentions: ['store-dev', 'cli-dev'], ts: baseMs },
+      { seq: 2, id: 'ux-2', agent: 'store-dev', sender: 'store-dev', type: 'decision', channel: 'dev', text: '@coordinator Store contract ready', mentions: ['coordinator'], files: ['taskflow/store.py'], ts: baseMs + 10000 },
+      { seq: 3, id: 'ux-3', agent: 'cli-dev', sender: 'cli-dev', type: 'handoff', channel: 'main', text: '@verifier CLI ready for check', mentions: ['verifier'], ts: baseMs + 20000 },
+      { seq: 4, id: 'ux-4', agent: 'verifier', sender: 'verifier', type: 'blocker', channel: 'main', text: 'Found contrast gap', mentions: [], ts: baseMs + 30000 },
+    ],
+    raw: {
+      board: JSON.stringify({ swarm: 'swarm-ux-a', head: 4 }, null, 2),
+      meta: '',
+    },
+  };
+
+  const snapB = {
+    swarm: 'swarm-ux-b',
+    id: 'swarm-ux-b',
+    etag: 'ux-b-1',
+    head: 1,
+    title: 'Swarm B Clean Reset',
+    primaryConversationId: 'conv-ux-primary-b',
+    members: [
+      { name: 'coordinator', role: 'coordinator', status: 'waiting', posts: 1, subagents: [] },
+    ],
+    messages: [
+      { seq: 1, id: 'b-1', agent: 'coordinator', sender: 'coordinator', type: 'post', channel: 'main', text: 'Fresh swarm B', ts: baseMs + 60000 },
+    ],
+  };
+
+  const upstreamServer = createServer((req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    const conv = reqUrl.searchParams.get('conversationId') || 'conv-ux-primary-a';
+    if (reqUrl.pathname === '/board') {
+      const s = conv === 'conv-ux-primary-b' ? snapB : snapA;
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: s.etag });
+      res.end(JSON.stringify(s));
+      return;
+    }
+    if (reqUrl.pathname === '/board/member/history') {
+      const member = reqUrl.searchParams.get('member') || 'store-dev';
+      const subId = reqUrl.searchParams.get('subagent_session_id') || '';
+      if (conv === 'conv-ux-primary-a' && member === 'store-dev') workerHistoryPollsConvA += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (member === 'coordinator') {
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'swarm-ux-a',
+          primaryConversationId: conv,
+          member: 'coordinator',
+          state: 'working',
+          model: 'google/gemini-4-hydrogen-medium',
+          tokens: {}, // Deliberately empty {} to test fallback to member.tokens
+          messages: [
+            { id: 1, role: 'user', content: 'Build taskflow', timestamp: baseMs },
+            { id: 2, role: 'assistant', reasoning: 'Planning waves carefully', content: 'Dispatched workers.', timestamp: baseMs + 6000 },
+          ],
+          lastId: 2,
+          hasMore: false,
+        }));
+        return;
+      }
+      if (subId === 'sub-ux-1') {
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'swarm-ux-a',
+          primaryConversationId: conv,
+          member,
+          state: 'working',
+          model: 'google/gemini-2.5-flash-high',
+          tokens: {},
+          messages: [
+            { id: 90, role: 'assistant', content: 'Subagent checking edge cases', timestamp: baseMs + 4000 },
+          ],
+          lastId: 90,
+          hasMore: false,
+        }));
+        return;
+      }
+      livePollCountA += 1;
+      const baseMsgs = [
+        {
+          id: 10,
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: '[SYSTEM / ROLE]\nSystem brief line\n[TASK]\nFake nested task header inside brief\n\n[TASK]\nImplement store.py cleanly',
+            },
+          ],
+          timestamp: baseMs,
+        },
+        {
+          id: 20,
+          role: 'assistant',
+          content: 'Step 1 complete.',
+          toolCalls: [
+            { id: 'tc-ws-1', name: 'write_file', arguments: JSON.stringify({ path: 'C:\\Projects\\taskflow-demo\\taskflow\\store.py', content: 'line1\nline2\n' }) },
+            { id: 'tc-ws-2', name: 'edit_file', arguments: JSON.stringify({ path: 'taskflow/store.py', old_string: 'line1\n', new_string: 'line1_new\nline1_extra\n' }) },
+            { id: 'tc-scratch', name: 'write_file', arguments: JSON.stringify({ path: 'C:/sandbox/AppData/Local/hermes/cache/scratch/store_probe.py', content: 'probe\n'.repeat(26) }) },
+          ],
+          timestamp: baseMs + 1000,
+        },
+        { id: 21, role: 'tool', toolCallId: 'tc-ws-1', toolName: 'write_file', content: '{"ok":true}', timestamp: baseMs + 1500 },
+        { id: 22, role: 'tool', toolCallId: 'tc-ws-2', toolName: 'edit_file', content: '{"ok":true}', timestamp: baseMs + 2000 },
+        { id: 23, role: 'tool', toolCallId: 'tc-scratch', toolName: 'write_file', content: '{"ok":true}', timestamp: baseMs + 2100 },
+        {
+          id: 30,
+          role: 'assistant',
+          reasoning: 'Final verification reasoning.',
+          content: 'Step 2 complete.',
+          timestamp: baseMs + 7000, // 5s after prevEndMs (2000) -> Worked for 5s!
+        },
+      ];
+      if (commitLiveTool) {
+        baseMsgs.push(
+          {
+            id: 40,
+            role: 'assistant',
+            toolCalls: [{ id: 'tc-live-to-commit', name: 'terminal', arguments: JSON.stringify({ command: 'pytest -q' }) }],
+            timestamp: baseMs + 8000,
+          },
+          { id: 41, role: 'tool', toolCallId: 'tc-live-to-commit', toolName: 'terminal', content: '10 passed', timestamp: baseMs + 9000 },
+        );
+      }
+      res.end(JSON.stringify({
+        ok: true,
+        swarm: 'swarm-ux-a',
+        primaryConversationId: conv,
+        member,
+        workspace: 'C:/Projects/taskflow-demo',
+        state: 'working',
+        model: 'anthropic/claude-sonnet-4-medium',
+        tps: 55.2,
+        tokens: snapA.members[1].tokens,
+        subagents: snapA.members[1].subagents,
+        live: commitLiveTool
+          ? {
+              active: true,
+              elapsedMs: 1200,
+              currentTool: { name: 'swarm_wait', preview: 'since=4' },
+              transcript: 'Step 1 complete.\n\nStep 2 complete.', // Should dedupe to empty!
+              toolTrace: [],
+            }
+          : {
+              active: true,
+              elapsedMs: 1000 + livePollCountA * 300,
+              currentTool: { name: 'terminal', preview: 'pytest -q' },
+              reasoning: 'Running test suite now',
+              transcript: 'Step 1 complete.\n\nStep 2 complete.\n\nIn-flight live tail line!',
+              toolTrace: [
+                { toolCallId: 'tc-live-to-commit', name: 'terminal', preview: 'pytest -q', status: 'running' },
+              ],
+            },
+        messages: baseMsgs,
+        lastId: commitLiveTool ? 41 : 30,
+        hasMore: false,
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end('Not found');
+  });
+  const upstreamPort = await listenServer(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const sidecarProc = await spawnSidecarProcess({
+    HERMES_A2A_STATE_DIR: tempState,
+    HERMES_A2A_BOARD_URL: `http://127.0.0.1:${upstreamPort}`,
+    HERMES_SWARM_DISABLE_WAKEUP: '1',
+    ANTIGRAVITY_CONVERSATION_ID: 'conv-ux-primary-a',
+    SWARM_OVERVIEW: 'true',
+  });
+  t.after(() => sidecarProc.stop());
+
+  const context = await browser.newContext({ viewport: { width: 1120, height: 820 }, colorScheme: 'dark' });
+  const page = await context.newPage();
+  const obs = attachPageObservers(page, sidecarProc.baseUrl);
+
+  await page.goto(`${sidecarProc.baseUrl}/?conversationId=conv-ux-primary-a`, { waitUntil: 'networkidle' });
+  await page.waitForSelector('#board:not(.hidden)', { timeout: 10000 });
+  await page.evaluate(() => {
+    window.__toggledConvs = [];
+    window.sidecar = window.sidecar || {};
+    window.sidecar.ui = {
+      ...(window.sidecar.ui || {}),
+      toggleConversation: (cid) => window.__toggledConvs.push(cid),
+    };
+  });
+
+  // 1. Overview: cleanAssignment strips "verifier in this Hermes swarm...", parseProg allows 65/100, coordinator model badge, unified proc+out
+  await page.click('#tabbtn-overview');
+  await page.waitForSelector('#tab-overview.active');
+  const ovText = await page.textContent('#tab-overview');
+  assert.doesNotMatch(ovText, /in this Hermes swarm/i, 'Swarm preamble must be stripped in Overview');
+  assert.doesNotMatch(ovText, /737e69ed/, 'Raw swarm_id must be stripped in Overview');
+  assert.match(ovText, /gemini-4-hydrogen/, 'Coordinator model must appear in Overview');
+  assert.match(ovText, /65\/100/, 'parseProg must support denominators > 60');
+  assert.match(ovText, /120k proc · 5\.0k out/, 'Overview must show unified proc + out');
+
+  // Clicking .o2-lead opens coordinator in-pane Agent Tab (no toggleConversation call)
+  await page.click('#tab-overview .o2-lead');
+  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
+  assert.deepEqual(await page.evaluate(() => window.__toggledConvs), []);
+  const coordTabText = await page.textContent('#agent-header');
+  assert.match(coordTabText, /gemini-4-hydrogen/, 'Coordinator Agent Tab must show shortened model badge');
+  assert.match(coordTabText, /42\.0k proc/, 'Empty {} tokens must fall back to member.tokens');
+  assert.match(coordTabText, /2\.0k out/, 'Agent Tab header must show output tokens');
+  await page.click('[data-ag-open-primary="conv-ux-primary-a"]');
+  assert.deepEqual(await page.evaluate(() => window.__toggledConvs), ['conv-ux-primary-a']);
+  const coordWorkSummary = await page.textContent('#agent-committed details.ag-work-group > summary');
+  assert.match(coordWorkSummary, /Worked for 6s/, 'Reasoning-only reply must use prevEndMs fallback');
+  await page.click('[data-close-agent="coordinator"]');
+
+  // 2. Members: shortened model badges, empty-search state, Tier-3 subagent tokens/TPS
+  await page.click('#tabbtn-members');
+  await page.waitForSelector('#tab-members.active');
+  const membersCheck = await page.evaluate(() => {
+    const storeRow = document.querySelector('.o2-mrow[data-open-member="store-dev"]');
+    const coordRow = document.querySelector('.o2-mrow[data-open-member="coordinator"]');
+    return {
+      coordModel: coordRow?.querySelector('.o2-mts')?.textContent || '',
+      storeModel: storeRow?.querySelector('.o2-mts')?.textContent || '',
+      storeMetrics: storeRow?.querySelector('.o2-mmetrics')?.textContent || '',
+      subMeta: storeRow?.querySelector('.o2-sub-meta')?.textContent || '',
+    };
+  });
+  assert.match(membersCheck.coordModel, /gemini-4-hydrogen/);
+  assert.match(membersCheck.storeModel, /claude-sonnet-4/);
+  assert.equal(membersCheck.storeModel.includes('anthropic/'), false, 'Provider prefix must be shortened');
+  assert.match(membersCheck.storeMetrics, /5\.0k out/);
+  assert.match(membersCheck.subMeta, /gemini-2\.5-flash · 3 steps · 9\.4k proc · 89 t\/s/);
+
+  await page.fill('#members .o2-msin', 'no-such-worker-xyz');
+  await page.waitForFunction(() => document.querySelector('.o2-mempty')?.hidden === false, null, { timeout: 2000 });
+  await page.fill('#members .o2-msin', '');
+
+  // 3. Board: kind filter, expanded search, clickable @mention and .msg-author
+  await page.click('#tabbtn-feed');
+  await page.waitForSelector('#tab-feed.active');
+  await page.click('#f-toggle');
+  await page.selectOption('#f-kind', 'blocker');
+  assert.equal(await page.locator('#feed .msg').count(), 1);
+  await page.selectOption('#f-kind', '');
+  await page.fill('#f-search', 'taskflow/store.py');
+  await page.waitForFunction(() => document.querySelectorAll('#feed .msg').length === 1, null, { timeout: 2000 });
+  await page.fill('#f-search', '');
+  await page.waitForFunction(() => document.querySelectorAll('#feed .msg').length === 4, null, { timeout: 2000 });
+
+  await page.click('#feed .msg[data-seq="1"] .msg-author-btn');
+  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
+  await page.click('[data-close-agent="coordinator"]');
+
+  // 4. Mentions Graph: clicking worker .node and coordinator .node opens Agent Tab
+  await page.click('#tabbtn-graph');
+  await page.waitForSelector('#tab-graph.active');
+  await page.click('#gview-mentions');
+  await page.waitForSelector('#graph .node[data-member="store-dev"]', { timeout: 3000 });
+  await page.click('#graph .node[data-member="coordinator"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
+  await page.click('[data-close-agent="coordinator"]');
+
+  await page.click('#tabbtn-graph');
+  await page.click('#graph .node[data-member="store-dev"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="store-dev"].active', { timeout: 4000 });
+  await page.waitForSelector('#agent-committed .ag-user-pill', { timeout: 4000 });
+
+  // 5. Agent Tab: unwrapUserPrompt array + nested [TASK], workspace-scoped & normalized filesChanged, countLines, live tail dedup & <details> stability
+  const storeTabChecks = await page.evaluate(() => {
+    const pill = document.querySelector('#agent-committed .ag-user-pill')?.textContent?.trim() || '';
+    const fcSum = document.querySelector('#agent-committed [data-testid="ag-files-changed"] > summary')?.textContent?.replace(/\s+/g, ' ').trim() || '';
+    const fcRows = [...document.querySelectorAll('#agent-committed .ag-fc-row')].map((r) => r.textContent.replace(/\s+/g, ' ').trim());
+    const liveReply = document.querySelector('#agent-live-tail .ag-live-reply')?.textContent || '';
+    const workGroups = [...document.querySelectorAll('#agent-committed details.ag-work-group > summary')].map((s) => s.textContent.trim());
+    const subPillText = document.querySelector('.agent-sub-pill[data-sub-id="sub-ux-1"]')?.textContent || '';
+    return { pill, fcSum, fcRows, liveReply, workGroups, subPillText };
+  });
+  assert.equal(storeTabChecks.pill, 'Implement store.py cleanly');
+  assert.match(storeTabChecks.fcSum, /^1 file changed \+4 -1/, `Expected deduplicated workspace-only 1 file changed +4 -1, got: ${storeTabChecks.fcSum}`);
+  assert.equal(storeTabChecks.fcRows.length, 1);
+  assert.equal(storeTabChecks.liveReply.includes('Step 1 complete'), false, 'Live tail must deduplicate committed Step 1');
+  assert.equal(storeTabChecks.liveReply.includes('Step 2 complete'), false, 'Live tail must deduplicate committed Step 2');
+  assert.match(storeTabChecks.liveReply, /In-flight live tail line!/);
+  assert.ok(storeTabChecks.workGroups.some((w) => w.includes('Worked for 5s')), `Expected Worked for 5s on reasoning-only step, got ${JSON.stringify(storeTabChecks.workGroups)}`);
+  assert.match(storeTabChecks.subPillText, /9\.4k/);
+  assert.match(storeTabChecks.subPillText, /89 t\/s/);
+
+  // Expand live-wg and live-tc, survive a live poll, then commit tc-live-to-commit and verify committed tc: stays open!
+  await page.click('#agent-live-tail details.ag-live-work > summary');
+  await page.waitForSelector('#agent-live-tail details.ag-live-work[open] details.ag-tool-card > summary');
+  await page.click('#agent-live-tail details.ag-live-work details.ag-tool-card > summary');
+  const liveWgEl = await page.locator('#agent-live-tail details.ag-live-work').elementHandle();
+  await page.waitForTimeout(950);
+  const liveAfterPoll = await page.evaluate((el) => ({
+    sameNode: el.isConnected && document.querySelector('#agent-live-tail details.ag-live-work') === el,
+    wgOpen: el.open,
+    tcOpen: document.querySelector('#agent-live-tail details.ag-tool-card')?.open,
+  }), liveWgEl);
+  assert.equal(liveAfterPoll.sameNode, true, 'Live work group DOM node must be updated surgically without replacement');
+  assert.equal(liveAfterPoll.wgOpen, true, 'Live work group must remain open across polls');
+  assert.equal(liveAfterPoll.tcOpen, true, 'Live tool card must remain open across polls');
+
+  commitLiveTool = true;
+  await page.waitForFunction(
+    () => (document.getElementById('agent-committed')?.textContent || '').includes('pytest -q'),
+    null,
+    { timeout: 4000 },
+  );
+  const committedOpenState = await page.evaluate(() => ({
+    lastWgOpen: [...document.querySelectorAll('#agent-committed details.ag-work-group')].at(-1)?.open,
+    committedTcOpen: [...document.querySelectorAll('#agent-committed details.ag-tool-card')].at(-1)?.open,
+    liveReplyGone: !document.querySelector('#agent-live-tail .ag-live-reply'),
+  }));
+  assert.equal(committedOpenState.lastWgOpen, true, 'Open live-wg must transfer open state when committed');
+  assert.equal(committedOpenState.committedTcOpen, true, 'Open live-tc must transfer open state to committed tc');
+  assert.equal(committedOpenState.liveReplyGone, true, 'Deduplicated live transcript must disappear when empty');
+
+  // 6. Raw: normalized Windows separator + copy disabled when empty
+  await page.click('#tabbtn-raw');
+  await page.waitForSelector('#tab-raw.active');
+  const rawMetaPath = await page.textContent('#raw-meta .path');
+  assert.equal(rawMetaPath, 'C:\\Projects\\taskflow-demo\\board.json', `Mixed path separators found: ${rawMetaPath}`);
+  await page.click('.raw-btn[data-raw="meta"]');
+  assert.equal(await page.evaluate(() => document.getElementById('raw-copy').disabled), true, 'Copy button must be disabled when raw file is empty');
+
+  // 7. 420px responsiveness + WCAG AA light theme tokens
+  await page.setViewportSize({ width: 420, height: 780 });
+  await page.click('#tabbtn-overview');
+  await page.waitForTimeout(100);
+  const overflow420 = await page.evaluate(() => ({
+    scrollW: document.documentElement.scrollWidth,
+    innerW: window.innerWidth,
+  }));
+  assert.ok(overflow420.scrollW <= overflow420.innerW, `420px overview overflow: ${JSON.stringify(overflow420)}`);
+
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.waitForFunction(() => document.documentElement.dataset.theme === 'light', null, { timeout: 3000 });
+  const lightTokens = await page.evaluate(() => {
+    const cs = getComputedStyle(document.documentElement);
+    return {
+      warn: cs.getPropertyValue('--sw-warning').trim(),
+      succ: cs.getPropertyValue('--sw-success').trim(),
+    };
+  });
+  assert.equal(lightTokens.warn, '#8a6d00');
+  assert.equal(lightTokens.succ, '#2f6f24');
+
+  // 8. resetSwarm() clears openAgentTabs, agentTabData, and agentPollTimer on conversation switch
+  await page.setViewportSize({ width: 1120, height: 820 });
+  await page.click('.tab-agent[data-agent-tab="store-dev"]');
+  await page.waitForSelector('#tab-agent.active');
+  await page.evaluate(() => {
+    window.sidecar = window.sidecar || {};
+    window.sidecar.conversationId = 'conv-ux-primary-b';
+    document.dispatchEvent(new Event('visibilitychange'));
+  });
+  await page.waitForFunction(
+    () => (document.getElementById('swarm-title')?.textContent || '').trim() === 'Swarm B Clean Reset',
+    null,
+    { timeout: 5000 },
+  );
+  const pollsBeforeWait = workerHistoryPollsConvA;
+  await page.waitForTimeout(1100);
+  assert.equal(workerHistoryPollsConvA, pollsBeforeWait, 'agentPollTimer for old conversation must be stopped on resetSwarm()');
+  assert.equal(await page.locator('.tab-agent').count(), 0, 'openAgentTabs must be cleared on resetSwarm()');
+
+  await context.close();
+  const realFailed = obs.failedRequests.filter(
+    (r) => !(r.reason === 'net::ERR_ABORTED' && /fonts\.g(?:static|oogleapis)\.com/.test(r.url))
+      && !r.url.includes('/_sidecar/get-conversation-metadata')
+      && !(r.reason === 'net::ERR_ABORTED' && r.url.includes('/api/member/history')),
+  );
+  assert.deepEqual(realFailed, [], `Failed network requests: ${JSON.stringify(realFailed)}`);
+  const realConsoleErrors = obs.consoleErrors.filter(
+    (c) => !c.url.includes('/_sidecar/get-conversation-metadata') && !/Failed to resolve project ID/i.test(c.text),
+  );
+  assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
+  assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
+});
+
+test('Regression #11a/#11b/#11c & coordinator live tail: stripSwarmPreamble, non-nested overview controls, shard mentions, selection preservation, coordinator live->DONE', async (t) => {
+  const pw = await loadPlaywright();
+  const executablePath = findBrowserExecutable();
+  const browser = await pw.chromium.launch({
+    headless: true,
+    args: ['--no-proxy-server', '--proxy-bypass-list=<-loopback>'],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  t.after(() => browser.close());
+
+  const tempState = mkdtempSync(join(tmpdir(), 'hermes-ui-reg11-'));
+  t.after(() => rmSync(tempState, { recursive: true, force: true }));
+
+  const baseMs = 1795900000000;
+  let mutateWorkerReply = false;
+  let coordDone = false;
+
+  const snap = {
+    swarm: 'swarm-reg11',
+    id: 'swarm-reg11',
+    etag: 'reg11-1',
+    head: 2,
+    title: 'Regression 11 Swarm',
+    workspace: '/tmp/reg11-demo',
+    primaryConversationId: 'conv-reg11-primary',
+    coordinatorConversationId: 'conv-reg11-coord',
+    builtinOverview: true,
+    meta: {
+      swarmId: 'swarm-reg11',
+      title: 'Regression 11 Swarm',
+      workspace: '/tmp/reg11-demo',
+      primaryConversationId: 'conv-reg11-primary',
+      coordinatorConversationId: 'conv-reg11-coord',
+    },
+    plan: {
+      goal: { title: 'Verify #11a/#11b/#11c and coordinator live tail', line: 'Regression checks' },
+      threads: [
+        { id: 't-reg', title: 'Regression Thread', workstreams: ['worker-sim', 'trunc-newline', 'swarm-id-only', 'verifier', 'done-dev', 'queued-dev'], state: 'running' },
+      ],
+      tasks: {
+        'worker-sim': { title: 'Worker in swarm simulation', status: 'active', assignees: ['worker-sim', 'trunc-newline'] },
+        'trunc-newline': {
+          title: 'You are trunc-newline in this Hermes swarm (swarm_id: 99999999, workdir: /tmp/proj...\nTask: Preserve post-truncation title',
+          status: 'active',
+          assignee: 'trunc-newline',
+        },
+        'swarm-id-only': {
+          title: 'swarm-id-only in swarm (swarm_id: abcd-1234, workdir: /tmp/proj). Check lint',
+          status: 'active',
+          assignee: 'swarm-id-only',
+        },
+        verifier: {
+          title: 'You are verifier in this Hermes swarm (swarm_id: 11111111-2222-3333-4444-555555555555, workdir: /tmp/demo-proj...',
+          status: 'active',
+          assignee: 'verifier',
+        },
+        'done-dev': { title: 'Completed helper task', status: 'done', assignee: 'done-dev' },
+        'queued-dev': { title: 'Queued followup task', status: 'queued', assignee: 'queued-dev' },
+      },
+    },
+    channels: [{ name: 'main', topic: 'Main' }],
+    members: [
+      { name: 'coordinator', role: 'coordinator', status: 'working', conversationId: 'conv-reg11-coord', steps: 2, posts: 1, now: 'Coordinating', subagents: [] },
+      { name: 'worker-sim', role: 'worker', status: 'working', workspace: '/tmp/reg11-demo', steps: 2, posts: 1, now: 'Simulating swarm', subagents: [] },
+      { name: 'trunc-newline', role: 'worker', status: 'working', workspace: '/tmp/reg11-demo', steps: 1, posts: 0, now: 'Working', subagents: [] },
+      { name: 'swarm-id-only', role: 'worker', status: 'working', workspace: '/tmp/reg11-demo', steps: 1, posts: 0, now: 'Linting', subagents: [] },
+      { name: 'verifier', role: 'worker', status: 'working', workspace: '/tmp/reg11-demo', assignment: 'Task: Run tests cleanly', steps: 1, posts: 0, now: 'Testing', subagents: [] },
+      { name: 'done-dev', role: 'worker', status: 'waiting', workspace: '/tmp/reg11-demo', steps: 1, posts: 1, now: '[done] Finished', subagents: [] },
+      { name: 'queued-dev', role: 'worker', status: 'waiting', workspace: '/tmp/reg11-demo', steps: 0, posts: 0, now: 'Waiting', subagents: [] },
+      { name: 'sh-1', role: 'worker', status: 'waiting', workspace: '/tmp/reg11-demo', steps: 1, posts: 0, now: 'Shard 1', subagents: [] },
+      { name: 'sh-2', role: 'worker', status: 'waiting', workspace: '/tmp/reg11-demo', steps: 1, posts: 0, now: 'Shard 2', subagents: [] },
+    ],
+    messages: [
+      { seq: 1, id: 'r11-1', agent: 'coordinator', sender: 'coordinator', type: 'post', channel: 'main', text: 'Check @worker and @sh-1 @sh-2', mentions: ['worker', 'sh-1', 'sh-2'], ts: baseMs },
+      { seq: 2, id: 'r11-2', agent: 'done-dev', sender: 'done-dev', type: 'handoff', channel: 'main', text: '@coordinator [done] Done', mentions: ['coordinator'], ts: baseMs + 5000 },
+    ],
+  };
+
+  const upstreamServer = createServer((req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    if (reqUrl.pathname === '/board') {
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: snap.etag });
+      res.end(JSON.stringify(snap));
+      return;
+    }
+    if (reqUrl.pathname === '/board/member/history') {
+      const member = reqUrl.searchParams.get('member') || 'worker-sim';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (member === 'coordinator') {
+        const msgs = [
+          { id: 1, role: 'user', content: 'Run regression check', timestamp: baseMs },
+          { id: 2, role: 'assistant', content: 'Initial step.', timestamp: baseMs + 1000 },
+        ];
+        if (coordDone) {
+          msgs.push({ id: 3, role: 'assistant', content: 'Coordinator live streaming line', timestamp: baseMs + 3000 });
+        }
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'swarm-reg11',
+          primaryConversationId: 'conv-reg11-primary',
+          member: 'coordinator',
+          state: coordDone ? 'waiting' : 'working',
+          messages: msgs,
+          live: coordDone
+            ? null
+            : {
+                active: true,
+                elapsedMs: 1400,
+                currentTool: { name: 'swarm_board_read', preview: 'since=1' },
+                reasoning: 'Checking worker progress',
+                transcript: 'Initial step.\n\nCoordinator live streaming line',
+                toolTrace: [{ toolCallId: 'tc-coord-1', name: 'swarm_board_read', preview: 'since=1', status: 'running' }],
+              },
+          lastId: coordDone ? 3 : 2,
+          hasMore: false,
+        }));
+        return;
+      }
+      if (member === 'worker-sim') {
+        const msgs = [
+          { id: 10, role: 'user', content: 'Run simulation', timestamp: baseMs },
+          {
+            id: 20,
+            role: 'assistant',
+            content: mutateWorkerReply ? 'Selectable committed reply text — updated' : 'Selectable committed reply text',
+            timestamp: baseMs + 2000,
+          },
+        ];
+        if (mutateWorkerReply) {
+          msgs.push({ id: 21, role: 'assistant', content: 'Appended reply 21', timestamp: baseMs + 4000 });
+        }
+        res.end(JSON.stringify({
+          ok: true,
+          swarm: 'swarm-reg11',
+          primaryConversationId: 'conv-reg11-primary',
+          member: 'worker-sim',
+          state: 'working',
+          messages: msgs,
+          lastId: mutateWorkerReply ? 21 : 20,
+          hasMore: false,
+        }));
+        return;
+      }
+      res.end(JSON.stringify({
+        ok: true,
+        swarm: 'swarm-reg11',
+        primaryConversationId: 'conv-reg11-primary',
+        member,
+        state: 'waiting',
+        messages: [{ id: 1, role: 'assistant', content: `History for ${member}`, timestamp: baseMs }],
+        lastId: 1,
+        hasMore: false,
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end('Not found');
+  });
+  const upstreamPort = await listenServer(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const sidecarProc = await spawnSidecarProcess({
+    HERMES_A2A_STATE_DIR: tempState,
+    HERMES_A2A_BOARD_URL: `http://127.0.0.1:${upstreamPort}`,
+    HERMES_SWARM_DISABLE_WAKEUP: '1',
+    ANTIGRAVITY_CONVERSATION_ID: 'conv-reg11-primary',
+    SWARM_OVERVIEW: 'true',
+  });
+  t.after(() => sidecarProc.stop());
+
+  const context = await browser.newContext({ viewport: { width: 1120, height: 820 }, colorScheme: 'dark' });
+  const page = await context.newPage();
+  const obs = attachPageObservers(page, sidecarProc.baseUrl);
+
+  await page.goto(`${sidecarProc.baseUrl}/?conversationId=conv-reg11-primary`, { waitUntil: 'networkidle' });
+  await page.waitForSelector('#board:not(.hidden)', { timeout: 10000 });
+
+  // #11a: stripSwarmPreamble preserves generic "Worker in swarm simulation" while stripping Hermes/swarm_id preambles
+  await page.click('#tabbtn-overview');
+  await page.waitForSelector('#tab-overview.active');
+  await page.click('#tab-overview .o2-progh');
+  await page.click('#tab-overview [data-o2t="t-reg"]');
+
+  const ovText = await page.textContent('#tab-overview');
+  assert.match(ovText, /Worker in swarm simulation/, 'Generic "Worker in swarm simulation" title must NOT be stripped');
+  assert.match(ovText, /Preserve post-truncation title/, 'Truncated (...) preamble must not eat subsequent Task line');
+  assert.match(ovText, /Check lint/, 'swarm (swarm_id: ...) preamble must be stripped cleanly');
+  assert.match(ovText, /Run tests cleanly/, 'Truncated Hermes swarm preamble must fall back cleanly');
+  assert.doesNotMatch(ovText, /in this Hermes swarm/i);
+  assert.doesNotMatch(ovText, /11111111-2222/);
+  assert.doesNotMatch(ovText, /abcd-1234/);
+
+  // #11b: Zero nested interactive controls inside Overview
+  const nestedCount = await page.evaluate(() =>
+    document.querySelectorAll('#tab-overview button button, #tab-overview button [role="button"], #tab-overview [role="button"] button, #tab-overview [role="button"] [role="button"]').length,
+  );
+  assert.equal(nestedCount, 0, 'Overview must have zero nested interactive controls');
+
+  // Verify clicking both title button and sibling worker chip button open their respective Agent Tabs
+  await page.click('#tab-overview .o2-runrow .o2-runt[data-ov-member="worker-sim"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="worker-sim"].active', { timeout: 4000 });
+  await page.click('[data-close-agent="worker-sim"]');
+
+  await page.click('#tab-overview .o2-runrow .o2-wchip[data-ov-member="trunc-newline"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="trunc-newline"].active', { timeout: 4000 });
+  await page.click('[data-close-agent="trunc-newline"]');
+
+  await page.click('#tab-overview .o2-donelist .o2-donem[data-ov-member="done-dev"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="done-dev"].active', { timeout: 4000 });
+  await page.click('[data-close-agent="done-dev"]');
+
+  await page.click('#tab-overview .o2-tasks .o2-tt[data-ov-member="worker-sim"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="worker-sim"].active', { timeout: 4000 });
+  await page.click('[data-close-agent="worker-sim"]');
+
+  // #11c part 1: Board recipientsHtml exact/shard match (do NOT match @worker -> worker-sim; DO collapse sh-1/sh-2 -> @sh)
+  await page.click('#tabbtn-feed');
+  await page.waitForSelector('#tab-feed.active');
+  const recipientCheck = await page.evaluate(() => {
+    const to = document.querySelector('#feed article.msg[data-seq="1"] .msg-to');
+    if (!to) return null;
+    const btns = [...to.querySelectorAll('button.msg-mention-btn')].map((b) => ({
+      text: b.textContent.trim(),
+      member: b.getAttribute('data-feed-member'),
+    }));
+    const spans = [...to.querySelectorAll('span')].map((s) => s.textContent.trim());
+    return { btns, spans };
+  });
+  assert.deepEqual(recipientCheck.btns, [{ text: '@sh', member: 'sh-1' }], 'Shard group sh-1/sh-2 must collapse to @sh button');
+  assert.ok(recipientCheck.spans.includes('@worker'), '@worker must remain plain span and NOT link to worker-sim');
+
+  // #11c part 2: reconcileCommitted must preserve node & live text selection when selected
+  await page.click('#tabbtn-overview');
+  await page.click('#tab-overview .o2-runrow .o2-runt[data-ov-member="worker-sim"]');
+  await page.waitForSelector('#agent-committed .ag-reply-wrap[data-ag-msg-id="20"]', { timeout: 4000 });
+  await page.evaluate(() => {
+    const wrap = document.querySelector('#agent-committed .ag-reply-wrap[data-ag-msg-id="20"]');
+    const p = wrap.querySelector('.ag-reply');
+    window.__selectedWrap = wrap;
+    const range = document.createRange();
+    range.selectNodeContents(p);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+  });
+  mutateWorkerReply = true;
+  await page.click('[data-ag-refresh]');
+  await page.waitForFunction(
+    () => (document.getElementById('agent-committed')?.textContent || '').includes('Appended reply 21'),
+    null,
+    { timeout: 4000 },
+  );
+  const duringSelection = await page.evaluate(() => {
+    const wrap = document.querySelector('#agent-committed .ag-reply-wrap[data-ag-msg-id="20"]');
+    const sel = window.getSelection();
+    return {
+      sameNode: wrap === window.__selectedWrap && wrap.isConnected,
+      selectedText: sel ? sel.toString() : '',
+      replyText: wrap?.querySelector('.ag-reply')?.textContent || '',
+    };
+  });
+  assert.equal(duringSelection.sameNode, true, 'Committed message node with active selection must NOT be replaced');
+  assert.match(duringSelection.selectedText, /Selectable committed reply text/);
+  assert.equal(duringSelection.replyText.includes('updated'), false, 'Selected node update must be deferred until deselection');
+
+  await page.evaluate(() => window.getSelection()?.removeAllRanges());
+  await page.click('[data-ag-refresh]');
+  await page.waitForFunction(
+    () => (document.querySelector('#agent-committed .ag-reply-wrap[data-ag-msg-id="20"] .ag-reply')?.textContent || '').includes('updated'),
+    null,
+    { timeout: 4000 },
+  );
+  await page.click('[data-close-agent="worker-sim"]');
+
+  // Coordinator live tail rendering (live.transcript + committed DONE)
+  await page.click('#tabbtn-overview');
+  await page.click('#tab-overview .o2-lead');
+  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
+  await page.waitForFunction(
+    () => (document.querySelector('#agent-live-tail .ag-live-reply')?.textContent || '').includes('Coordinator live streaming line'),
+    null,
+    { timeout: 4000 },
+  );
+  const coordLive = await page.evaluate(() => ({
+    tailHidden: document.getElementById('agent-live-tail')?.classList.contains('hidden'),
+    footHidden: document.getElementById('agent-live-foot')?.classList.contains('hidden'),
+    liveReply: document.querySelector('#agent-live-tail .ag-live-reply')?.textContent || '',
+    footText: document.getElementById('agent-live-foot')?.textContent || '',
+  }));
+  assert.equal(coordLive.tailHidden, false);
+  assert.equal(coordLive.footHidden, false);
+  assert.equal(coordLive.liveReply.includes('Initial step.'), false, 'Coordinator live tail must dedupe committed prefix');
+  assert.match(coordLive.liveReply, /Coordinator live streaming line/);
+  assert.match(coordLive.footText, /swarm_board_read/);
+
+  coordDone = true;
+  await page.waitForFunction(
+    () => (document.getElementById('agent-committed')?.textContent || '').includes('Coordinator live streaming line')
+      && document.getElementById('agent-live-tail')?.classList.contains('hidden'),
+    null,
+    { timeout: 4000 },
+  );
+  const coordAfterDone = await page.evaluate(() => ({
+    tailHidden: document.getElementById('agent-live-tail')?.classList.contains('hidden'),
+    footHidden: document.getElementById('agent-live-foot')?.classList.contains('hidden'),
+    committedText: document.getElementById('agent-committed')?.textContent || '',
+  }));
+  assert.equal(coordAfterDone.tailHidden, true);
+  assert.equal(coordAfterDone.footHidden, true);
+  assert.match(coordAfterDone.committedText, /Coordinator live streaming line/);
+
+  await context.close();
+  const realFailed = obs.failedRequests.filter(
+    (r) => !(r.reason === 'net::ERR_ABORTED' && /fonts\.g(?:static|oogleapis)\.com/.test(r.url))
+      && !r.url.includes('/_sidecar/get-conversation-metadata')
+      && !(r.reason === 'net::ERR_ABORTED' && r.url.includes('/api/member/history')),
+  );
+  assert.deepEqual(realFailed, [], `Failed network requests: ${JSON.stringify(realFailed)}`);
+  const realConsoleErrors = obs.consoleErrors.filter(
+    (c) => !c.url.includes('/_sidecar/get-conversation-metadata') && !/Failed to resolve project ID/i.test(c.text),
+  );
+  assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
+  assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
 });

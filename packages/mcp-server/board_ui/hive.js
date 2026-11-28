@@ -115,6 +115,12 @@
     if (v < 1000000) return `${Math.round(v / 1000)}k`;
     return `${(v / 1000000).toFixed(2)}M`;
   };
+  const fmtMod = m => {
+    let s = String(m || '').trim();
+    if (!s) return '';
+    if (s.includes('/')) s = s.split('/').pop();
+    return s.replace(/-(?:dropdown|high|medium|low)$/i, '');
+  };
   const fmtTps = v => {
     const n = Number(v) || 0;
     return n < 10 ? `${n.toFixed(1)} t/s` : `${Math.round(n)} t/s`;
@@ -162,7 +168,7 @@
     return `<span class="o2-wchips">${list.map(n=>{
       const m = sc && sc.members && sc.members[n];
       const st = (sc && !sc.finished && m && !m.killed && m.status==='working') ? 'working' : 'landed';
-      return `<span class="o2-wchip bee" title="@${esc(n)}">${spriteTag(n, st)}<span>${esc(n)}</span></span>`;
+      return `<button type="button" class="o2-wchip bee" data-ov-member="${esc(n)}" title="Open @${esc(n)}">${spriteTag(n, st)}<span>${esc(n)}</span></button>`;
     }).join('')}${extra>0?`<span class="o2-wchip more">+${extra}</span>`:''}</span>`;
   }
 
@@ -210,25 +216,47 @@
     const rows = vis.map(({w, st})=>{
       const c = itemCopy(w.id, w.title, w.note);
       const note = cleanNote(w.note, c.line);
-      const activeMem = st==='running' ? (w.assignees||[]).map(n=>sc.members[n]).find(m=>m && !m.killed && m.status==='working') : null;
-      const lm = st==='running' ? (w.assignees||[]).map(n=>sc.members[n]).find(m=>m && !m.killed && m.live) : null;
-      const telMem = activeMem || lm || (w.assignees||[]).map(n=>sc.members[n]).find(m=>m && !m.killed && ((m.tokens?.new > 0 || m.tokens?.total > 0) || m.tps > 0));
-      const telTok = memberTokDisplay(telMem?.tokens);
+      const assignees = (w.assignees||[]).map(n=>sc.members[n]).filter(m=>m && !m.killed);
+      const activeMem = st==='running' ? assignees.find(m=>m.status==='working') : null;
+      const lm = st==='running' ? assignees.find(m=>m.live) : null;
+      const telMem = activeMem || lm || assignees.find(m=>((m.tokens?.totalProcessed ?? m.tokens?.total ?? m.tokens?.new ?? 0) > 0) || m.tps > 0) || assignees[0] || null;
+      let procSum = 0, outSum = 0, cachedSum = 0, pureSum = 0, tpsSum = 0, tpsEst = false;
+      for (const m of assignees) {
+        const t = m.tokens && typeof m.tokens === 'object' ? m.tokens : {};
+        procSum += Number(t.totalProcessed ?? t.total ?? t.new) || 0;
+        outSum += Number(t.output) || 0;
+        cachedSum += Number(t.cachedInput ?? t.cacheRead) || 0;
+        pureSum += Number(t.pureInput ?? t.uncachedInput ?? t.input) || 0;
+        if (Number(m.tps) > 0) { tpsSum += Number(m.tps); if (m.tpsEstimated) tpsEst = true; }
+      }
       const telParts = [];
-      if (telTok.val > 0) telParts.push(`${fmtTok(telTok.val)} tok`);
-      if (telMem?.tps > 0) telParts.push(fmtTps(telMem.tps));
-      const telHtml = telParts.length ? `<span class="o2-runtel" data-testid="swarm-running-telemetry"${telTok.tip ? ` title="${esc(telTok.tip)}"` : ''}>${esc(telParts.join(' · '))}</span>` : '';
+      if (procSum > 0) telParts.push(`${fmtTok(procSum)} proc`);
+      if (outSum > 0) telParts.push(`${fmtTok(outSum)} out`);
+      if (tpsSum > 0) telParts.push(`${tpsEst ? '~' : ''}${fmtTps(tpsSum)}`);
+      const telTipParts = [];
+      if (procSum > 0) telTipParts.push(`Processed: ${fmtTok(procSum)}`);
+      if (pureSum > 0) telTipParts.push(`Pure: ${fmtTok(pureSum)}`);
+      if (cachedSum > 0) telTipParts.push(`Cached: ${fmtTok(cachedSum)}`);
+      if (outSum > 0) telTipParts.push(`Out: ${fmtTok(outSum)}`);
+      const telTip = telTipParts.join(' · ');
+      const modBadge = telMem?.model ? `<span class="o2-runmod" title="${esc(telMem.model)}">${esc(fmtMod(telMem.model))}</span>` : '';
+      const telHtml = telParts.length ? `<span class="o2-runtel" data-testid="swarm-running-telemetry"${telTip ? ` title="${esc(telTip)}"` : ''}>${esc(telParts.join(' · '))}</span>` : '';
       const activeToolLabel = activeMem?.currentTool?.name ? `Running ${fmtToolCall(activeMem.currentTool)}` : '';
       const liveObj = activeToolLabel ? { kind: 'tool', text: activeToolLabel } : lm?.live;
       const extra = liveObj && note && note.toLowerCase() !== liveObj.text.toLowerCase() ? `\n${note}` : '';
       const noteHtml = liveObj
         ? `<p class="o2-runnote o2-live" data-testid="swarm-running-activity" title="${esc(liveTip(liveObj) + extra)}">${liveText(liveObj)}</p>`
         : (note ? `<p class="o2-runnote" title="${esc(w.note||note)}">${esc(note)}</p>` : '');
+      const primaryAssignee = (w.assignees||[])[0] || '';
+      const titleHtml = primaryAssignee
+        ? `<button type="button" class="o2-runt" data-ov-member="${esc(primaryAssignee)}" title="Open @${esc(primaryAssignee)}" style="background:none;border:0;padding:0;text-align:left">${esc(c.title)}</button>`
+        : `<b class="o2-runt">${esc(c.title)}</b>`;
       return `<li class="o2-runrow ${st}">
         <span class="o2-ti ${st}" aria-label="${st}"></span>
         <div class="o2-runmain">
           <div class="o2-runtop">
-            <b class="o2-runt">${esc(c.title)}</b>
+            ${titleHtml}
+            ${modBadge}
             ${telHtml}
             ${taskProgressPill(w)}
             ${workerBadges(w.assignees, 2, sc)}
@@ -272,13 +300,21 @@
       ? `<ul class="o2-donelist">${visDone.map(w=>{
           const c = itemCopy(w.id, w.title, w.note);
           const sub = cleanNote(c.line || w.note, '');
-          return `<li><span class="o2-ti done" aria-label="done">✓</span><div class="o2-donem"><b>${esc(c.title)}</b>${sub?`<span>${esc(sub)}</span>`:''}</div>${workerBadges(w.assignees, 2, sc)}</li>`;
+          const who0 = (w.assignees || [])[0] || '';
+          const bodyHtml = who0
+            ? `<button type="button" class="o2-donem" data-ov-member="${esc(who0)}" title="Open @${esc(who0)}" style="background:none;border:0;padding:0;text-align:left"><b>${esc(c.title)}</b>${sub?`<span>${esc(sub)}</span>`:''}</button>`
+            : `<div class="o2-donem"><b>${esc(c.title)}</b>${sub?`<span>${esc(sub)}</span>`:''}</div>`;
+          return `<li><span class="o2-ti done" aria-label="done">✓</span>${bodyHtml}${workerBadges(w.assignees, 2, sc)}</li>`;
         }).join('')}</ul>${more>0?`<button class="o2-more" data-o2="doneAll">${ui('more').replace('{n}', more)}</button>`:''}`
       : `<p class="o2-doneempty">No tasks completed yet.</p>`;
     const queuedBody = queuedWs.length
       ? `<div class="o2-queuedsub"><div class="o2-qhdr">Up next · ${queuedWs.length}</div><ul class="o2-donelist queued">${queuedWs.slice(0,6).map(w=>{
           const c = itemCopy(w.id, w.title, w.note);
-          return `<li><span class="o2-ti queued" aria-label="queued"></span><div class="o2-donem"><b>${esc(c.title)}</b></div>${workerBadges(w.assignees, 2, sc)}</li>`;
+          const who0 = (w.assignees || [])[0] || '';
+          const bodyHtml = who0
+            ? `<button type="button" class="o2-donem" data-ov-member="${esc(who0)}" title="Open @${esc(who0)}" style="background:none;border:0;padding:0;text-align:left"><b>${esc(c.title)}</b></button>`
+            : `<div class="o2-donem"><b>${esc(c.title)}</b></div>`;
+          return `<li><span class="o2-ti queued" aria-label="queued"></span>${bodyHtml}${workerBadges(w.assignees, 2, sc)}</li>`;
         }).join('')}</ul></div>`
       : '';
     return `<section class="o2-prog ${open?'open':''}">
@@ -373,7 +409,7 @@
       const sum = r.n.done+r.n.running+r.n.blocked+r.n.queued;
       const asks = [...r.asks, ...r.issues].map(a=>{ const c=itemCopy(a.id, a.title, a.why, a.full); const on = (a.wait==='coordinator' && r.t.id!=='t-waiting' && !r.ws.some(w=>w.assignees.includes(a.from))) ? `<span class="o2-askon">${esc(waitOn('coordinator'))}</span>` : '';
         return `<button type="button" class="o2-ask ${a.wait==='issue'?'issue':''}" ${a.post ? `data-ov-seq="${a.post}"` : `data-open-member="${esc(a.from)}"`}><span class="o2-askd" aria-hidden="true"></span><span class="o2-askb"><b>${esc(c.title)}</b><span class="o2-askl">${esc(c.line)}</span>${on}</span></button>`; }).join('');
-      const tasks = r.ws.slice().sort((a,b)=>({blocked:0,running:1,queued:2,done:3}[stOf(a)]-({blocked:0,running:1,queued:2,done:3}[stOf(b)]))).map(w=>{ const s=stOf(w); const c=itemCopy(w.id, w.title, w.note); return `<li class="${s}"><span class="o2-ti ${s}" aria-label="${s}">${ICON[s]}</span><span class="o2-tt">${esc(c.title)}${waiterOf(w) ? `<span class="o2-tw">${esc(waitOn(waiterOf(w)))}</span>` : ''}</span>${taskProgressPill(w)}${workerBadges(w.assignees, 2, sc)}</li>`; }).join('');
+      const tasks = r.ws.slice().sort((a,b)=>({blocked:0,running:1,queued:2,done:3}[stOf(a)]-({blocked:0,running:1,queued:2,done:3}[stOf(b)]))).map(w=>{ const s=stOf(w); const c=itemCopy(w.id, w.title, w.note); const who0=(w.assignees||[])[0]||''; const labelInner=`${esc(c.title)}${waiterOf(w) ? `<span class="o2-tw">${esc(waitOn(waiterOf(w)))}</span>` : ''}`; const labelHtml=who0 ? `<button type="button" class="o2-tt" data-ov-member="${esc(who0)}" title="Open @${esc(who0)}" style="background:none;border:0;padding:0;text-align:left">${labelInner}</button>` : `<span class="o2-tt">${labelInner}</span>`; return `<li class="${s}"><span class="o2-ti ${s}" aria-label="${s}">${ICON[s]}</span>${labelHtml}${taskProgressPill(w)}${workerBadges(w.assignees, 2, sc)}</li>`; }).join('');
       const head = `<span class="o2-thd ${r.state}" aria-hidden="true"></span>
           <span class="o2-tht"><b>${esc(r.t.title)}</b>${labelOf(r) !== r.t.title ? `<em>${esc(labelOf(r))}</em>` : ''}</span>
           <span class="o2-thc">${sum ? `${miniBar(r.n)}<span>${r.n.done}/${sum}</span>` : `<span>${r.asks.length + r.issues.length}</span>`}</span>`;
@@ -468,6 +504,7 @@
     }
     if (pure > 0) parts.push(`<span>${esc(`${fmtTok(pure)} pure`)}</span>`);
     if (cached > 0) parts.push(`<span>${esc(`${fmtTok(cached)} cached`)}</span>`);
+    if (outTok > 0) parts.push(`<span>${esc(`${fmtTok(outTok)} out`)}</span>`);
     if (tps > 0) parts.push(`<span title="${x.tpsEstimated ? 'Estimated live TPS' : 'Measured TPS'}">${esc(`${tpsPrefix}${fmtTps(tps)}`)}</span>`);
     if (showCtx) {
       const pctLabel = Math.round(ctxPct);
@@ -509,7 +546,7 @@
       const task = rawTask;
       const st = s.status || 'idle';
       const metaParts = [];
-      if(s.model) metaParts.push(String(s.model).split('/').pop());
+      if(s.model) metaParts.push(fmtMod(s.model));
       const subSteps = Number(s.steps) || 0;
       if(subSteps > 0) metaParts.push(`${subSteps} ${subSteps === 1 ? 'step' : 'steps'}`);
       const subTok = s.tokens && (Number(s.tokens.totalProcessed ?? s.tokens.total) || ((Number(s.tokens.pureInput ?? s.tokens.uncachedInput ?? s.tokens.input) || 0) + (Number(s.tokens.output) || 0)));
@@ -541,7 +578,6 @@
 
   function membersView(sc){
     state.style = 'bees';
-    const fmtMod = m => String(m||'').replace(/-(?:dropdown|high|medium)$/i,'');
     const allEntries = Object.entries(sc.members).filter(([,x])=>!x.system);
     const roleEntries = Object.entries(sc.members).filter(([,x])=>x.system && x.roleWorker).map(([n,x])=>[x.rawName||n, x]);
     const lead = sc.members.coordinator || {rawName:'coordinator', role:'coordinator', title:'Coordinator · Antigravity', status:'parked', now:'', posts:0, subagents:[]};
@@ -630,7 +666,7 @@
         <div class="o2-mcol">
           <header class="o2-mhead">
             <span class="o2-mwho"><span class="o2-mauth">@${esc(isCoord?'coordinator':n)}</span>${statTag}</span>
-            <span class="o2-mright">${meta?`<span class="o2-mts">${esc(meta)}</span>`:''}</span>
+            <span class="o2-mright">${meta?`<span class="o2-mts"${x.model ? ` title="${esc(x.model)}"` : ''}>${esc(meta)}</span>`:''}</span>
           </header>
           ${showRoleSub ? `<div class="o2-mrole">${esc(x.title)}</div>` : ''}
           ${memberTags(x)}
@@ -665,6 +701,7 @@
         ${groupHtml(sc.finished ? 'Team' : 'Standing by', standbyWorkers)}
         ${groupHtml('Role workers', liveRoleWorkers)}
         ${retiredHtml}
+        <p class="o2-mempty" data-testid="swarm-members-empty" hidden>No members match your search.</p>
       </div>
     </div>`;
   }
@@ -729,14 +766,16 @@
     const trio = crew.slice(0,3).map(([n])=>n);
     const swarmArt = `<span class="o2-swarm">${trio.map((n,i)=>`<span class="o2-sb s${i}">${spriteTag(n, sc.finished?'landed':'working')}</span>`).join('')}</span>`;
     const allTile = `<button class="o2-m all ${who?'':'on'}" aria-pressed="${!who}" title="All workers" data-o2who=""><span class="o2-tile sm all bees">${swarmArt}</span><span>All</span></button>`;
+    const leadMod = lead.model ? `<span class="o2-lmod" title="${esc(lead.model)}">${esc(fmtMod(lead.model))}</span>` : '';
     const team = `<section class="o2-team">
       <h3 class="o2-h">${ui('team')}</h3>
-      <div class="o2-lead" data-open-member="coordinator" role="button" tabindex="0" title="Open Coordinator chat or filter posts">${tile('coordinator','lg')}<div class="o2-lb"><b>${ui('lead')}</b>${lead.live && !sc.finished ? `<p class="o2-live" title="${esc(liveTip(lead.live))}">${liveText(lead.live, memberLine('coordinator', lead))}</p>` : `<p>${esc(memberLine('coordinator', lead))}</p>`}</div></div>
-      ${crew.length ? `<div class="o2-crew" role="group" aria-label="Filter by worker">${allTile}${shown.map(([n,x])=>`<button class="o2-m ${sc.finished?'':x.status} ${who===n?'on':''}" aria-pressed="${who===n}" title="${esc(n)}: ${esc(memberLine(n,x))}" data-o2who="${esc(n)}">${tile(n,'sm')}<i class="o2-st" aria-hidden="true"></i><span>@${esc(n)}</span></button>`).join('')}${extra>0?`<button class="o2-m more" id="o2More"><span class="o2-tile sm plus">+${extra}</span><span>&nbsp;</span></button>`:''}</div>` : ''}
+      <div class="o2-lead" data-open-member="coordinator" role="button" tabindex="0" title="Open Coordinator chat">${tile('coordinator','lg')}<div class="o2-lb"><b><span>${ui('lead')}</span>${leadMod}</b>${lead.live && !sc.finished ? `<p class="o2-live" title="${esc(liveTip(lead.live))}">${liveText(lead.live, memberLine('coordinator', lead))}</p>` : `<p>${esc(memberLine('coordinator', lead))}</p>`}</div></div>
+      ${crew.length ? `<div class="o2-crew" role="group" aria-label="Filter by worker">${allTile}${shown.map(([n,x])=>`<button class="o2-m ${sc.finished?'':x.status} ${who===n?'on':''}" aria-pressed="${who===n}" title="${esc(n)}${x.model ? ' · ' + fmtMod(x.model) : ''}: ${esc(memberLine(n,x))}" data-o2who="${esc(n)}">${tile(n,'sm')}<i class="o2-st" aria-hidden="true"></i><span>@${esc(n)}</span></button>`).join('')}${extra>0?`<button class="o2-m more" id="o2More"><span class="o2-tile sm plus">+${extra}</span><span>&nbsp;</span></button>`:''}</div>` : ''}
     </section>`;
 
     const card = it => { const c=itemCopy(it.id, it.title, it.line, it.full);
-      return `<div class="o2-card">${tile(it.assignee,'md')}<div class="o2-cb"><b>${esc(c.title)}</b><p>${esc(c.line)}</p><div class="o2-who">@${esc(it.assignee)}</div></div></div>`; };
+      const clickAttr = it.assignee ? ` data-ov-member="${esc(it.assignee)}" role="button" tabindex="0"` : '';
+      return `<div class="o2-card"${clickAttr}>${tile(it.assignee,'md')}<div class="o2-cb"><b>${esc(c.title)}</b><p>${esc(c.line)}</p><div class="o2-who">@${esc(it.assignee)}</div></div></div>`; };
     const branch = (k, list, none, limit) => { const lim=state['o2'+k]?list.length:limit; const vis=list.slice(0,lim); const more=list.length-vis.length;
       return `<section class="o2-br ${k}"><h3 class="o2-h"><i></i>${ui(k)}<em>${list.length}</em></h3>
         ${list.length ? `<div class="o2-cards">${vis.map(card).join('')}</div>${more>0?`<button class="o2-more" data-o2="${k}">${ui('more').replace('{n}',more)}</button>`:''}` : `<p class="o2-none">${ui(none)}</p>`}</section>`; };
@@ -767,9 +806,14 @@
     el.querySelectorAll('.o2-mrow').forEach(row => {
       row.style.display = (!q || (row.dataset.mhay || '').toLowerCase().includes(q)) ? '' : 'none';
     });
+    let anyVisible = false;
     el.querySelectorAll('.o2-mgroup').forEach(grp => {
-      grp.style.display = (!q || [...grp.querySelectorAll('.o2-mrow')].some(r => r.style.display !== 'none')) ? '' : 'none';
+      const show = !q || [...grp.querySelectorAll('.o2-mrow')].some(r => r.style.display !== 'none');
+      grp.style.display = show ? '' : 'none';
+      if (show) anyVisible = true;
     });
+    const emptyEl = el.querySelector('.o2-mempty');
+    if (emptyEl) emptyEl.hidden = !q || anyVisible;
   }
 
   /* ---------- render ---------- */
@@ -922,22 +966,23 @@
         state.o2toolsOpen[d.dataset.o2tools] = d.open;
       });
     });
-    el.querySelectorAll('[data-open-member]').forEach(b => {
+    el.querySelectorAll('[data-open-member], [data-ov-member]').forEach(b => {
+      const memTarget = () => b.dataset.openMember || b.dataset.ovMember || '';
       b.onclick = (e) => {
         if (e.target.closest('details.o2-tools')) return;
         const subEl = e.target.closest('[data-open-subagent]');
         if (subEl && subEl !== b) return;
         const btn = e.target.closest('button');
         if (btn && btn !== b) return;
-        if (b.dataset.openSubagent) e.stopPropagation();
-        if (hooks.member) hooks.member(b.dataset.openMember, b.dataset.openSubagent || '');
+        if (b.tagName === 'BUTTON' || b.dataset.openSubagent) e.stopPropagation();
+        if (hooks.member) hooks.member(memTarget(), b.dataset.openSubagent || '');
       };
       if (b.getAttribute('role') === 'button') {
         b.onkeydown = (e) => {
           if (e.key === 'Enter' || e.key === ' ') {
             e.preventDefault();
             e.stopPropagation();
-            if (hooks.member) hooks.member(b.dataset.openMember, b.dataset.openSubagent || '');
+            if (hooks.member) hooks.member(memTarget(), b.dataset.openSubagent || '');
           }
         };
       }
@@ -1066,15 +1111,26 @@
       const w = String(str||'').replace(/\s+/g,' ').trim().split(' ').filter(Boolean);
       return w.length > maxW ? w.slice(0, maxW).join(' ').replace(/[,;:.]+$/,'') + '…' : w.join(' ').replace(/[.:]+$/,'');
     };
+    const SWARM_PREAMBLE_RE = /^(?:You\s+are\s+)?[`'"*]?[\w-]+[`'"*]?\s+in\s+(?:this\s+)?(?:Hermes\s+swarm\b(?:\s+[`'"*]?[\w-]+[`'"*]?)?(?:\s*\([^)\n]*?(?:\)|…|\.\.\.|(?=\n)|$))?|swarm\b(?:\s+(?:[`'"*][\w-]+[`'"*]|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\s*\([^)\n]*?(?:\)|…|\.\.\.|(?=\n)|$))?|\s*\(\s*[`'"*]?(?:swarm_id|workdir|Tier)\b[^)\n]*?(?:\)|…|\.\.\.|(?=\n)|$)))[.:—–\-\s]*/i;
+    const stripSwarmPreamble = raw => {
+      let s = String(raw || '').trim();
+      if (!s) return '';
+      if (/^\[(?:Batched\s+)?Board\s+@mention\s+wakeup/i.test(s)) return '';
+      if (/^You are\s+[`'"*]?[\w-]+[`'"*]?\s*\(Tier-/i.test(s)) return '';
+      s = s.replace(SWARM_PREAMBLE_RE, '').trim();
+      return s;
+    };
     const cleanAssignment = raw => {
-      let s = String(raw||'').trim();
-      if(!s) return '';
-      if(/^\[(?:Batched\s+)?Board\s+@mention\s+wakeup/i.test(s)) return '';
-      if(/^You are\s+[`'"*]?[\w-]+[`'"*]?\s*\(Tier-/i.test(s)) return '';
-      s = s.replace(/^You are\s+[`'"*]?[\w-]+[`'"*]?\s+in\s+swarm\s+[`'"*]?[\w-]+[`'"*]?(?:\s*\([^)]*\))?[.:—–\-\s]*/i, '').trim();
-      if(!s) return '';
-      const line = s.split(/\n/).map(l => l.trim()).find(Boolean) || '';
-      return clipW(cleanPath(line), 16);
+      const s = stripSwarmPreamble(raw);
+      if (!s) return '';
+      const lines = s.split(/\n/).map(l => l.trim()).filter(Boolean);
+      const taskLine = lines.find(l => /^(?:Task|Goal|Assignment)\s*:/i.test(l));
+      let chosen = taskLine
+        ? taskLine.replace(/^(?:Task|Goal|Assignment)\s*:\s*/i, '').trim()
+        : (lines.find(l => !/^(?:Ownership\s*&?\s*Locks|Workdir|Swarm\s*ID|Channel|Rules)\s*:/i.test(l)) || '');
+      chosen = chosen.replace(/^(?:Task|Goal|Assignment)\s*:\s*/i, '').trim();
+      if (!chosen) return '';
+      return clipW(cleanPath(chosen), 16);
     };
     const briefOf = n => { const re=new RegExp('^@'+n.replace(/[.*+?^${}()|[\]\\-]/g,'\\$&')+'(?![\\w-])'); const p=msgs.find(m=>(m.agent||m.sender)===L && re.test(String(m.text||''))); if(!p) return '';
       let s=String(p.text).replace(/^@\S+[\s,:]*/,'').replace(/\*\*([^*]+)\*\*/g,'$1').split(/(?<=[.!?])\s|\n/)[0];
@@ -1124,7 +1180,12 @@
     const members = Object.create(null);
     const taskTitleFor = (name) => {
       const pt = planTaskByKey.get(name);
-      if (pt && pt.title) return pt.title.slice(0, 120);
+      if (pt && pt.title) {
+        const cleanedPt = SWARM_PREAMBLE_RE.test(pt.title)
+          ? cleanAssignment(pt.title)
+          : pt.title;
+        if (cleanedPt) return cleanedPt.slice(0, 120);
+      }
       const mem = byName.get(name);
       const assign = cleanAssignment(mem && mem.assignment);
       if (assign) return assign.slice(0, 120);
@@ -1262,8 +1323,8 @@
       if(typeof w.progress==='number' && w.progress>=0 && w.progress<=100){
         const p=Math.round(w.progress); return {done:p, total:100, label:p+'%'};
       }
-      const fm=/(?<!cl\/)(?<!\d\.)\b(\d{1,2})\s*(?:\/|of)\s*(\d{1,2})\b(?!\s*(?:AM|PM|am|pm))/.exec(String(w.note||''));
-      if(fm){ const d=+fm[1], t=+fm[2]; if(t>=2 && t<=60 && d<=t) return {done:d, total:t, label:`${d}/${t}`}; }
+      const fm=/(?<!cl\/)(?<!\d\.)\b(\d{1,4})\s*(?:\/|of)\s*(\d{1,4})\b(?![./-]\d)(?!\s*(?:AM|PM|am|pm))/.exec(String(w.note||''));
+      if(fm){ const d=+fm[1], t=+fm[2]; if(t>=2 && t<=10000 && d<=t) return {done:d, total:t, label:`${d}/${t}`}; }
       return null;
     };
     const rawAssignees = w => {
@@ -1280,11 +1341,21 @@
       }
       return r && Number(r.seq) ? Number(r.seq) : 0;
     }).filter(Boolean);
+    const cleanWorkTitle = (rawTitle, assigneeName) => {
+      const tStr = String(rawTitle || '').trim();
+      if (tStr && SWARM_PREAMBLE_RE.test(tStr)) {
+        const cleaned = cleanAssignment(tStr);
+        if (cleaned) return cleaned.slice(0, 120);
+        return (assigneeName ? taskTitleFor(assigneeName) : '') || 'Task';
+      }
+      return tStr ? tStr.slice(0, 120) : ((assigneeName ? taskTitleFor(assigneeName) : '') || 'Task');
+    };
     let workstreams = (Array.isArray(vj.workstreams)?vj.workstreams:[]).filter(w=>w&&(w.title||w.task)).map((w,i)=>{
       const seqs = normSeqs(w.refs);
       const rawState0=STATES.includes(w.state)?w.state:'active';
       const rawState=(finished && rawState0!=='failed') ? 'done' : rawState0;
-      return { id:w.id||('w'+i), title:String(w.title||w.task).slice(0,120), assignees:rawAssignees(w).filter(o=>byName.has(o)).map(key), state: rawState==='failed'?'blocked':rawState, rawState, progress:parseProg(w), note:String(w.note||w.evidence||'').slice(0,200), seq: seqs.length?Math.max(...seqs):head };
+      const ass = rawAssignees(w).filter(o=>byName.has(o)).map(key);
+      return { id:w.id||('w'+i), title:cleanWorkTitle(w.title||w.task, ass[0]), assignees:ass, state: rawState==='failed'?'blocked':rawState, rawState, progress:parseProg(w), note:String(w.note||w.evidence||'').slice(0,200), seq: seqs.length?Math.max(...seqs):head };
     });
     workstreams.forEach(w=>{ if(!w.assignees.length) w.assignees=['coordinator']; });
     const fallbackState = (x, lp) => x.killed ? 'done' : x.status==='waiting_on' ? 'blocked' :
@@ -1299,7 +1370,7 @@
           const rawSt = STATES.includes(t.status) ? t.status : (mObj ? fallbackState(mObj, lp) : 'queued');
           return {
             id: t.id,
-            title: String(t.title).slice(0, 120),
+            title: cleanWorkTitle(t.title, assigneeName),
             assignees: byName.has(assigneeName) ? [n] : ['coordinator'],
             state: rawSt === 'failed' ? 'blocked' : rawSt,
             rawState: rawSt,
@@ -1328,7 +1399,7 @@
           existingIds.add(wid);
           workstreams.push({
             id: wid,
-            title: String((pt && pt.title) || taskTitleFor(wid) || (mObj && mObj.title) || wid).slice(0, 120),
+            title: cleanWorkTitle(pt && pt.title, wid) || (mObj && mObj.title) || wid,
             assignees: byName.has(wid) ? [key(wid)] : ['coordinator'],
             state: rawSt === 'failed' ? 'blocked' : rawSt,
             rawState: rawSt,
@@ -1390,7 +1461,7 @@
       telemetry: snap.telemetry && typeof snap.telemetry==='object' ? snap.telemetry : null,
       source: snap.source && typeof snap.source==='object' ? snap.source : null,
       reel: (()=>{ const fr=(vj.reel && Array.isArray(vj.reel.frames) && vj.reel.frames.length) ? vj.reel.frames : (Array.isArray(snap.frames) ? snap.frames : []);
-        const urlConv=new URLSearchParams(location.search).get('conversationId')||'';
+        const urlConv=window.sidecar?.conversationId || new URLSearchParams(location.search).get('conversationId') || '';
         const out=fr.filter(f=>f && typeof f.path==='string' && f.path.trim()).slice(0,40).map(f=>{
           const q=new URLSearchParams({ path: f.path, seq: String(Number(f.seq)||0) });
           if (urlConv) q.set('conversationId', urlConv);
@@ -1577,7 +1648,10 @@
       const per = Math.max(2, Math.min(3, Math.floor(1.6 * R / 50))), cap = per * 2, show = born.length > cap ? born.slice(0, cap - 1) : born;
       const sw = Math.min(58, 1.66 * R / per), rows = show.length > per ? [show.slice(0, per), show.slice(per)] : [show], rg = names ? 54 : 40;
       const top = ty + lines.length * 14 + 8, bot = y + K * R - (names ? 16 : 6), y0 = (top + bot) / 2 - (rows.length - 1) * rg / 2 - (names ? 6 : 0);
-      rows.forEach((rw, ri) => rw.forEach((n, j) => { pos[n] = {x: x + (j - (rw.length - 1) / 2) * sw, y: y0 + ri * rg, size: 'm'}; }));
+      rows.forEach((rw, ri) => {
+        const rowSw = rw.length === 2 ? Math.min(82, Math.max(sw, R * 0.74)) : sw;
+        rw.forEach((n, j) => { pos[n] = {x: x + (j - (rw.length - 1) / 2) * rowSw, y: y0 + ri * rg, size: 'm'}; });
+      });
       if (show.length < born.length) { const lr = rows[rows.length - 1], px = x + ((lr.length + 1) / 2) * sw - sw / 2 + 4, py = y0 + (rows.length - 1) * rg;
         textSvg += `<text class="hv-n" x="${px.toFixed(1)}" y="${(py + 4).toFixed(1)}">+${born.length - show.length}</text>`;
         born.slice(show.length).forEach(n => { pos[n] = {x: px, y: py, size: 'xs'}; tucked.add(n); }); } });
