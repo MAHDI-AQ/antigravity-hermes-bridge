@@ -1,6 +1,6 @@
 # Hermes A2A Swarm Bridge (`hermes-a2a`)
 
-A clean 3-tier **Agent2Agent (A2A) v1.0** bridge, unified event-driven Swarm Board, and 1:1 session-bound read-only observer backend connecting **Antigravity** (`primary` -> `coordinator`) with local **Hermes Agent** workers (`worker`, `verifier`, `researcher`, `monitor`, `narrator`).
+A clean 3-tier **Agent2Agent (A2A) v1.0** bridge, unified event-driven Swarm Board, and 1:1 session-bound read-only observer backend connecting **Antigravity** (`primary` -> `coordinator` + IDE frontier subagents) with local **Hermes Agent** execution workers (`worker`, `implementer`, `monitor`, `narrator`).
 
 ## MCP Tools (7)
 

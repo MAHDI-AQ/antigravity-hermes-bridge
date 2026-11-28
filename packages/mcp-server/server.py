@@ -17,6 +17,7 @@ from mcp.server.mcpserver import Context, MCPServer
 import catalog as catalog_mod
 import http_server
 import models
+import role_policy as role_policy_mod
 import runtime as runtime_mod
 import store
 import worktree as worktree_mod
@@ -34,12 +35,17 @@ You are connected to the Hermes A2A Swarm Bridge (`hermes-a2a`), enabling a 3-ti
    - Spawn ONE dedicated Tier-2 Coordinator subagent via `invoke_subagent`, bind its exact verbatim `conversationId`
      via `swarm_manage(action="bind_coordinator", conversation_id=..., coordinator_conversation_id=..., model=..., provider=...)` (NEVER hand-type or splice UUID segments), and wait for `@primary` escalations.
    - Read the project's Obsidian vault (`Handoffs/current.md` and `Lessons/lessons.md`) before starting and write verified receipts/lessons to `Evidence/` / `Handoffs/` before closing.
-2. Tier 2 (`coordinator` + Hermes A2A workers `worker|verifier|researcher|monitor|narrator`):
-   - Discover available models dynamically via `swarm_catalog()` before spawning workers.
+2. Tier 2a (`coordinator` + IDE Frontier Subagents via `invoke_subagent(TypeName="self", ...)`):
+   - Thinking & judgment roles (Research, Architecture/Design, Planning, Specialist Consultation, and Adversarial Verification) belong to **IDE Frontier Subagents** (`invoke_subagent`, `TypeName="self"`), NEVER cheap Hermes execution workers.
+   - Inspect `role_policy` returned by `swarm_manage(init|status)` / `swarm_catalog()` so local user preferences (IDE tiers, restricted roles, execution worker model defaults) are always honored.
+   - Because `wakeup_bridge` only wakes `primary` and `coordinator`, Coordinator bridges outputs between IDE subagents and Hermes workers (`@coordinator` only).
+3. Tier 2b (Hermes A2A Execution Workers via `swarm_worker` — `worker|implementer|monitor|narrator`):
+   - Discover available models dynamically via `swarm_catalog()` before spawning workers (or inherit local `role_policy` `hermes_worker_defaults`).
+   - Reserve `swarm_worker` strictly for execution bricklaying: implementing pre-designed specs/patches, running builds, SSH/profiling/benchmark/test loops, and git/CI mechanics.
    - Publish `swarm_manage(action="set_plan", ...)`, spawn/resume/switch/diff/kill workers via
      `swarm_worker(...)` (`diff` accepts optional `name`, omitting `name` inspects all workers), manage channels via `swarm_manage(action="channel", ...)`, claim/release
      scopes via `swarm_board_read(scope_action=...)`, and block zero-cost via `swarm_wait(since=...)`.
-3. Tier 3 (`subagent` — Hermes `delegate_task` leaf workers):
+4. Tier 3 (`subagent` — Hermes `delegate_task` leaf workers):
    - Spawned exclusively by Tier-2 Hermes workers; surfaced read-only under Members.
 """
 
@@ -244,6 +250,7 @@ async def swarm_catalog(
     )
     cat["http_url"] = _http_ctrl.url or _swarm_mgr.http_url
     cat["active_workdir"] = resolved_ws or _get_session_val(ctx, "workdir") or _swarm_mgr.get_default_workdir()
+    cat["role_policy"] = role_policy_mod.load_role_policy(cat["active_workdir"])
     return _json_str(cat)
 
 
@@ -415,6 +422,7 @@ async def swarm_manage(
             "http_url": _http_ctrl.url or _swarm_mgr.http_url,
             "observer_ui_url": observer_ui_url,
             "meta": meta,
+            "role_policy": role_policy_mod.load_role_policy(meta.get("workspace") or resolved_ws),
         })
 
     lookup_conv = (
@@ -545,6 +553,7 @@ async def swarm_manage(
             "telemetry": snap.get("telemetry") or {},
             "members": snap.get("members") or [],
             "tasks": tasks_res.get("tasks") or [],
+            "role_policy": role_policy_mod.load_role_policy(meta.get("workspace") or resolved_ws),
         })
 
     raise ValueError(f"Unsupported swarm_manage action: {action!r}")
@@ -579,6 +588,7 @@ async def swarm_worker(
     swarm_id: str | None = None,
     conversation_id: str | None = None,
     workspace: str | None = None,
+    allow_ide_only_role: bool = False,
     ctx: Context | None = None,
 ) -> str:
     """Manage Tier-2 Hermes A2A workers (`spawn|resume|switch_model|status|diff|kill`)."""
@@ -596,6 +606,24 @@ async def swarm_worker(
             raise ValueError("`name` is required for action='spawn'.")
         if not prompt or not prompt.strip():
             raise ValueError("`prompt` is required for action='spawn'.")
+        meta_doc = await asyncio.to_thread(_swarm_mgr.store.read_meta, sid) or {}
+        policy = role_policy_mod.load_role_policy(resolved_ws or meta_doc.get("workspace"))
+        allowed, policy_msg = role_policy_mod.evaluate_worker_spawn_policy(
+            role,
+            worker_name=name.strip(),
+            policy=policy,
+            allow_ide_only_role=bool(allow_ide_only_role),
+        )
+        if not allowed:
+            raise ValueError(policy_msg or f"Role {role!r} is restricted to IDE subagents under role_policy.")
+        eff_defaults = role_policy_mod.apply_worker_defaults(
+            policy,
+            model=model,
+            provider=provider,
+            base_url=base_url,
+            reasoning=reasoning,
+            profile=profile,
+        )
         res = await rt.run_on_loop(
             rt.spawn_workers,
             name=name.strip(),
@@ -607,11 +635,11 @@ async def swarm_worker(
             workdir=resolved_ws,
             worktree=bool(worktree),
             channels=channels,
-            model=model,
-            provider=provider,
-            base_url=base_url,
-            profile=profile or "default",
-            reasoning=reasoning,
+            model=eff_defaults["model"],
+            provider=eff_defaults["provider"],
+            base_url=eff_defaults["base_url"],
+            profile=eff_defaults["profile"] or "default",
+            reasoning=eff_defaults["reasoning"],
             toolsets=toolsets,
             skills=skills,
             max_turns=max_turns,
@@ -620,6 +648,10 @@ async def swarm_worker(
             return_immediately=bool(return_immediately),
             wait_seconds=wait_seconds,
         )
+        if policy_msg and isinstance(res, dict):
+            res["policy_warning"] = policy_msg
+        if isinstance(res, dict):
+            res["role_policy_source"] = policy.get("source", "default")
         return _json_str(res)
 
     if act == "resume":

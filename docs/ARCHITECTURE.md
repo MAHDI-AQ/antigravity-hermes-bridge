@@ -9,8 +9,8 @@
 | Tier | Component | Role | Capabilities |
 |---|---|---|---|
 | **Tier 1** | User + Primary IDE Agent (`primary`) | Goal owner | Initializes session's 1:1 swarm, spawns **one** Coordinator (`invoke_subagent`), binds the verbatim `coordinatorConversationId`, displays `open_board`, handles `@primary` escalations & final delivery |
-| **Tier 2a** | Coordinator Subagent (`coordinator`) | Planner & Reviewer | Publishes `set_plan`, manages topic channels, spawns/resumes/hot-swaps/kills workers, reviews diffs & tests, escalates blockers & `[done]` to `@primary`; opens in an in-pane read-only Agent Tab backed by its local Antigravity transcript (`transcript_full.jsonl` / `transcript.jsonl`) |
-| **Tier 2b** | Hermes A2A Workers (`worker \| verifier \| researcher \| monitor \| narrator`) | Execution | Run asynchronously via Hermes CLI subprocesses with `HERMES_SWARM_*` env injected; talk via native `swarm_*` tools; coordinate via `@<peer>`, `@#channel`, `@all`, `@coordinator` |
+| **Tier 2a** | Coordinator Subagent (`coordinator`) + IDE Frontier Subagents | Planner & Engineers | Coordinator publishes `set_plan`, manages topic channels, spawns **IDE frontier subagents** (`invoke_subagent`, `TypeName="self"`) for Research, Architecture/Design, Planning, Consultation, and Adversarial Verification, spawns/resumes/hot-swaps/kills Hermes execution workers, reviews diffs & tests, and escalates to `@primary`; opens in an in-pane read-only Agent Tab backed by its local Antigravity transcript (`transcript_full.jsonl` / `transcript.jsonl`) |
+| **Tier 2b** | Hermes A2A Execution Workers (`worker \| implementer \| monitor \| narrator`) | Execution Bricklayers | Run asynchronously via Hermes CLI subprocesses with `HERMES_SWARM_*` env injected; implement pre-designed specs, run builds/SSH/profiling/test loops; talk via native `swarm_*` tools and `@coordinator` / `@<peer>` |
 | **Tier 3** | Hermes Leaf Subagents (`subagent`) | Bounded helpers | Spawned by Tier-2 workers via `delegate_task`; tracked in telemetry and History Tabs without waking Tier 1 or Tier 2 directly |
 
 ---

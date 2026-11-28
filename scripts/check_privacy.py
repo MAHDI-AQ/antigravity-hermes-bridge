@@ -54,6 +54,7 @@ FORBIDDEN_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
     ("private_project", re.compile(r"\b(local-agent-lab|personal-hermes|strata-agx)\b", re.IGNORECASE)),
     ("private_host_or_user", re.compile(r"\b(ai-server|mhd67)\b", re.IGNORECASE)),
     ("private_model_or_provider", re.compile(r"\b(hy4-flash-free|opencode-go)\b", re.IGNORECASE)),
+    ("private_project_helper", re.compile(r"(?:build_swarm_brief|@neon\b)", re.IGNORECASE)),
     ("windows_user_path", re.compile(r"[A-Za-z]:[/\\]Users[/\\][A-Za-z0-9._-]+")),
     ("posix_home_path", re.compile(r"/(?:home|Users)/[A-Za-z0-9._-]+/")),
     ("private_lan_ip", re.compile(r"\b192\.168\.\d+\.\d+\b")),

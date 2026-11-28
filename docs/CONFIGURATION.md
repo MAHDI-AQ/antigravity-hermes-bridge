@@ -14,7 +14,37 @@ Hermes Swarm works with zero manual configuration after running `scripts/install
 | `HERMES_A2A_HTTP_PORT` | `0` (ephemeral, `9910` preferred when free) | Port for HTTP/SSE API; discovered automatically by sidecar via `registry.json` |
 | `HERMES_A2A_HTTP_TOKEN` | `<stateDir>/internal_token` | Shared Bearer token protecting `/internal/*` endpoints |
 | `HERMES_A2A_DEFAULT_WORKDIR` | Workspace resolved from MCP | Fallback working directory when `set_workdir` has not been called |
+| `HERMES_SWARM_ROLE_POLICY` | `<ws>/.hermes-swarm/role_policy.json` -> `~/.config/hermes-swarm/role_policy.json` -> `~/.hermes-swarm.json` | Optional local JSON policy separating IDE frontier roles from Hermes execution roles (`enforcement`: `"warn"` / `"reject"` / `"off"`) and setting local `hermes_worker_defaults` |
 | `HERMES_SWARM_URL_HOSTS` | `url_hosts.json` | Optional extra allowlisted hostnames inside observer link detection |
+
+## Local Role & Model Policy (`~/.config/hermes-swarm/role_policy.json`)
+
+Keep personal IDE tier preferences and Hermes worker model defaults external to any project repo via `~/.config/hermes-swarm/role_policy.json` (or `<workspace>/.hermes-swarm/role_policy.json` / `HERMES_SWARM_ROLE_POLICY`). Example:
+
+```json
+{
+  "version": 1,
+  "enforcement": "reject",
+  "ide_only_roles": [
+    "researcher", "research", "architect", "design",
+    "planner", "plan", "consult", "consultant",
+    "verifier", "verify", "reviewer", "auditor"
+  ],
+  "hermes_execution_roles": ["worker", "implementer", "monitor", "narrator"],
+  "ide_subagent_preferences": {
+    "tool": "invoke_subagent",
+    "type_name": "self"
+  },
+  "hermes_worker_defaults": {
+    "model": null,
+    "provider": null
+  },
+  "hub_and_spoke": true
+}
+```
+
+- When `enforcement` is `"reject"`, `swarm_worker(action="spawn")` blocks spawns matching `ide_only_roles` unless `allow_ide_only_role=True` is passed explicitly. Default (when no file exists) is `"warn"`.
+- `swarm_manage(action="init"|"status")` and `swarm_catalog()` return the active `role_policy` so Coordinators always see local preferences at runtime.
 
 ---
 

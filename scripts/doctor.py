@@ -217,6 +217,26 @@ def run_doctor(
         "detail": str(bridge_dir),
     })
 
+    # Local role policy (optional — default policy is valid when no override file exists)
+    rp_ok = True
+    rp_detail = "default (enforcement=warn)"
+    try:
+        sys.path.insert(0, str(mcp_root))
+        import role_policy as _rp_mod  # type: ignore[import-not-found]
+        rp = _rp_mod.load_role_policy()
+        if rp.get("load_error"):
+            rp_ok = False
+            rp_detail = str(rp["load_error"])
+        else:
+            rp_detail = f"{rp.get('source', 'default')} (enforcement={rp.get('enforcement', 'warn')})"
+    except Exception as exc:
+        rp_detail = f"default (role_policy module unavailable: {exc})"
+    checks.append({
+        "name": "role_policy",
+        "ok": rp_ok,
+        "detail": rp_detail,
+    })
+
     overall = all(bool(c["ok"]) for c in checks)
     return {"ok": overall, "checks": checks}
 

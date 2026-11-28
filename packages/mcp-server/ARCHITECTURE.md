@@ -8,6 +8,7 @@ Python Environment: `.venv` (deps: `mcp`, `httpx`, `pyyaml`, `starlette`, `uvico
 | File | Responsibility |
 |---|---|
 | `models.py` | Canonical A2A v1.0 & Swarm v2 dataclasses and builders (`TaskState`, `Role`, `MemberState`, `MessageType`, `WorkerConfig`, `TaskView`, `build_hermes_agent_card`). |
+| `role_policy.py` | Local user/workspace role-and-model policy loader (`~/.config/hermes-swarm/role_policy.json`, `<ws>/.hermes-swarm/role_policy.json`, `HERMES_SWARM_ROLE_POLICY`), separating IDE frontier roles (`invoke_subagent`) from Hermes execution workers (`worker`/`implementer`, `monitor`, `narrator`). |
 | `store.py` | 1:1 session-bound Swarm v2 filesystem store (`meta.json`, `board.json`, `tasks.json`, `registry.json`), Windows-safe `atomic_file_lock`, `atomic_write_json`, path containment (`is_path_within`), `resolve_swarm_for_conversation`, and PID-only server registry (`SwarmStore`). |
 | `catalog.py` | Secret-free dynamic introspection of Hermes CLI, profiles, providers, models, aliases, toolsets, skills, git status/diff, and custom A2A peers. |
 | `worktree.py` | Isolated git worktree provisioning, diff inspection, removal, and pruning (`create_worktree`, `inspect_git_diff`, `prune_worktrees`). |

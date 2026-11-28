@@ -215,9 +215,17 @@ def normalize_channel_name(raw: str | None) -> str:
     return f"#{slug}"
 
 
+_WORKER_ROLE_ALIASES: dict[str, str] = {
+    "implementer": Role.WORKER.value,
+    "impl": Role.WORKER.value,
+}
+
+
 def normalize_role(raw: str | None, default: str = Role.WORKER.value) -> str:
     """Normalize a participant role to a canonical Role value."""
     text = str(raw or "").strip().lower()
+    if text in _WORKER_ROLE_ALIASES:
+        return _WORKER_ROLE_ALIASES[text]
     if text in ALL_ROLES:
         return text
     return default
@@ -228,8 +236,9 @@ def validate_worker_role(raw: str | None) -> str:
     if raw is None or not str(raw).strip():
         return Role.WORKER.value
     role = str(raw).strip().lower()
+    role = _WORKER_ROLE_ALIASES.get(role, role)
     if role not in WORKER_ROLES:
-        allowed = ", ".join(sorted(WORKER_ROLES))
+        allowed = ", ".join(sorted(set(WORKER_ROLES) | {"implementer"}))
         raise ValueError(f"Unsupported worker role {raw!r}; expected one of: {allowed}")
     return role
 

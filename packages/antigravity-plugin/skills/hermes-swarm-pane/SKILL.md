@@ -24,17 +24,17 @@ Right as you launch workers (and whenever you add workers, regroup lanes, or shi
     "line": "Audit running across views; theme fixes queued next."
   },
   "tasks": {
-    "auditor": "Audit split panes across states",
-    "fixer": "Unify split panes in shared cards",
-    "verifier": "Verify layouts in dark and light themes"
+    "impl-a": "Implement shared card component",
+    "impl-b": "Unify split pane layouts",
+    "test-runner": "Run dark and light theme UI suite"
   },
   "threads": [
     {
       "id": "t-split",
       "title": "Split pane cards",
       "goal": "Panes share one card with clean headers.",
-      "now": "Auditing live views",
-      "tasks": ["auditor", "fixer", "verifier"]
+      "now": "Implementing unified card components",
+      "tasks": ["impl-a", "impl-b", "test-runner"]
     }
   ]
 }

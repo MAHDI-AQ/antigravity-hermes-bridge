@@ -16,6 +16,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+os.environ.setdefault("HERMES_SWARM_ROLE_POLICY", "default")
 
 from starlette.testclient import TestClient
 
@@ -6391,6 +6392,169 @@ class Phase4HardeningRegressionTests(unittest.TestCase):
                 self.assertEqual(r2["tasks"][0]["metadata"]["resolvedProvider"], "gw-prov")
 
         asyncio.run(_run_f9())
+
+
+class RolePolicyTests(unittest.TestCase):
+    """Verify local/workspace role_policy.json enforcement, implementer alias, and defaults."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="hermes-rp-")
+        self.tmp_root = Path(self._tmp.name)
+        self.state_dir = self.tmp_root / "state"
+        self.repo_dir = self.tmp_root / "repo"
+        _init_temp_git_repo(self.repo_dir)
+        self.orig_mgr = mcp_srv._swarm_mgr
+        self.orig_http = mcp_srv._http_ctrl
+        self.orig_wd = mcp_srv._session_workdir
+        self.orig_conv = mcp_srv._session_conversation_id
+        self.orig_sid = mcp_srv._session_swarm_id
+        mcp_srv._swarm_mgr = runtime_mod.SwarmManager(
+            state_dir=self.state_dir,
+            default_workdir_provider=lambda: str(self.repo_dir),
+        )
+        mcp_srv._http_ctrl = http_server.EmbeddedA2AHttpController(mcp_srv._swarm_mgr)
+        mcp_srv._session_workdir = str(self.repo_dir)
+        mcp_srv._session_conversation_id = None
+        mcp_srv._session_swarm_id = None
+
+    def tearDown(self) -> None:
+        mcp_srv._swarm_mgr = self.orig_mgr
+        mcp_srv._http_ctrl = self.orig_http
+        mcp_srv._session_workdir = self.orig_wd
+        mcp_srv._session_conversation_id = self.orig_conv
+        mcp_srv._session_swarm_id = self.orig_sid
+        self._tmp.cleanup()
+
+    def test_default_policy_implementer_alias_and_warn_mode(self) -> None:
+        import role_policy as rp_mod
+
+        self.assertEqual(models.normalize_role("implementer"), "worker")
+        self.assertEqual(models.validate_worker_role("implementer"), "worker")
+
+        with patch.dict(os.environ, {"HERMES_SWARM_ROLE_POLICY": "default"}):
+            pol = rp_mod.load_role_policy(str(self.repo_dir))
+            self.assertEqual(pol["source"], "default")
+            self.assertEqual(pol["enforcement"], "warn")
+
+            ok, warn = rp_mod.evaluate_worker_spawn_policy("verifier", worker_name="v-1", policy=pol)
+            self.assertTrue(ok)
+            self.assertIn("ide_only_roles", warn or "")
+
+            async def _run() -> None:
+                init_res = json.loads(await mcp_srv.swarm_manage(
+                    "init",
+                    primary_conversation_id="conv-rp-warn",
+                    workspace=str(self.repo_dir),
+                ))
+                self.assertEqual(init_res["role_policy"]["enforcement"], "warn")
+
+                async def _fake_spawn(**kwargs):
+                    return {"tasks": [{"id": "t1", "worker": kwargs["name"], "role": models.validate_worker_role(kwargs["role"]), "model": kwargs.get("model")}]}
+
+                with patch.object(mcp_srv._swarm_mgr.get_runtime(init_res["swarm_id"]), "spawn_workers", side_effect=_fake_spawn):
+                    impl_res = json.loads(await mcp_srv.swarm_worker(
+                        "spawn",
+                        name="coder-1",
+                        prompt="Implement change",
+                        role="implementer",
+                        swarm_id=init_res["swarm_id"],
+                    ))
+                    self.assertNotIn("policy_warning", impl_res)
+                    self.assertEqual(impl_res["tasks"][0]["role"], "worker")
+
+                    ver_res = json.loads(await mcp_srv.swarm_worker(
+                        "spawn",
+                        name="verifier",
+                        prompt="Check diff",
+                        role="verifier",
+                        swarm_id=init_res["swarm_id"],
+                    ))
+                    self.assertIn("policy_warning", ver_res)
+
+            asyncio.run(_run())
+
+    def test_reject_policy_defaults_and_explicit_override(self) -> None:
+        policy_file = self.tmp_root / "custom_role_policy.json"
+        policy_file.write_text(json.dumps({
+            "version": 1,
+            "enforcement": "reject",
+            "ide_only_roles": ["researcher", "architect", "verifier"],
+            "ide_subagent_preferences": {
+                "tool": "invoke_subagent",
+                "type_name": "self",
+                "preferred_tiers": {"research": "pro"},
+            },
+            "hermes_worker_defaults": {
+                "model": "custom-exec-model",
+                "provider": "custom-exec-provider",
+            },
+        }), encoding="utf-8")
+
+        captured: list[dict] = []
+
+        async def _fake_spawn(**kwargs):
+            captured.append(dict(kwargs))
+            return {"tasks": [{"id": "t2", "worker": kwargs["name"], "model": kwargs.get("model"), "provider": kwargs.get("provider")}]}
+
+        with patch.dict(os.environ, {"HERMES_SWARM_ROLE_POLICY": str(policy_file)}):
+            async def _run() -> None:
+                cat_res = json.loads(await mcp_srv.swarm_catalog(workdir=str(self.repo_dir)))
+                self.assertEqual(cat_res["role_policy"]["enforcement"], "reject")
+                self.assertEqual(cat_res["role_policy"]["hermes_worker_defaults"]["model"], "custom-exec-model")
+
+                init_res = json.loads(await mcp_srv.swarm_manage(
+                    "init",
+                    primary_conversation_id="conv-rp-reject",
+                    workspace=str(self.repo_dir),
+                ))
+                sid = init_res["swarm_id"]
+                rt = mcp_srv._swarm_mgr.get_runtime(sid)
+
+                with patch.object(rt, "spawn_workers", side_effect=_fake_spawn):
+                    with self.assertRaises(ValueError) as ctx_role:
+                        await mcp_srv.swarm_worker(
+                            "spawn",
+                            name="res-1",
+                            prompt="Research kernels",
+                            role="researcher",
+                            swarm_id=sid,
+                        )
+                    self.assertIn("invoke_subagent", str(ctx_role.exception))
+
+                    with self.assertRaises(ValueError) as ctx_name:
+                        await mcp_srv.swarm_worker(
+                            "spawn",
+                            name="verifier-1",
+                            prompt="Audit code",
+                            role="worker",
+                            swarm_id=sid,
+                        )
+                    self.assertIn("name='verifier'", str(ctx_name.exception))
+
+                    # Allowed execution role inherits hermes_worker_defaults when omitted
+                    ok_res = json.loads(await mcp_srv.swarm_worker(
+                        "spawn",
+                        name="impl-1",
+                        prompt="Implement kernel patch",
+                        role="implementer",
+                        swarm_id=sid,
+                    ))
+                    self.assertEqual(ok_res["tasks"][0]["model"], "custom-exec-model")
+                    self.assertEqual(ok_res["tasks"][0]["provider"], "custom-exec-provider")
+
+                    # Explicit override works even under enforcement='reject'
+                    ovr_res = json.loads(await mcp_srv.swarm_worker(
+                        "spawn",
+                        name="ver-override",
+                        prompt="Explicitly run verification script",
+                        role="verifier",
+                        model="explicit-model",
+                        allow_ide_only_role=True,
+                        swarm_id=sid,
+                    ))
+                    self.assertEqual(ovr_res["tasks"][0]["model"], "explicit-model")
+
+            asyncio.run(_run())
 
 
 if __name__ == "__main__":
