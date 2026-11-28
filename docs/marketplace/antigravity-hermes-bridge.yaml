@@ -4,7 +4,7 @@
 name: antigravity-hermes-bridge
 title: Antigravity <-> Hermes Bridge
 repo: https://github.com/MAHDI-AQ/antigravity-hermes-bridge
-sha: "d6bbf33e74313c081bb19ca93dd8e3ad5a135115"
+sha: "aff855aa07227cc9392eafd7f7ed940616e93aef"
 subdir: packages/hermes-bridge
 description: >-
   Antigravity <-> Hermes interoperability bridge for heterogeneous and local-model
@@ -23,7 +23,7 @@ tier: community
 category: tools
 requires_hermes: ">=0.21.4"
 version: "1.0.0"
-docs_url: https://github.com/MAHDI-AQ/antigravity-hermes-bridge/blob/d6bbf33e74313c081bb19ca93dd8e3ad5a135115/packages/hermes-bridge/README.md
+docs_url: https://github.com/MAHDI-AQ/antigravity-hermes-bridge/blob/aff855aa07227cc9392eafd7f7ed940616e93aef/packages/hermes-bridge/README.md
 readme: true
 platforms: []
 capabilities:

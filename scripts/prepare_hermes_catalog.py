@@ -78,7 +78,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         text = re.sub(r'(?m)^sha:\s*"?[0-9a-f]{40}"?\s*$', f'sha: "{sha}"', text)
         text = re.sub(
-            r'(?m)^docs_url:\s*(https://github\.com/[^/]+/[^/]+/blob/)[0-9a-f]{40}(/.*)$',
+            r'(?m)^(docs_url:\s*https://github\.com/[^/]+/[^/]+/blob/)[0-9a-f]{40}(/.*)$',
             rf'\g<1>{sha}\g<2>',
             text,
         )
