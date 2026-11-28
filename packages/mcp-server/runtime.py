@@ -4748,6 +4748,57 @@ def validate_coordinator_conversation_id(
     )
 
 
+def resolve_or_heal_antigravity_conversation_id(
+    cid: str,
+    parent_cid: str | None = None,
+    *,
+    allow_single_candidate: bool = True,
+) -> tuple[bool, str, str | None, str | None]:
+    """Validate an Antigravity subagent UUID and auto-heal spliced/truncated IDs when unambiguous.
+
+    Returns `(ok, resolved_cid, auto_corrected_from, error_message)`.
+    """
+    clean_cid = str(cid or "").strip()
+    ok, err = validate_coordinator_conversation_id(clean_cid, parent_cid)
+    if ok:
+        return True, clean_cid, None, None
+
+    clean_parent = str(parent_cid or "").strip() or None
+    if clean_parent and _CONV_ID_RE.match(clean_cid):
+        candidates: list[str] = []
+        for cand in _discover_coordinator_subagent_candidates(clean_parent):
+            if cand and cand not in candidates:
+                candidates.append(cand)
+        for child in discover_antigravity_child_members(clean_parent):
+            cc = str(child.get("conversationId") or "").strip()
+            if cc and cc not in candidates:
+                candidates.append(cc)
+
+        if candidates:
+            low_in = clean_cid.lower()
+            best_len = 0
+            best_matches: list[str] = []
+            for cand in candidates:
+                low_c = cand.lower()
+                pref = 0
+                for a, b in zip(low_in, low_c):
+                    if a != b:
+                        break
+                    pref += 1
+                if pref >= 8:
+                    if pref > best_len:
+                        best_len = pref
+                        best_matches = [cand]
+                    elif pref == best_len:
+                        best_matches.append(cand)
+            if len(best_matches) == 1:
+                return True, best_matches[0], clean_cid, None
+            if allow_single_candidate and len(candidates) == 1:
+                return True, candidates[0], clean_cid, None
+
+    return False, clean_cid, None, err
+
+
 def _resolve_antigravity_transcript_file(
     conv_ids: list[str],
     *,

@@ -87,11 +87,12 @@ You are connected to the Hermes A2A Swarm Bridge (`hermes-a2a`), enabling a 3-ti
 1. Tier 1 (`primary` — User + Primary Antigravity session):
    - Resolve active workspace via `swarm_workspace(action="get_workdir")` (and `set_workdir` if needed).
    - Initialize this conversation's 1:1 swarm via `swarm_manage(action="init", conversation_id=..., title=..., mission=...)` and put `open_board` on its own line (never a manual board link or command).
-   - Spawn ONE dedicated Tier-2 Coordinator subagent via `invoke_subagent`, bind its exact verbatim `conversationId`
+   - Spawn ONE dedicated Tier-2 Coordinator subagent via `invoke_subagent` with `Model="inherit"` (fast/medium dispatcher — NEVER `pro`/XHigh for Coordinator; reserve `pro`/XHigh strictly for Tier-2 IDE Specialists), bind its exact verbatim `conversationId`
      via `swarm_manage(action="bind_coordinator", conversation_id=..., coordinator_conversation_id=..., model=..., provider=...)` (NEVER hand-type or splice UUID segments), and wait for `@primary` escalations.
    - Read the project's Obsidian vault (`Handoffs/current.md` and `Lessons/lessons.md`) before starting and write verified receipts/lessons to `Evidence/` / `Handoffs/` before closing.
 2. Tier 2a (`coordinator` + IDE Frontier Subagents via `invoke_subagent(TypeName="self", ...)`):
-   - Thinking & judgment roles (Research, Architecture/Design, Planning, Specialist Consultation, and Adversarial Verification) belong to **IDE Frontier Subagents** (`invoke_subagent`, `TypeName="self"`), NEVER cheap Hermes execution workers.
+   - Coordinator is a **thin, fast dispatcher**: read ONLY the active project vault's `Handoffs/current.md` (if declared) and `hermes-swarm-pane/SKILL.md` once — NEVER read codebase source files, multiple skill manuals, or long logs inline. Within 1–2 turns, dispatch Tier-2 IDE Specialists (`invoke_subagent`, `Model="pro"`) and/or Hermes bricklayers (`swarm_worker`), register IDE members (`register_member`), publish `set_plan`, and block on `swarm_wait`.
+   - Thinking & judgment roles (Research, Architecture/Design, Planning, Specialist Consultation, and Adversarial Verification) belong to **IDE Frontier Subagents** (`invoke_subagent`, `TypeName="self"`, `Model="pro"`), NEVER Coordinator inline reading or cheap Hermes execution workers.
    - Immediately after spawning any Antigravity IDE subagent with `invoke_subagent`, register it as a first-class board member via `swarm_manage(action="register_member", name=..., role=..., conversation_id="<exact conversationId>", assignment=...)` and include it in `set_plan` so it appears in `Members`, `Overview`, and `Graph` (and mark it `done` / `remove_member` when stopped or complete).
    - Inspect `role_policy` returned by `swarm_manage(init|status)` / `swarm_catalog()` so local user preferences (IDE tiers, restricted roles, execution worker model defaults) are always honored.
    - Because `wakeup_bridge` only wakes `primary` and `coordinator`, Coordinator bridges outputs between IDE subagents and Hermes workers (`@coordinator` only).
@@ -511,13 +512,15 @@ async def swarm_manage(
             raise ValueError("`coordinator_conversation_id` is required for action='bind_coordinator'.")
         existing_meta = await asyncio.to_thread(_swarm_mgr.store.read_meta, sid)
         prim_for_check = str(primary_conversation_id or (existing_meta or {}).get("primaryConversationId") or "").strip() or None
-        valid_ccid, valid_err = await asyncio.to_thread(
-            runtime_mod.validate_coordinator_conversation_id,
+        valid_ccid, resolved_ccid, auto_corrected_from, valid_err = await asyncio.to_thread(
+            runtime_mod.resolve_or_heal_antigravity_conversation_id,
             ccid,
             prim_for_check,
+            allow_single_candidate=True,
         )
         if not valid_ccid:
             raise ValueError(valid_err or f"Invalid coordinator_conversation_id: {ccid!r}")
+        ccid = resolved_ccid
         existing_ws = (existing_meta or {}).get("workspace")
         ws_for_bind = (
             resolved_ws
@@ -558,14 +561,17 @@ async def swarm_manage(
         )
         if _http_ctrl.is_running():
             await asyncio.to_thread(_http_ctrl._register_self, swarm_id=sid)
-        return _json_str({
+        resp_bind: dict[str, Any] = {
             "swarm_id": sid,
             "open_board": _OPEN_BOARD_LINK,
             "coordinator_conversation_id": ccid,
             "model": eff_model,
             "provider": eff_provider,
             "meta": meta,
-        })
+        }
+        if auto_corrected_from:
+            resp_bind["auto_corrected_from"] = auto_corrected_from
+        return _json_str(resp_bind)
 
     if act in ("register_member", "add_member"):
         clean_name = str(name or "").strip().lstrip("@")
@@ -576,16 +582,19 @@ async def swarm_manage(
         existing_meta = await asyncio.to_thread(_swarm_mgr.store.read_meta, sid)
         prim_for_check = str(primary_conversation_id or (existing_meta or {}).get("primaryConversationId") or "").strip() or None
         coord_for_check = str((existing_meta or {}).get("coordinatorConversationId") or "").strip() or None
+        auto_corrected_cid_from: str | None = None
         if eff_runtime == "antigravity":
             if not cid:
                 raise ValueError("`conversation_id` is required when registering an Antigravity member.")
-            valid_cid, valid_err = await asyncio.to_thread(
-                runtime_mod.validate_coordinator_conversation_id,
+            valid_cid, resolved_cid, auto_corrected_cid_from, valid_err = await asyncio.to_thread(
+                runtime_mod.resolve_or_heal_antigravity_conversation_id,
                 cid,
                 coord_for_check or prim_for_check,
+                allow_single_candidate=False,
             )
             if not valid_cid:
                 raise ValueError(valid_err or f"Invalid conversation_id: {cid!r}")
+            cid = resolved_cid
 
         eff_model = str(model or "").strip() or None
         eff_provider = str(provider or "").strip() or ("antigravity" if eff_runtime == "antigravity" else None)
@@ -628,12 +637,15 @@ async def swarm_manage(
             )
         if _http_ctrl.is_running():
             await asyncio.to_thread(_http_ctrl._register_self, swarm_id=sid)
-        return _json_str({
+        resp_reg: dict[str, Any] = {
             "swarm_id": sid,
             "open_board": _OPEN_BOARD_LINK,
             "member": member_rec,
             "meta": meta,
-        })
+        }
+        if auto_corrected_cid_from:
+            resp_reg["auto_corrected_from"] = auto_corrected_cid_from
+        return _json_str(resp_reg)
 
     if act in ("remove_member", "unregister_member"):
         clean_name = str(name or "").strip().lstrip("@")

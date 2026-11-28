@@ -5716,14 +5716,32 @@ class Phase4HardeningRegressionTests(unittest.TestCase):
                     primary_conversation_id=prim_uuid,
                     workspace=str(self.repo_dir),
                 )
-                # Spliced UUID MUST be rejected with valid candidate hint
-                with self.assertRaises(ValueError) as ctx_err:
+                # Spliced UUID auto-heals cleanly to the real local subagent conversationId
+                healed = json.loads(
                     await mcp_srv.swarm_manage(
                         "bind_coordinator",
                         primary_conversation_id=prim_uuid,
                         coordinator_conversation_id=spliced_uuid,
                     )
+                )
+                self.assertEqual(healed["coordinator_conversation_id"], coord_uuid)
+                self.assertEqual(healed["auto_corrected_from"], spliced_uuid)
+                self.assertEqual(mcp_srv._swarm_mgr.store.resolve_swarm_for_conversation(coord_uuid), prim_uuid)
+
+                # Unrelated UUID with multiple candidates still fails closed with valid candidate hints
+                alt_uuid = "aaaa1111-1111-4111-8111-111111111111"
+                (sub_dir / f"{alt_uuid}.json").write_text(
+                    json.dumps({"conversationId": alt_uuid, "subagentDescriptor": {"role": "Other"}}),
+                    encoding="utf-8",
+                )
+                with self.assertRaises(ValueError) as ctx_err:
+                    await mcp_srv.swarm_manage(
+                        "bind_coordinator",
+                        primary_conversation_id=prim_uuid,
+                        coordinator_conversation_id="00000000-0000-4000-8000-000000000000",
+                    )
                 self.assertIn(coord_uuid, str(ctx_err.exception))
+                (sub_dir / f"{alt_uuid}.json").unlink()
 
                 # Skip check env var allows synthetic UUID
                 with patch.dict(os.environ, {"HERMES_A2A_SKIP_BRAIN_CHECK": "1"}):
@@ -5755,6 +5773,7 @@ class Phase4HardeningRegressionTests(unittest.TestCase):
                 self.assertIn("get_workdir", mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
                 self.assertIn("conversation_id", mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
                 self.assertIn("bind_coordinator", mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
+                self.assertIn('Model="inherit"', mcp_srv.ORCHESTRATOR_INSTRUCTIONS)
 
                 # Coordinator history + pagination + tokens + TPS + workspace
                 hist = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator")
@@ -7881,6 +7900,112 @@ class AntigravityMemberRegistrationAndDiscoveryTests(unittest.TestCase):
             arch_after = next(m for m in snap2["members"] if m["name"] == "sys-arch")
             self.assertEqual(arch_after["status"], "waiting")
             self.assertFalse(arch_after["killed"])
+
+    def test_resolve_swarm_for_conversation_discovers_unbound_coordinator_and_child(self) -> None:
+        """Even if coordinatorConversationId is null in meta.json, opening Coordinator or its IDE subagent keeps the Swarm UI attached."""
+        brain_root = self.tmp_root / "app_data_unbound" / "brain"
+        prim_cid = "c6d9002f-4613-4405-8757-988d9f93cf44"
+        coord_cid = "fb15139e-eb42-4aaf-8c07-091ccb18bd4a"
+        child_cid = "c9f01eb6-930c-42b5-83f4-88fc5db0901f"
+
+        (brain_root / prim_cid / ".system_generated" / "subagents").mkdir(parents=True, exist_ok=True)
+        (brain_root / prim_cid / ".system_generated" / "subagents" / f"{coord_cid}.json").write_text(
+            json.dumps({"conversationId": coord_cid, "subagentDescriptor": {"role": "Swarm Coordinator"}}),
+            encoding="utf-8",
+        )
+        (brain_root / coord_cid / ".system_generated" / "subagents").mkdir(parents=True, exist_ok=True)
+        (brain_root / coord_cid / ".system_generated" / "subagents" / f"{child_cid}.json").write_text(
+            json.dumps({"conversationId": child_cid, "subagentDescriptor": {"role": "Architect"}}),
+            encoding="utf-8",
+        )
+
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = store.derive_swarm_id(conversation_id=prim_cid)
+        mgr.store.upsert_meta(
+            sid,
+            title="Unbound Coord Swarm",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=prim_cid,
+        )
+        with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(self.tmp_root / "app_data_unbound")}, clear=False):
+            store._CONV_RESOLVE_CACHE.clear()
+            self.assertEqual(mgr.store.resolve_swarm_for_conversation(coord_cid), sid)
+            meta_after_coord = mgr.store.read_meta(sid) or {}
+            self.assertEqual(meta_after_coord.get("coordinatorConversationId"), coord_cid)
+            self.assertIn(coord_cid, meta_after_coord.get("conversationIds") or [])
+
+            store._CONV_RESOLVE_CACHE.clear()
+            self.assertEqual(mgr.store.resolve_swarm_for_conversation(child_cid), sid)
+            meta_after_child = mgr.store.read_meta(sid) or {}
+            self.assertIn(child_cid, meta_after_child.get("conversationIds") or [])
+
+    def test_build_observer_snapshot_persists_discovered_coordinator_and_children(self) -> None:
+        """Snapshot auto-persists discovered Coordinator & child IDE subagent conversationIds into meta.json."""
+        brain_root = self.tmp_root / "app_data_snap_persist" / "brain"
+        prim_cid = "dddd1111-1111-4111-8111-111111111111"
+        coord_cid = "eeee2222-2222-4222-8222-222222222222"
+        child_cid = "ffff3333-3333-4333-8333-333333333333"
+
+        (brain_root / prim_cid / ".system_generated" / "subagents").mkdir(parents=True, exist_ok=True)
+        (brain_root / prim_cid / ".system_generated" / "subagents" / f"{coord_cid}.json").write_text(
+            json.dumps({"conversationId": coord_cid, "subagentDescriptor": {"role": "Swarm Coordinator"}}),
+            encoding="utf-8",
+        )
+        coord_logs = brain_root / coord_cid / ".system_generated" / "logs"
+        coord_logs.mkdir(parents=True, exist_ok=True)
+        (coord_logs / "transcript_full.jsonl").write_text(
+            "\n".join([
+                json.dumps({
+                    "step_index": 0,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "WAITING",
+                    "model": "gemini-4-hydrogen-medium",
+                    "created_at": "2026-11-28T11:00:00Z",
+                    "tool_calls": [{
+                        "name": "invoke_subagent",
+                        "args": {"Role": "Research Analyst", "Prompt": "Inspect repo", "Model": "pro"},
+                    }],
+                }),
+                json.dumps({
+                    "step_index": 1,
+                    "type": "GENERIC",
+                    "status": "DONE",
+                    "created_at": "2026-11-28T11:00:01Z",
+                    "content": json.dumps({"conversationId": child_cid}),
+                }),
+            ]) + "\n",
+            encoding="utf-8",
+        )
+        child_logs = brain_root / child_cid / ".system_generated" / "logs"
+        child_logs.mkdir(parents=True, exist_ok=True)
+        (child_logs / "transcript_full.jsonl").write_text(
+            json.dumps({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-4-pro-high",
+                "created_at": "2026-11-28T11:00:05Z",
+                "content": "Done",
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = store.derive_swarm_id(conversation_id=prim_cid)
+        mgr.store.upsert_meta(sid, title="Persist Test", workspace=str(self.repo_dir), primary_conversation_id=prim_cid)
+        mgr.board_service.upsert_member("coordinator", role="coordinator", tier=2, runtime="antigravity", state="working", swarm_id=sid)
+
+        with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(self.tmp_root / "app_data_snap_persist")}, clear=False):
+            snap = http_server.build_observer_snapshot(mgr, sid)
+            coord_m = next(m for m in snap["members"] if m["name"] == "coordinator")
+            self.assertEqual(coord_m["conversationId"], coord_cid)
+            meta_now = mgr.store.read_meta(sid) or {}
+            self.assertEqual(meta_now.get("coordinatorConversationId"), coord_cid)
+            self.assertIn(coord_cid, meta_now.get("conversationIds") or [])
+            self.assertIn(child_cid, meta_now.get("conversationIds") or [])
+            store._CONV_RESOLVE_CACHE.clear()
+            self.assertEqual(mgr.store.resolve_swarm_for_conversation(coord_cid), sid)
+            self.assertEqual(mgr.store.resolve_swarm_for_conversation(child_cid), sid)
 
 
 if __name__ == "__main__":

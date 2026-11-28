@@ -1336,6 +1336,8 @@ def build_observer_snapshot(
             coord_cid_disc or None,
             primary_cid=meta.get("primaryConversationId"),
         )
+        known_meta_cids = {str(x).strip() for x in (meta.get("conversationIds") or []) if str(x).strip()}
+        missing_child_cids: list[str] = []
         by_cid: dict[str, str] = {}
         used_names_low: set[str] = set()
         for mname, mrec in effective_members_map.items():
@@ -1347,6 +1349,8 @@ def build_observer_snapshot(
             ccid = str(child.get("conversationId") or "").strip()
             if not ccid:
                 continue
+            if ccid not in known_meta_cids and ccid not in missing_child_cids:
+                missing_child_cids.append(ccid)
             existing_name = by_cid.get(ccid)
             if existing_name and existing_name in effective_members_map:
                 ex = effective_members_map[existing_name]
@@ -1384,6 +1388,14 @@ def build_observer_snapshot(
                 "updatedAt": child.get("createdAt") or meta.get("updatedAt") or "",
                 "autoDiscovered": True,
             }
+        if missing_child_cids:
+            try:
+                meta_unchanged = _stat_sig_triple(paths.meta_file) == base_sig_before[0]
+                meta = manager.store.upsert_meta(sid, extra_conversation_ids=missing_child_cids)
+                if meta_unchanged:
+                    base_sig_before = (_stat_sig_triple(paths.meta_file), *base_sig_before[1:])
+            except Exception:
+                pass
 
     for name, mem in effective_members_map.items():
         if not isinstance(mem, dict):
@@ -1618,6 +1630,17 @@ def build_observer_snapshot(
                     member_llm_active_ms = int(ag_stats["llmActiveMs"])
                 if not conv_id and ag_stats.get("conversationId"):
                     conv_id = str(ag_stats["conversationId"])
+                if is_coord and conv_id and (
+                    not meta.get("coordinatorConversationId")
+                    or conv_id not in [str(x).strip() for x in (meta.get("conversationIds") or [])]
+                ):
+                    try:
+                        meta_unchanged = _stat_sig_triple(paths.meta_file) == base_sig_before[0]
+                        meta = manager.store.upsert_meta(sid, coordinator_conversation_id=conv_id)
+                        if meta_unchanged:
+                            base_sig_before = (_stat_sig_triple(paths.meta_file), *base_sig_before[1:])
+                    except Exception:
+                        pass
             ag_updated_ms = runtime_mod._compute_coordinator_updated_ms(
                 mem,
                 meta if is_coord else {},

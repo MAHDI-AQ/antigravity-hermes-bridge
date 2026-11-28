@@ -1138,6 +1138,56 @@ def is_conversation_in_swarm(meta: dict[str, Any] | None, conversation_id: str |
     return clean in cids
 
 
+_SAFE_CONV_SEGMENT_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
+
+
+def _antigravity_brain_roots_for_store() -> list[Path]:
+    """Return existing Antigravity `brain` roots safely without importing `runtime`."""
+    candidates: list[Path] = []
+    app_data = (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip()
+    if app_data:
+        app_brain = Path(normalize_local_path(app_data)) / "brain"
+        if app_brain.is_dir():
+            candidates.append(app_brain)
+            return candidates
+    exec_data = (os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "").strip()
+    if exec_data:
+        cur = Path(normalize_local_path(exec_data))
+        for parent in [cur, *cur.parents]:
+            if parent.name == "sidecar_data":
+                bdir = parent.parent / "brain"
+                if bdir.is_dir():
+                    candidates.append(bdir)
+                break
+    gemini_root = Path.home() / ".gemini"
+    default_brain = gemini_root / "antigravity" / "brain"
+    if default_brain.is_dir():
+        candidates.append(default_brain)
+    if gemini_root.is_dir():
+        try:
+            for child in sorted(gemini_root.iterdir()):
+                if child.is_dir():
+                    cand = child / "brain"
+                    if cand.is_dir() and cand not in candidates:
+                        candidates.append(cand)
+        except OSError:
+            pass
+    return candidates
+
+
+def _is_subagent_in_brain(parent_cid: str | None, child_cid: str, brain_roots: list[Path]) -> bool:
+    clean_parent = str(parent_cid or "").strip()
+    if not clean_parent or not _SAFE_CONV_SEGMENT_RE.match(clean_parent):
+        return False
+    if not _SAFE_CONV_SEGMENT_RE.match(child_cid):
+        return False
+    for root in brain_roots:
+        sub_file = root / clean_parent / ".system_generated" / "subagents" / f"{child_cid}.json"
+        if is_path_within(sub_file, [root]) and sub_file.is_file():
+            return True
+    return False
+
+
 def resolve_swarm_for_conversation(
     conversation_id: str | None,
     *,
@@ -1173,6 +1223,7 @@ def resolve_swarm_for_conversation(
         return 0
 
     matches: list[tuple[int, str, str]] = []
+    active_metas: list[tuple[str, dict[str, Any]]] = []
     try:
         for entry in sorted(swarms_dir.iterdir()):
             if not entry.is_dir():
@@ -1186,11 +1237,44 @@ def resolve_swarm_for_conversation(
             meta = read_swarm_meta(sid, state_dir=sdir) or models.default_swarm_meta(sid)
             if meta.get("archived"):
                 continue
+            active_metas.append((sid, meta))
             rank = _match_rank(meta)
             if rank > 0:
                 matches.append((rank, str(meta.get("updatedAt") or ""), sid))
     except OSError:
         return None
+
+    if not matches and _SAFE_CONV_SEGMENT_RE.match(clean_conv):
+        brain_roots = _antigravity_brain_roots_for_store()
+        if brain_roots:
+            active_metas.sort(key=lambda pair: str(pair[1].get("updatedAt") or ""), reverse=True)
+            for sid, meta in active_metas:
+                prim_cid = str(meta.get("primaryConversationId") or "").strip() or None
+                coord_cid = str(meta.get("coordinatorConversationId") or "").strip() or None
+                if _is_subagent_in_brain(prim_cid, clean_conv, brain_roots):
+                    try:
+                        if not coord_cid:
+                            upsert_swarm_meta(sid, coordinator_conversation_id=clean_conv, state_dir=sdir)
+                        else:
+                            upsert_swarm_meta(sid, extra_conversation_ids=[clean_conv], state_dir=sdir)
+                    except OSError:
+                        pass
+                    with _CONV_RESOLVE_CACHE_LOCK:
+                        _CONV_RESOLVE_CACHE[cache_key] = (time.monotonic(), sid)
+                    return sid
+                parent_pool = [coord_cid] if coord_cid else []
+                for cid_item in meta.get("conversationIds") or []:
+                    c_str = str(cid_item or "").strip()
+                    if c_str and c_str != prim_cid and c_str not in parent_pool:
+                        parent_pool.append(c_str)
+                if any(_is_subagent_in_brain(p, clean_conv, brain_roots) for p in parent_pool):
+                    try:
+                        upsert_swarm_meta(sid, extra_conversation_ids=[clean_conv], state_dir=sdir)
+                    except OSError:
+                        pass
+                    with _CONV_RESOLVE_CACHE_LOCK:
+                        _CONV_RESOLVE_CACHE[cache_key] = (time.monotonic(), sid)
+                    return sid
 
     if not matches:
         with _CONV_RESOLVE_CACHE_LOCK:
