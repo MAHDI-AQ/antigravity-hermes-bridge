@@ -1076,7 +1076,7 @@ def _compute_observer_light_sig(
     *,
     view_dir: Path | None = None,
     view_candidate_dirs: tuple[Path, ...] = (),
-    coord_transcript_path: Path | None = None,
+    ag_transcript_paths: tuple[Path, ...] = (),
 ) -> tuple[Any, ...]:
     """Build a cheap stat + runtime-fingerprint signature to short-circuit unchanged observer ETag polls."""
     return (
@@ -1086,7 +1086,7 @@ def _compute_observer_light_sig(
             view_dir=view_dir,
             view_candidate_dirs=view_candidate_dirs,
         ),
-        (str(coord_transcript_path), _stat_sig_triple(coord_transcript_path)) if coord_transcript_path else None,
+        tuple((str(p), _stat_sig_triple(p)) for p in ag_transcript_paths),
     )
 
 
@@ -1120,12 +1120,11 @@ def try_fast_unchanged_snapshot(
     if time.monotonic() >= float(cached.get("nextExpiryMono") or 0.0):
         return None
 
-    # If a coordinator existed without a transcript file, check whether one just appeared.
-    coord_path = cached.get("coordTranscriptPath")
-    if cached.get("hasCoordinator") and coord_path is None:
+    # If any Antigravity member existed without a transcript file, check whether one just appeared.
+    for lookup_cids, lookup_prim in cached.get("agMissingLookups") or ():
         _, newly_found = runtime_mod._resolve_antigravity_transcript_file(
-            list(cached.get("coordLookupCids") or []),
-            primary_cid=cached.get("primaryConversationId"),
+            list(lookup_cids),
+            primary_cid=lookup_prim,
         )
         if newly_found is not None:
             return None
@@ -1136,7 +1135,7 @@ def try_fast_unchanged_snapshot(
         runtime,
         view_dir=cached.get("viewDir"),
         view_candidate_dirs=tuple(cached.get("viewCandidateDirs") or ()),
-        coord_transcript_path=coord_path,
+        ag_transcript_paths=tuple(cached.get("agTranscriptPaths") or ()),
     )
     if cur_sig != cached.get("sig"):
         return None
@@ -1313,10 +1312,8 @@ def build_observer_snapshot(
     now_ms = int(time.time() * 1000)
     now_mono = time.monotonic()
     earliest_expiry_ms: int | None = None
-    has_coordinator = False
-    coord_lookup_cids: list[str] = []
-    coord_transcript_path: Path | None = None
-    coord_sig_before: tuple[str, tuple[int, int, int, int] | None] | None = None
+    ag_watch_map: dict[str, tuple[int, int, int, int] | None] = {}
+    ag_missing_lookups: list[tuple[tuple[str, ...], str | None]] = []
     subagents_map = board.get("subagents") if isinstance(board.get("subagents"), dict) else {}
     members_out: list[dict[str, Any]] = []
     unseen_by: dict[str, list[int]] = {}
@@ -1324,12 +1321,81 @@ def build_observer_snapshot(
     stuck_keys: list[str] = []
     raw_task_by_id = {str(t.get("id") or ""): t for t in raw_tasks if isinstance(t, dict) and t.get("id")}
 
-    for name, mem in members_map.items():
+    effective_members_map: dict[str, dict[str, Any]] = {
+        str(k): dict(v)
+        for k, v in members_map.items()
+        if isinstance(v, dict)
+    }
+    coord_entry = effective_members_map.get(models.Role.COORDINATOR.value) or {}
+    coord_killed_on_board = bool(coord_entry.get("killed")) or (
+        str(coord_entry.get("state") or "").strip().lower() == models.MemberState.KILLED.value
+    )
+    coord_cid_disc = str(meta.get("coordinatorConversationId") or coord_entry.get("conversationId") or "").strip()
+    if coord_cid_disc or meta.get("primaryConversationId"):
+        discovered_children = runtime_mod.discover_antigravity_child_members(
+            coord_cid_disc or None,
+            primary_cid=meta.get("primaryConversationId"),
+        )
+        by_cid: dict[str, str] = {}
+        used_names_low: set[str] = set()
+        for mname, mrec in effective_members_map.items():
+            used_names_low.add(mname.lower())
+            mcid = str(mrec.get("conversationId") or "").strip()
+            if mcid:
+                by_cid[mcid] = mname
+        for child in discovered_children:
+            ccid = str(child.get("conversationId") or "").strip()
+            if not ccid:
+                continue
+            existing_name = by_cid.get(ccid)
+            if existing_name and existing_name in effective_members_map:
+                ex = effective_members_map[existing_name]
+                if not ex.get("assignment") and child.get("assignment"):
+                    ex["assignment"] = child["assignment"]
+                if not ex.get("model") and child.get("requestedModel"):
+                    ex["model"] = child["requestedModel"]
+                if child.get("killed") and not ex.get("killed"):
+                    ex["killed"] = True
+                    ex["state"] = models.MemberState.KILLED.value
+                continue
+            cand_name = str(child.get("name") or "ide-agent").strip() or "ide-agent"
+            base_cand = cand_name
+            idx = 2
+            while cand_name.lower() in used_names_low:
+                suf = f"-{idx}"
+                cand_name = f"{base_cand[: max(1, 24 - len(suf))].rstrip('-')}{suf}"
+                idx += 1
+            used_names_low.add(cand_name.lower())
+            by_cid[ccid] = cand_name
+            is_child_killed = bool(child.get("killed") or coord_killed_on_board)
+            effective_members_map[cand_name] = {
+                "name": cand_name,
+                "role": child.get("role") or "engineer",
+                "tier": 2,
+                "runtime": "antigravity",
+                "state": models.MemberState.KILLED.value if is_child_killed else models.MemberState.WORKING.value,
+                "killed": is_child_killed,
+                "assignment": child.get("assignment") or "",
+                "channels": ["*"],
+                "parent": models.Role.COORDINATOR.value,
+                "conversationId": ccid,
+                "model": child.get("requestedModel"),
+                "provider": "antigravity",
+                "updatedAt": child.get("createdAt") or meta.get("updatedAt") or "",
+                "autoDiscovered": True,
+            }
+
+    for name, mem in effective_members_map.items():
         if not isinstance(mem, dict):
             continue
-        role = models.normalize_role(mem.get("role"))
+        eff_runtime = str(mem.get("runtime") or "").strip().lower()
+        role = models.normalize_member_role(mem.get("role"), runtime=eff_runtime or "hermes")
+        is_coord = role == models.Role.COORDINATOR.value
+        if not eff_runtime:
+            eff_runtime = "antigravity" if is_coord else "hermes"
+        is_antigravity = is_coord or eff_runtime == "antigravity"
         killed = bool(mem.get("killed")) or str(mem.get("state") or "").lower() == models.MemberState.KILLED.value
-        trow = latest_task_by_worker.get(name)
+        trow = latest_task_by_worker.get(name) if not is_antigravity else None
         ui_status = _member_status_for_ui(str(mem.get("state") or ""), killed=killed)
         if not killed and trow:
             if trow["state"] in (models.TaskState.WORKING.value, models.TaskState.SUBMITTED.value):
@@ -1352,9 +1418,8 @@ def build_observer_snapshot(
                 activity = str(trow["lastTextPreview"])[-180:]
                 activity_kind = "thinking"
 
-        is_coord = role == models.Role.COORDINATOR.value
         is_role_worker = role in (models.Role.MONITOR.value, models.Role.NARRATOR.value) or bool(_ROLE_WORKER_RE.match(name))
-        conv_id = meta.get("coordinatorConversationId") if is_coord else (mem.get("conversationId") or "")
+        conv_id = (meta.get("coordinatorConversationId") or mem.get("conversationId") or "") if is_coord else (mem.get("conversationId") or "")
         eff_chs = board_mod.effective_member_channels(role, mem.get("channels"), name)
         disp_chs = ["*" if c == "*" else board_mod.channel_display_name(c) for c in eff_chs]
         last_read = int(mem.get("lastReadSeq") or 0)
@@ -1519,55 +1584,61 @@ def build_observer_snapshot(
         member_tps = float((trow or {}).get("tps") or 0.0)
         member_elapsed_ms = int((trow or {}).get("elapsedMs") or 0)
         member_llm_active_ms = int((trow or {}).get("llmActiveMs") or 0)
-        if is_coord:
-            has_coordinator = True
-            coord_lookup_cids = [conv_id] if conv_id else []
-            _, coord_tpath = runtime_mod._resolve_antigravity_transcript_file(
-                coord_lookup_cids,
-                primary_cid=meta.get("primaryConversationId"),
+        if is_antigravity:
+            ag_lookup_cids = [conv_id] if conv_id else []
+            ag_prim_lookup = meta.get("primaryConversationId") if is_coord else None
+            _, ag_tpath = runtime_mod._resolve_antigravity_transcript_file(
+                ag_lookup_cids,
+                primary_cid=ag_prim_lookup,
             )
-            if coord_tpath is not None:
-                coord_transcript_path = coord_tpath
-                coord_sig_before = (str(coord_tpath), _stat_sig_triple(coord_tpath))
-            coord_stats = runtime_mod.extract_antigravity_transcript_summary(
-                coord_lookup_cids,
-                primary_cid=meta.get("primaryConversationId"),
+            if ag_tpath is not None:
+                ag_watch_map[str(ag_tpath)] = _stat_sig_triple(ag_tpath)
+            elif ag_lookup_cids or (is_coord and ag_prim_lookup):
+                ag_missing_lookups.append((tuple(ag_lookup_cids), ag_prim_lookup))
+            ag_stats = runtime_mod.extract_antigravity_transcript_summary(
+                ag_lookup_cids,
+                primary_cid=ag_prim_lookup,
             )
-            if coord_stats:
-                if not member_model and coord_stats.get("model"):
-                    member_model = str(coord_stats["model"])
-                if not member_provider and coord_stats.get("provider"):
-                    member_provider = str(coord_stats["provider"])
-                if not member_steps and coord_stats.get("steps"):
-                    member_steps = int(coord_stats["steps"])
-                if not member_tool_calls and coord_stats.get("toolCalls"):
-                    member_tool_calls = int(coord_stats["toolCalls"])
-                if int(member_tokens.get("total") or 0) == 0 and isinstance(coord_stats.get("tokens"), dict):
-                    member_tokens = dict(coord_stats["tokens"])
-                if member_tps <= 0.0 and coord_stats.get("tps"):
-                    member_tps = float(coord_stats["tps"])
-                if member_elapsed_ms <= 0 and coord_stats.get("elapsedMs"):
-                    member_elapsed_ms = int(coord_stats["elapsedMs"])
-                if member_llm_active_ms <= 0 and coord_stats.get("llmActiveMs"):
-                    member_llm_active_ms = int(coord_stats["llmActiveMs"])
-                if not conv_id and coord_stats.get("conversationId"):
-                    conv_id = str(coord_stats["conversationId"])
-            coord_updated_ms = runtime_mod._compute_coordinator_updated_ms(
+            if ag_stats:
+                if ag_stats.get("model"):
+                    member_model = str(ag_stats["model"])
+                if not member_provider and ag_stats.get("provider"):
+                    member_provider = str(ag_stats["provider"])
+                if not member_steps and ag_stats.get("steps"):
+                    member_steps = int(ag_stats["steps"])
+                if not member_tool_calls and ag_stats.get("toolCalls"):
+                    member_tool_calls = int(ag_stats["toolCalls"])
+                if int(member_tokens.get("total") or 0) == 0 and isinstance(ag_stats.get("tokens"), dict):
+                    member_tokens = dict(ag_stats["tokens"])
+                if member_tps <= 0.0 and ag_stats.get("tps"):
+                    member_tps = float(ag_stats["tps"])
+                if member_elapsed_ms <= 0 and ag_stats.get("elapsedMs"):
+                    member_elapsed_ms = int(ag_stats["elapsedMs"])
+                if member_llm_active_ms <= 0 and ag_stats.get("llmActiveMs"):
+                    member_llm_active_ms = int(ag_stats["llmActiveMs"])
+                if not conv_id and ag_stats.get("conversationId"):
+                    conv_id = str(ag_stats["conversationId"])
+            ag_updated_ms = runtime_mod._compute_coordinator_updated_ms(
                 mem,
-                meta,
+                meta if is_coord else {},
                 last_post_ts_ms=int((lp or {}).get("ts") or 0),
                 coord_name=name,
             )
-            ui_status, coord_expiry_ms = runtime_mod.reconcile_coordinator_state(
+            ui_status, ag_expiry_ms = runtime_mod.reconcile_coordinator_state(
                 ui_status,
                 killed=killed,
-                coord_stats=coord_stats or None,
-                active_worker_count=len(active_tasks),
-                member_updated_ms=coord_updated_ms,
+                coord_stats=ag_stats or None,
+                active_worker_count=(len(active_tasks) if is_coord else 0),
+                member_updated_ms=ag_updated_ms,
                 now_ms=now_ms,
             )
-            if coord_expiry_ms is not None and (earliest_expiry_ms is None or coord_expiry_ms < earliest_expiry_ms):
-                earliest_expiry_ms = coord_expiry_ms
+            if ag_expiry_ms is not None and (earliest_expiry_ms is None or ag_expiry_ms < earliest_expiry_ms):
+                earliest_expiry_ms = ag_expiry_ms
+            if ui_status == "working" and not killed and isinstance(ag_stats.get("currentTool"), dict) and ag_stats["currentTool"].get("name"):
+                cur_tool = dict(ag_stats["currentTool"])
+                prev_txt = str(cur_tool.get("preview") or "").strip()
+                activity = f"Running {cur_tool['name']}({prev_txt})" if prev_txt else f"Running {cur_tool['name']}"
+                activity_kind = "tool"
         m_pure, m_cached, m_cw, m_out, m_proc, _ = _extract_token_economy(member_tokens)
         member_tokens.setdefault("pureInput", m_pure)
         member_tokens.setdefault("cachedInput", m_cached)
@@ -1589,7 +1660,8 @@ def build_observer_snapshot(
             "name": name,
             "role": role,
             "tier": int(mem.get("tier") or 2),
-            "runtime": mem.get("runtime") or ("antigravity" if is_coord else "hermes"),
+            "runtime": eff_runtime,
+            "autoDiscovered": bool(mem.get("autoDiscovered", False)),
             "model": member_model,
             "provider": member_provider,
             "status": ui_status,
@@ -1750,6 +1822,9 @@ def build_observer_snapshot(
             "members": [
                 (
                     m["name"],
+                    m["role"],
+                    m["runtime"],
+                    m.get("conversationId") or "",
                     m["status"],
                     m["killed"],
                     m.get("model"),
@@ -1844,6 +1919,7 @@ def build_observer_snapshot(
         *(meta.get("conversationIds") or []),
         meta.get("primaryConversationId"),
         meta.get("coordinatorConversationId"),
+        *[m_item.get("conversationId") for m_item in members_out if m_item.get("runtime") == "antigravity"],
     ]:
         clean_c = str(cid_item or "").strip()
         if clean_c and clean_c not in conv_ids_list:
@@ -1869,13 +1945,15 @@ def build_observer_snapshot(
             if meta_exp_m < next_expiry_mono:
                 next_expiry_mono = meta_exp_m
         view_dir_path = Path(str(view_info.get("dir") or paths.swarm_dir))
-        light_sig_before = (base_sig_before, view_sig_before, coord_sig_before)
+        sorted_ag_paths = tuple(sorted((Path(p) for p in ag_watch_map), key=lambda p: str(p)))
+        ag_sigs_before = tuple((str(p), ag_watch_map[str(p)]) for p in sorted_ag_paths)
+        light_sig_before = (base_sig_before, view_sig_before, ag_sigs_before)
         light_sig_after = _compute_observer_light_sig(
             paths,
             runtime,
             view_dir=view_dir_path,
             view_candidate_dirs=view_candidate_dirs,
-            coord_transcript_path=coord_transcript_path,
+            ag_transcript_paths=sorted_ag_paths,
         )
         etag_cache_key = (str(paths.swarm_dir), sid)
         with _OBSERVER_ETAG_CACHE_LOCK:
@@ -1892,9 +1970,8 @@ def build_observer_snapshot(
                     "nextExpiryMono": next_expiry_mono,
                     "viewDir": view_dir_path,
                     "viewCandidateDirs": view_candidate_dirs,
-                    "hasCoordinator": has_coordinator,
-                    "coordLookupCids": list(coord_lookup_cids),
-                    "coordTranscriptPath": coord_transcript_path,
+                    "agTranscriptPaths": sorted_ag_paths,
+                    "agMissingLookups": tuple(ag_missing_lookups),
                 }
                 _OBSERVER_ETAG_CACHE.move_to_end(etag_cache_key)
                 while len(_OBSERVER_ETAG_CACHE) > _OBSERVER_ETAG_CACHE_MAX:

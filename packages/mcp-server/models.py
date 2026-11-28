@@ -220,6 +220,38 @@ _WORKER_ROLE_ALIASES: dict[str, str] = {
     "impl": Role.WORKER.value,
 }
 
+IDE_ROLES = frozenset({
+    Role.PRIMARY.value,
+    Role.COORDINATOR.value,
+    Role.RESEARCHER.value,
+    Role.VERIFIER.value,
+    "architect",
+    "designer",
+    "planner",
+    "consultant",
+    "reviewer",
+    "auditor",
+    "engineer",
+    "specialist",
+})
+
+_IDE_ROLE_ALIASES: dict[str, str] = {
+    "coord": Role.COORDINATOR.value,
+    "lead": Role.COORDINATOR.value,
+    "research": Role.RESEARCHER.value,
+    "investigator": Role.RESEARCHER.value,
+    "design": "architect",
+    "designer": "architect",
+    "architecture": "architect",
+    "plan": "planner",
+    "consult": "consultant",
+    "verify": Role.VERIFIER.value,
+    "review": "reviewer",
+    "audit": "auditor",
+    "implementer": Role.WORKER.value,
+    "impl": Role.WORKER.value,
+}
+
 
 def normalize_role(raw: str | None, default: str = Role.WORKER.value) -> str:
     """Normalize a participant role to a canonical Role value."""
@@ -229,6 +261,40 @@ def normalize_role(raw: str | None, default: str = Role.WORKER.value) -> str:
     if text in ALL_ROLES:
         return text
     return default
+
+
+def normalize_member_role(
+    raw: str | None,
+    *,
+    runtime: str | None = None,
+    default: str = Role.WORKER.value,
+) -> str:
+    """Normalize a member role, preserving rich IDE specialist roles when `runtime='antigravity'`."""
+    text = str(raw or "").strip().lower()
+    rt = str(runtime or "").strip().lower()
+    if rt == "antigravity" or text in IDE_ROLES or text in _IDE_ROLE_ALIASES:
+        mapped = _IDE_ROLE_ALIASES.get(text, text)
+        if mapped in IDE_ROLES or mapped in ALL_ROLES:
+            return mapped
+        if rt == "antigravity":
+            if "coord" in text:
+                return Role.COORDINATOR.value
+            if "arch" in text or "design" in text:
+                return "architect"
+            if "research" in text or "investigat" in text:
+                return Role.RESEARCHER.value
+            if "verif" in text:
+                return Role.VERIFIER.value
+            if "review" in text:
+                return "reviewer"
+            if "audit" in text:
+                return "auditor"
+            if "plan" in text:
+                return "planner"
+            if "consult" in text:
+                return "consultant"
+            return "engineer"
+    return normalize_role(raw, default=default)
 
 
 def validate_worker_role(raw: str | None) -> str:
@@ -624,7 +690,7 @@ def new_board_member(
             deduped_channels = None
     return {
         "name": name,
-        "role": normalize_role(role),
+        "role": normalize_member_role(role, runtime=runtime),
         "tier": int(tier),
         "runtime": runtime,
         "state": state,

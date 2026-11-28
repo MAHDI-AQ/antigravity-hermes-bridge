@@ -7628,5 +7628,260 @@ class AuditPhase2BackendBugfixTests(unittest.TestCase):
             asyncio.run(mgr.shutdown())
 
 
+class AntigravityMemberRegistrationAndDiscoveryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_root = Path(self._tmp.name)
+        self.state_dir = self.tmp_root / "state"
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        self.brain_root = self.tmp_root / "app_data" / "brain"
+        self.brain_root.mkdir(parents=True, exist_ok=True)
+        self.repo_dir = self.tmp_root / "repo"
+        self.repo_dir.mkdir(parents=True, exist_ok=True)
+
+        self.orig_mgr = mcp_srv._swarm_mgr
+        self.orig_http = mcp_srv._http_ctrl
+        self.orig_wd = mcp_srv._session_workdir
+        self.orig_conv = mcp_srv._session_conversation_id
+        self.orig_sid = mcp_srv._session_swarm_id
+
+        mcp_srv._swarm_mgr = runtime_mod.SwarmManager(
+            state_dir=self.state_dir,
+            default_workdir_provider=lambda: str(self.repo_dir),
+        )
+        mcp_srv._http_ctrl = http_server.EmbeddedA2AHttpController(mcp_srv._swarm_mgr)
+        mcp_srv._session_workdir = str(self.repo_dir)
+        mcp_srv._session_conversation_id = None
+        mcp_srv._session_swarm_id = None
+
+    def tearDown(self) -> None:
+        mcp_srv._swarm_mgr = self.orig_mgr
+        mcp_srv._http_ctrl = self.orig_http
+        mcp_srv._session_workdir = self.orig_wd
+        mcp_srv._session_conversation_id = self.orig_conv
+        mcp_srv._session_swarm_id = self.orig_sid
+        self._tmp.cleanup()
+
+    def test_register_and_remove_member_and_auto_discover_children(self) -> None:
+        prim_cid = "11111111-1111-4111-8111-111111111111"
+        coord_cid = "22222222-2222-4222-8222-222222222222"
+        arch_cid = "33333333-3333-4333-8333-333333333333"
+        ver_cid = "44444444-4444-4444-8444-444444444444"
+
+        for cid in (prim_cid, coord_cid, arch_cid, ver_cid):
+            (self.brain_root / cid / ".system_generated" / "logs").mkdir(parents=True, exist_ok=True)
+
+        coord_log = self.brain_root / coord_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        coord_steps = [
+            {
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-4-hydrogen-medium",
+                "input_tokens": 1000,
+                "cache_read_tokens": 200,
+                "output_tokens": 120,
+                "created_at": "2026-11-28T10:00:00Z",
+                "tool_calls": [
+                    {
+                        "id": "tc-1",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "\"self\"",
+                            "Role": "\"Systems Kernel Architect\"",
+                            "Model": "\"pro\"",
+                            "Prompt": "\"Diagnose indexing\"",
+                        },
+                    },
+                    {
+                        "id": "tc-2",
+                        "name": "invoke_subagent",
+                        "args": {
+                            "TypeName": "self",
+                            "Role": "Adversarial Verifier",
+                            "Model": "inherit",
+                            "Prompt": "Verify patch",
+                        },
+                    },
+                ],
+            },
+            {
+                "step_index": 1,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-28T10:00:01Z",
+                "content": f'Created the following subagent:\n{{\n  "conversationId": "{arch_cid}"\n}}',
+            },
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "DONE",
+                "created_at": "2026-11-28T10:00:02Z",
+                "content": f'Created the following subagent:\n{{\n  "conversationId": "{ver_cid}"\n}}',
+            },
+        ]
+        coord_log.write_text("\n".join(json.dumps(s) for s in coord_steps) + "\n", encoding="utf-8")
+
+        arch_log = self.brain_root / arch_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        arch_steps = [
+            {
+                "step_index": 0,
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "created_at": "2026-11-28T10:00:02Z",
+                "content": "Diagnose indexing",
+            },
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-4-pro-xhigh",
+                "input_tokens": 2500,
+                "cache_read_tokens": 500,
+                "output_tokens": 400,
+                "created_at": "2026-11-28T10:00:07Z",
+                "tool_calls": [{"id": "a-tc-1", "name": "read_file", "args": {"Path": "/tmp/a.py"}}],
+            },
+            {
+                "step_index": 2,
+                "type": "GENERIC",
+                "status": "RUNNING",
+                "created_at": "2026-11-28T10:00:08Z",
+                "content": "",
+            },
+        ]
+        arch_log.write_text("\n".join(json.dumps(s) for s in arch_steps) + "\n", encoding="utf-8")
+
+        ver_log = self.brain_root / ver_cid / ".system_generated" / "logs" / "transcript.jsonl"
+        ver_log.write_text(
+            json.dumps({
+                "step_index": 0,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-4-pro-high",
+                "input_tokens": 1200,
+                "output_tokens": 180,
+                "created_at": "2026-11-28T10:00:10Z",
+                "content": "[VERIFIER: PASS]",
+                "tool_calls": [],
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        env_patch = {"ANTIGRAVITY_APP_DATA_DIR": str(self.tmp_root / "app_data")}
+        with patch.dict(os.environ, env_patch, clear=False):
+            async def _run() -> dict[str, Any]:
+                init_res = json.loads(await mcp_srv.swarm_manage(
+                    "init",
+                    primary_conversation_id=prim_cid,
+                    title="Bridge Swarm",
+                    workspace=str(self.repo_dir),
+                ))
+                sid = init_res["swarm_id"]
+
+                await mcp_srv.swarm_manage(
+                    "bind_coordinator",
+                    primary_conversation_id=prim_cid,
+                    coordinator_conversation_id=coord_cid,
+                )
+
+                # Invalid conversationId on register_member must fail closed.
+                with self.assertRaises(ValueError):
+                    await mcp_srv.swarm_manage(
+                        "register_member",
+                        primary_conversation_id=prim_cid,
+                        name="bad-arch",
+                        role="architect",
+                        conversation_id="00000000-0000-4000-8000-000000000000",
+                    )
+
+                # Explicit register_member registers arch_cid with preserved architect role, extracted model, and meta.conversationIds.
+                reg_res = json.loads(await mcp_srv.swarm_manage(
+                    "register_member",
+                    primary_conversation_id=prim_cid,
+                    name="sys-arch",
+                    role="architect",
+                    conversation_id=arch_cid,
+                    assignment="Diagnose indexing",
+                ))
+                self.assertEqual(reg_res["member"]["role"], "architect")
+                self.assertEqual(reg_res["member"]["runtime"], "antigravity")
+                self.assertEqual(reg_res["member"]["model"], "gemini-4-pro-xhigh")
+                self.assertIn(arch_cid, reg_res["meta"]["conversationIds"])
+                self.assertEqual(mcp_srv._swarm_mgr.store.resolve_swarm_for_conversation(arch_cid), sid)
+                return {"sid": sid}
+
+            res = asyncio.run(_run())
+            sid = res["sid"]
+
+            # Snapshot surfaces coordinator, explicit sys-arch, AND auto-discovered Adversarial Verifier!
+            snap1 = http_server.build_observer_snapshot(mcp_srv._swarm_mgr, sid)
+            by_name = {m["name"]: m for m in snap1["members"]}
+            self.assertIn("coordinator", by_name)
+            self.assertIn("sys-arch", by_name)
+            self.assertEqual(len([m for m in snap1["members"] if m.get("conversationId") == arch_cid]), 1)
+            ver_mems = [m for m in snap1["members"] if m.get("conversationId") == ver_cid]
+            self.assertEqual(len(ver_mems), 1)
+            ver_mem = ver_mems[0]
+            self.assertEqual(ver_mem["runtime"], "antigravity")
+            self.assertEqual(ver_mem["role"], "verifier")
+            self.assertEqual(ver_mem["model"], "gemini-4-pro-high")
+            self.assertEqual(ver_mem["status"], "waiting")
+            self.assertTrue(ver_mem["autoDiscovered"])
+
+            arch_mem = by_name["sys-arch"]
+            self.assertEqual(arch_mem["model"], "gemini-4-pro-xhigh")
+            self.assertEqual(arch_mem["steps"], 1)
+            self.assertEqual(arch_mem["toolCalls"], 1)
+            self.assertEqual(arch_mem["tokens"]["total"], 3400)
+
+            # History query on child Antigravity member resolves strictly its OWN transcript, not Coordinator's.
+            hist = runtime_mod.query_member_session_history(self.state_dir, sid, "sys-arch")
+            self.assertEqual(hist["conversationId"], arch_cid)
+            self.assertEqual(hist["model"], "gemini-4-pro-xhigh")
+            self.assertTrue(any("Diagnose indexing" in str(m.get("content") or "") for m in hist["messages"]))
+
+            # Fast ETag hit works and invalidates when child transcript updates on disk.
+            fast_hit = http_server.try_fast_unchanged_snapshot(
+                mcp_srv._swarm_mgr,
+                sid,
+                conv_id=prim_cid,
+                known_etag=snap1["etag"],
+            )
+            self.assertIsNotNone(fast_hit)
+
+            arch_steps.append({
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "model": "gemini-4-pro-xhigh",
+                "input_tokens": 3000,
+                "output_tokens": 500,
+                "created_at": "2026-11-28T10:00:12Z",
+                "content": "Root cause identified.",
+                "tool_calls": [],
+            })
+            arch_log.write_text("\n".join(json.dumps(s) for s in arch_steps) + "\n", encoding="utf-8")
+            fast_miss = http_server.try_fast_unchanged_snapshot(
+                mcp_srv._swarm_mgr,
+                sid,
+                conv_id=prim_cid,
+                known_etag=snap1["etag"],
+            )
+            self.assertIsNone(fast_miss)
+
+            # remove_member(state="done") updates board member state cleanly.
+            asyncio.run(mcp_srv.swarm_manage(
+                "remove_member",
+                primary_conversation_id=prim_cid,
+                name="sys-arch",
+                state="done",
+            ))
+            snap2 = http_server.build_observer_snapshot(mcp_srv._swarm_mgr, sid)
+            arch_after = next(m for m in snap2["members"] if m["name"] == "sys-arch")
+            self.assertEqual(arch_after["status"], "waiting")
+            self.assertFalse(arch_after["killed"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

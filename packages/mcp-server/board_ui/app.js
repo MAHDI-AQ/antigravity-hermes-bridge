@@ -610,6 +610,36 @@
   }
 
   const canOpenConversation = () => !!window.sidecar?.ui?.toggleConversation;
+  function isAntigravityMember(m, name = '') {
+    const rt = String(m?.runtime || '').trim().toLowerCase();
+    if (rt === 'antigravity') return true;
+    const role = m ? roleOf(m) : '';
+    if (role === 'coordinator' || role === 'primary') return true;
+    const n = String(name || m?.name || m?.rawName || '').trim().toLowerCase();
+    const leadLow = String(window.SwarmHive?.leadName || '').trim().toLowerCase();
+    return n === 'coordinator' || (leadLow && n === leadLow);
+  }
+  function openMember(name, subSessionId = '') {
+    const leadName = window.SwarmHive?.leadName || 'coordinator';
+    const target = name === 'coordinator' ? leadName : name;
+    const m = memberOf(target) || memberByLower(String(target || '').toLowerCase());
+    if (m && m.local === false) {
+      const rCid = convIdOf(m);
+      if (rCid) return openConversation(rCid);
+      toast(`${m.name} runs on ${m.host?.label || 'another machine'}; open it there.`);
+      return;
+    }
+    if (!subSessionId && isAntigravityMember(m, target)) {
+      const cid = convIdOf(m) || (target === leadName || target === 'coordinator' ? coordinatorConv() : '');
+      if (isValidConvId(cid) && canOpenConversation()) {
+        openConversation(cid);
+        return;
+      }
+    }
+    if (m || target) {
+      openAgentTab(m ? m.name : target, subSessionId);
+    }
+  }
   function openConversation(convId) {
     if (!convId) return;
     const remote = members().find((m) => convIdOf(m) === convId && m.local === false);
@@ -940,13 +970,7 @@
   {
     window.SwarmHive.hooks = {
       members: () => selectTab('members', false, true),
-      member: (name, subSessionId = '') => {
-        const target = name === 'coordinator' ? (window.SwarmHive?.leadName || 'coordinator') : name;
-        const m = (state.snap?.members || []).find((x) => x.name === target);
-        if (m || target) {
-          openAgentTab(m ? m.name : target, subSessionId);
-        }
-      },
+      member: (name, subSessionId = '') => openMember(name, subSessionId),
     };
   }
 
@@ -1649,8 +1673,11 @@
       const bcast = expandAll ? 0 : broadcasts.get(n.id) || 0;
       const bw = 30 + 6 * String(bcast).length;
       const cid = convIdOf(n.m);
+      const clickHint = isAntigravityMember(n.m, n.id) && canOpenConversation() && isValidConvId(cid)
+        ? 'Click to open in Antigravity'
+        : 'Click to open agent tab';
       const tip = n.m
-        ? `${n.id} · ${n.m.role}${n.m.model ? ' · ' + n.m.model : ''} · ${statusLabel(status)} · ${n.m.steps || 0} steps${n.m.toolCalls ? ` · ${n.m.toolCalls} tools` : ''}${n.m.tokens?.total ? ` · ${fmtTokCompact(n.m.tokens.total)} tok` : ''}${n.m.tps ? ` · ${fmtTpsCompact(n.m.tps)}` : ''} · ${n.m.posts || 0} posts · ${n.m.unread || 0} unread${ring ? ` · ${ring} unaddressed` : ''}${broadcasts.get(n.id) ? ` · ${broadcasts.get(n.id)} @all` : ''}${n.m.activity && status === 'working' ? `\n${n.m.activity}` : ''}${n.m.host ? `\non ${n.m.host.label}` : ''}\nClick to open agent tab`
+        ? `${n.id} · ${n.m.role}${n.m.model ? ' · ' + n.m.model : ''} · ${statusLabel(status)} · ${n.m.steps || 0} steps${n.m.toolCalls ? ` · ${n.m.toolCalls} tools` : ''}${n.m.tokens?.total ? ` · ${fmtTokCompact(n.m.tokens.total)} tok` : ''}${n.m.tps ? ` · ${fmtTpsCompact(n.m.tps)}` : ''} · ${n.m.posts || 0} posts · ${n.m.unread || 0} unread${ring ? ` · ${ring} unaddressed` : ''}${broadcasts.get(n.id) ? ` · ${broadcasts.get(n.id)} @all` : ''}${n.m.activity && status === 'working' ? `\n${n.m.activity}` : ''}${n.m.host ? `\non ${n.m.host.label}` : ''}\n${clickHint}`
         : `${n.id} (not on the roster)`;
       const cls = ['node', isActive(n.id) ? '' : 'inactive', hot ? 'hot' : '', status === 'killed' ? 'killed' : '', n.m ? '' : 'outsider'].filter(Boolean).join(' ');
       nodesSvg += `<g class="${cls}" data-member="${esc(n.id)}" data-conv="${esc(cid)}">` +
@@ -3013,12 +3040,8 @@
     }
     if (a.type === 'open_conv') {
       const m = memberOf(a.target);
-      if (m && m.local === false) {
-        const cid = convIdOf(m);
-        if (cid) openConversation(cid);
-        else toast(`${m.name} runs on ${m.host?.label || 'another machine'}; open it there.`);
-      } else if (m) {
-        openAgentTab(m.name);
+      if (m) {
+        openMember(m.name);
       } else {
         toast(`Opening ${a.target}'s conversation needs the app.`);
       }
@@ -4750,7 +4773,7 @@
   });
   $('ov-open-coord').addEventListener('click', () => {
     const coordName = window.SwarmHive?.leadName || 'coordinator';
-    openAgentTab(coordName);
+    openMember(coordName);
   });
 
   const TABS = ['overview', 'feed', 'members', 'graph', 'raw'];

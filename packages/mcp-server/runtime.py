@@ -125,6 +125,8 @@ _TERMINAL_TRANSCRIPT_STATUSES = frozenset({
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _CONV_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
 _TRANSCRIPT_COMPLETED_AT_RE = re.compile(r"^Completed At:\s*(\S+)", re.MULTILINE)
+_SUBAGENT_RESULT_CID_RE = re.compile(r'"conversationId"\s*:\s*"([A-Za-z0-9_-]{4,128})"')
+_NON_SLUG_RE = re.compile(r"[^a-z0-9]+")
 _DEFAULT_CONTEXT_LIMITS: tuple[tuple[str, int], ...] = (
     ("900k", 900_000),
     ("1m", 1_000_000),
@@ -4783,6 +4785,7 @@ def _resolve_antigravity_transcript_file(
 def _empty_parsed_transcript() -> dict[str, Any]:
     return {
         "messages": [],
+        "childSubagents": [],
         "model": None,
         "provider": None,
         "tokens": {},
@@ -4811,6 +4814,70 @@ def _empty_parsed_transcript() -> dict[str, Any]:
     }
 
 
+def _parse_ag_tool_args(raw_args: Any) -> dict[str, Any]:
+    """Decode Antigravity transcript tool_call args (where string values may be JSON-quoted)."""
+    parsed_obj: Any = raw_args
+    if isinstance(raw_args, str):
+        try:
+            parsed_obj = json.loads(raw_args)
+        except Exception:
+            return {}
+    if not isinstance(parsed_obj, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in parsed_obj.items():
+        if isinstance(v, str):
+            sv = v.strip()
+            if (sv.startswith('"') and sv.endswith('"')) or (sv.startswith("[") and sv.endswith("]")) or (sv.startswith("{") and sv.endswith("}")):
+                try:
+                    out[k] = json.loads(sv)
+                    continue
+                except Exception:
+                    pass
+        out[k] = v
+    return out
+
+
+def _extract_ag_subagent_cid(raw_content: str) -> str | None:
+    """Extract child `conversationId` from an `invoke_subagent` GENERIC tool result."""
+    m = _SUBAGENT_RESULT_CID_RE.search(str(raw_content or ""))
+    if not m:
+        return None
+    cid = m.group(1).strip()
+    return cid if _CONV_ID_RE.match(cid) else None
+
+
+def _derive_ag_member_slug(role_title: str, used_low: set[str]) -> str:
+    """Convert an Antigravity subagent `Role` string into a unique <=24-char member name."""
+    words = [w for w in _NON_SLUG_RE.split(str(role_title or "").strip().lower()) if w]
+    if not words:
+        base = "ide-agent"
+    else:
+        chosen: list[str] = []
+        cur_len = 0
+        for w in words:
+            add_len = len(w) + (1 if chosen else 0)
+            if cur_len + add_len <= 24:
+                chosen.append(w)
+                cur_len += add_len
+            elif not chosen:
+                chosen.append(w[:24].strip("-"))
+                break
+            else:
+                break
+        base = "-".join(chosen).strip("-") or words[0][:24].strip("-") or "ide-agent"
+    if base in ("coordinator", "primary", "all") or base.startswith("coordinator-"):
+        base = f"ide-{base}"[:24].rstrip("-")
+    cand = base
+    idx = 2
+    while cand.lower() in used_low:
+        suf = f"-{idx}"
+        cand = f"{base[: max(1, 24 - len(suf))].rstrip('-')}{suf}"
+        idx += 1
+    used_low.add(cand.lower())
+    return cand
+
+
 def _build_transcript_summary_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
     live_blk = parsed.get("live") if isinstance(parsed.get("live"), dict) else {}
     cur_tool = live_blk.get("currentTool")
@@ -4832,6 +4899,7 @@ def _build_transcript_summary_from_parsed(parsed: dict[str, Any]) -> dict[str, A
         "mtimeMs": int(parsed.get("mtimeMs") or 0),
         "lastTimestampMs": parsed.get("lastTimestampMs"),
         "currentTool": dict(cur_tool) if isinstance(cur_tool, dict) else None,
+        "childSubagents": [dict(c) for c in (parsed.get("childSubagents") or []) if isinstance(c, dict)],
     }
 
 
@@ -4853,7 +4921,10 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
             return cached, cached["_msg_ids"]
 
     messages: list[dict[str, Any]] = []
-    pending_tools: list[tuple[str, str]] = []
+    pending_tools: list[tuple[str, str, dict[str, Any]]] = []
+    child_subagents: list[dict[str, Any]] = []
+    seen_child_cids: set[str] = set()
+    used_child_slugs: set[str] = {"coordinator", "primary", "all"}
     model_name: str | None = None
     pure_in_sum = 0
     cached_in_sum = 0
@@ -5041,7 +5112,11 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
                 if tcs_out:
                     tail_planner_has_tools = True
                     for tc in tcs_out:
-                        pending_tools.append((tc["id"], tc["name"]))
+                        pending_tools.append((
+                            tc["id"],
+                            tc["name"],
+                            _parse_ag_tool_args(tc["arguments"]) if tc["name"] in ("invoke_subagent", "manage_subagents") else {},
+                        ))
                         tool_calls_count += 1
                         if tc["name"] and (not live_recent_tools or live_recent_tools[-1] != tc["name"]):
                             live_recent_tools.append(tc["name"])
@@ -5070,7 +5145,7 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
                 msg_entry["isError"] = True
             messages.append(msg_entry)
         elif step_type == "GENERIC":
-            tc_id, tc_name = pending_tools.pop(0) if pending_tools else (f"s{step_idx}-tool", "tool")
+            tc_id, tc_name, tc_args = pending_tools.pop(0) if pending_tools else (f"s{step_idx}-tool", "tool", {})
             if step_status == "RUNNING":
                 live_active = True
                 live_current_tool = {
@@ -5104,6 +5179,38 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
                 prev_ready_ms = ts_ms
 
             is_err = step_status in ("ERROR", "INVALID") or bool(step.get("error"))
+            if not is_err and tc_name == "invoke_subagent":
+                child_cid = _extract_ag_subagent_cid(raw_content)
+                if child_cid and child_cid not in seen_child_cids:
+                    seen_child_cids.add(child_cid)
+                    role_title = str(tc_args.get("Role") or tc_args.get("role") or tc_args.get("TypeName") or "IDE Agent").strip() or "IDE Agent"
+                    req_model_raw = str(tc_args.get("Model") or tc_args.get("model") or "").strip()
+                    req_model = None if (not req_model_raw or req_model_raw.lower() == "inherit") else req_model_raw
+                    slug = _derive_ag_member_slug(role_title, used_child_slugs)
+                    child_subagents.append({
+                        "name": slug,
+                        "role": models.normalize_member_role(role_title, runtime="antigravity"),
+                        "roleTitle": role_title,
+                        "assignment": role_title,
+                        "conversationId": child_cid,
+                        "requestedModel": req_model,
+                        "typeName": str(tc_args.get("TypeName") or tc_args.get("typeName") or "self").strip(),
+                        "killed": False,
+                        "createdAt": created_at,
+                    })
+            elif not is_err and tc_name == "manage_subagents":
+                mg_act = str(tc_args.get("Action") or tc_args.get("action") or "").strip().lower()
+                if mg_act == "kill_all":
+                    for cs in child_subagents:
+                        cs["killed"] = True
+                elif mg_act == "kill":
+                    kill_ids = tc_args.get("ConversationIds") or tc_args.get("conversationIds") or []
+                    if isinstance(kill_ids, str):
+                        kill_ids = [kill_ids]
+                    kill_set = {str(x).strip() for x in (kill_ids if isinstance(kill_ids, list) else []) if str(x).strip()}
+                    for cs in child_subagents:
+                        if cs.get("conversationId") in kill_set:
+                            cs["killed"] = True
             msg_id = max(last_id + 1, step_idx + 1)
             last_id = msg_id
             messages.append({
@@ -5169,6 +5276,7 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
     has_pending = pending_count > 0 or bool(live_tool_calls) or (live_current_tool is not None)
     entry: dict[str, Any] = {
         "messages": messages,
+        "childSubagents": child_subagents,
         "model": model_name,
         "provider": "antigravity" if model_name else None,
         "tokens": tokens,
@@ -5250,6 +5358,7 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
     entry, _ = _parse_antigravity_transcript_cached_entry(log_path)
     out = {k: v for k, v in entry.items() if k != "_msg_ids"}
     out["messages"] = list(entry.get("messages") or [])
+    out["childSubagents"] = [dict(c) for c in (entry.get("childSubagents") or []) if isinstance(c, dict)]
     out["tokens"] = dict(entry.get("tokens") or {})
     live = entry.get("live") if isinstance(entry.get("live"), dict) else {}
     out["live"] = {
@@ -5260,6 +5369,22 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
         "currentTool": dict(live["currentTool"]) if isinstance(live.get("currentTool"), dict) else None,
     }
     return out
+
+
+def discover_antigravity_child_members(
+    coordinator_cid: str | None,
+    *,
+    primary_cid: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return cached child Antigravity subagents spawned by Coordinator via `invoke_subagent`."""
+    cids = [str(coordinator_cid).strip()] if coordinator_cid and str(coordinator_cid).strip() else []
+    if not cids and not (primary_cid and str(primary_cid).strip()):
+        return []
+    summary = extract_antigravity_transcript_summary(cids, primary_cid=primary_cid)
+    raw_children = summary.get("childSubagents") if isinstance(summary, dict) else None
+    if not isinstance(raw_children, list):
+        return []
+    return [dict(c) for c in raw_children if isinstance(c, dict) and c.get("conversationId")]
 
 
 def extract_antigravity_transcript_summary(
@@ -5493,8 +5618,35 @@ def query_member_session_history(
         canonical_name.lower() == models.Role.COORDINATOR.value
         or str(member_rec.get("role") or "").strip().lower() == models.Role.COORDINATOR.value
     )
-    if is_coordinator:
-        coord_cid = str(meta_coord or member_rec.get("conversationId") or "").strip()
+    is_antigravity = (
+        is_coordinator
+        or str(member_rec.get("runtime") or "").strip().lower() == "antigravity"
+    )
+    if not member_rec and not is_coordinator and meta_coord and canonical_name:
+        cn_low = canonical_name.lower()
+        for child in discover_antigravity_child_members(str(meta_coord), primary_cid=meta_primary):
+            if str(child.get("name") or "").strip().lower() == cn_low:
+                canonical_name = str(child.get("name") or canonical_name)
+                member_rec = {
+                    "name": canonical_name,
+                    "role": child.get("role") or "engineer",
+                    "runtime": "antigravity",
+                    "state": models.MemberState.KILLED.value if child.get("killed") else models.MemberState.WORKING.value,
+                    "killed": bool(child.get("killed")),
+                    "conversationId": child.get("conversationId") or "",
+                    "model": child.get("requestedModel"),
+                    "provider": "antigravity",
+                    "assignment": child.get("assignment") or "",
+                }
+                is_antigravity = True
+                break
+
+    if is_antigravity:
+        ag_cid = (
+            str(meta_coord or member_rec.get("conversationId") or "").strip()
+            if is_coordinator
+            else str(member_rec.get("conversationId") or "").strip()
+        )
         board_killed = bool(member_rec.get("killed")) or str(member_rec.get("state") or "").strip().lower() == models.MemberState.KILLED.value
         worker_state = _normalize_member_history_state(member_rec.get("state") or "working", killed=board_killed)
         req_sub = str(subagent_session_id or "").strip()
@@ -5509,7 +5661,7 @@ def query_member_session_history(
                 "conversationIds": meta_conv_ids,
                 "member": canonical_name or models.Role.COORDINATOR.value,
                 "sessionId": None,
-                "parentSessionId": coord_cid or None,
+                "parentSessionId": ag_cid or None,
                 "messages": [],
                 "hasMore": False,
                 "totalCount": 0,
@@ -5539,9 +5691,10 @@ def query_member_session_history(
                 },
             }
 
+        lookup_cids = [c for c in (ag_cid, str(member_rec.get("conversationId") or "").strip()) if c]
         resolved_cid, log_path = _resolve_antigravity_transcript_file(
-            [c for c in (coord_cid, str(member_rec.get("conversationId") or "")) if c],
-            primary_cid=meta_primary,
+            lookup_cids,
+            primary_cid=(meta_primary if is_coordinator else None),
         )
         if log_path is not None:
             parsed, msg_ids = _parse_antigravity_transcript_cached_entry(log_path)
@@ -5567,13 +5720,13 @@ def query_member_session_history(
             has_more = total_count > clamped_limit
             messages = [dict(m) for m in all_msgs[-clamped_limit:]]
         last_id = max(since_id, int(messages[-1]["id"])) if messages else since_id
-        coord_model = member_rec.get("model") or parsed.get("model")
-        coord_provider = member_rec.get("provider") or parsed.get("provider")
+        ag_model = parsed.get("model") or member_rec.get("model")
+        ag_provider = parsed.get("provider") or member_rec.get("provider") or "antigravity"
         parsed_live = parsed.get("live") if isinstance(parsed.get("live"), dict) else {}
-        active_worker_count = runtime.get_active_worker_count() if runtime is not None else 0
-        coord_updated_ms = _compute_coordinator_updated_ms(
+        active_worker_count = runtime.get_active_worker_count() if (is_coordinator and runtime is not None) else 0
+        ag_updated_ms = _compute_coordinator_updated_ms(
             member_rec,
-            swarm_meta,
+            swarm_meta if is_coordinator else {},
             board_messages=board.get("messages") if isinstance(board, dict) else None,
             coord_name=canonical_name or models.Role.COORDINATOR.value,
         )
@@ -5582,9 +5735,9 @@ def query_member_session_history(
             killed=board_killed,
             coord_stats=parsed if log_path is not None else None,
             active_worker_count=active_worker_count,
-            member_updated_ms=coord_updated_ms,
+            member_updated_ms=ag_updated_ms,
         )
-        coord_live_active = (worker_state == "working") and (
+        ag_live_active = (worker_state == "working") and (
             bool(parsed_live.get("active")) if log_path is not None else True
         )
         cur_tool_live = parsed_live.get("currentTool")
@@ -5593,12 +5746,13 @@ def query_member_session_history(
             "swarm": sid,
             "swarmId": sid,
             "primaryConversationId": meta_primary,
-            "coordinatorConversationId": resolved_cid or meta_coord,
-            "conversationId": meta_primary or resolved_cid or meta_coord,
+            "coordinatorConversationId": meta_coord if not is_coordinator else (resolved_cid or meta_coord),
+            "conversationId": resolved_cid or ag_cid or meta_primary or meta_coord,
             "conversationIds": meta_conv_ids,
             "member": canonical_name or models.Role.COORDINATOR.value,
-            "sessionId": resolved_cid or coord_cid or None,
-            "parentSessionId": resolved_cid or coord_cid or None,
+            "runtime": "antigravity",
+            "sessionId": resolved_cid or ag_cid or None,
+            "parentSessionId": resolved_cid or ag_cid or None,
             "messages": messages,
             "hasMore": has_more,
             "totalCount": total_count,
@@ -5608,15 +5762,15 @@ def query_member_session_history(
             "tpsEstimated": False,
             "currentTool": dict(cur_tool_live) if isinstance(cur_tool_live, dict) else None,
             "state": worker_state,
-            "model": coord_model,
-            "provider": coord_provider,
+            "model": ag_model,
+            "provider": ag_provider,
             "workspace": swarm_meta.get("workspace"),
             "workdir": member_rec.get("workdir") or swarm_meta.get("workspace"),
             "worktreePath": None,
             "worktreeBranch": None,
             "subagents": [],
             "live": {
-                "active": coord_live_active,
+                "active": ag_live_active,
                 "transcript": str(parsed_live.get("transcript") or ""),
                 "reasoning": str(parsed_live.get("reasoning") or ""),
                 "toolCalls": list(parsed_live.get("toolCalls") or []),

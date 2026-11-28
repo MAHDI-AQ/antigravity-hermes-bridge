@@ -43,8 +43,8 @@ Right as you launch workers (and whenever you add workers, regroup lanes, or shi
 Rules:
 - `goal.title`: 4 to 8 words naming the outcome.
 - `goal.line`: at most 12 words summarizing current standing.
-- `tasks`: map each worker roster name (`dict[str, str]`, e.g. `"auditor": "..."`) to a short phrase (2 to 8 words).
-- `threads`: 1 to 6 groups structured by the **outcome** they deliver, never one thread per agent; **always include a human-readable `threads[].title` (distinct from `threads[].id`, otherwise the UI falls back to the raw `id` slug)**, along with `goal`, `now`, and every active/planned worker in `tasks`.
+- `tasks`: map each active member roster name (`dict[str, str]`, including registered Antigravity IDE Specialists/Verifiers AND Hermes execution workers, e.g. `"arch-kernel": "..."`, `"impl-a": "..."`) to a short phrase (2 to 8 words).
+- `threads`: 1 to 6 groups structured by the **outcome** they deliver, never one thread per agent; **always include a human-readable `threads[].title` (distinct from `threads[].id`, otherwise the UI falls back to the raw `id` slug)**, along with `goal`, `now`, and every active/planned member in `tasks`.
 - **Dynamic updates:** Rewrite `plan` only when you add workers, move work (`Moving`, `Done`, `Blocked`, updating `now` as workers start, shift phase, or finish), or the goal changes; nothing else.
 - Do not duplicate raw status logs or blockers inside `plan` — live status, escalations, and `@coordinator` questions come automatically from tasks and board posts.
 

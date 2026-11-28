@@ -877,6 +877,7 @@ def upsert_swarm_meta(
     primary_conversation_id: str | None = None,
     coordinator_conversation_id: str | None = None,
     conversation_id: str | None = None,
+    extra_conversation_ids: list[str] | None = None,
     project_id: str | None = None,
     archived: bool | None = None,
     wake_seq: int | None = None,
@@ -918,6 +919,11 @@ def upsert_swarm_meta(
             meta["coordinatorConversationId"] = ccid
             if ccid not in cids:
                 cids.append(ccid)
+
+        for extra_cid in extra_conversation_ids or []:
+            clean_extra = str(extra_cid or "").strip()
+            if clean_extra and clean_extra not in cids:
+                cids.append(clean_extra)
 
         meta["conversationIds"] = cids
 

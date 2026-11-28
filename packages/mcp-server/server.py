@@ -92,6 +92,7 @@ You are connected to the Hermes A2A Swarm Bridge (`hermes-a2a`), enabling a 3-ti
    - Read the project's Obsidian vault (`Handoffs/current.md` and `Lessons/lessons.md`) before starting and write verified receipts/lessons to `Evidence/` / `Handoffs/` before closing.
 2. Tier 2a (`coordinator` + IDE Frontier Subagents via `invoke_subagent(TypeName="self", ...)`):
    - Thinking & judgment roles (Research, Architecture/Design, Planning, Specialist Consultation, and Adversarial Verification) belong to **IDE Frontier Subagents** (`invoke_subagent`, `TypeName="self"`), NEVER cheap Hermes execution workers.
+   - Immediately after spawning any Antigravity IDE subagent with `invoke_subagent`, register it as a first-class board member via `swarm_manage(action="register_member", name=..., role=..., conversation_id="<exact conversationId>", assignment=...)` and include it in `set_plan` so it appears in `Members`, `Overview`, and `Graph` (and mark it `done` / `remove_member` when stopped or complete).
    - Inspect `role_policy` returned by `swarm_manage(init|status)` / `swarm_catalog()` so local user preferences (IDE tiers, restricted roles, execution worker model defaults) are always honored.
    - Because `wakeup_bridge` only wakes `primary` and `coordinator`, Coordinator bridges outputs between IDE subagents and Hermes workers (`@coordinator` only).
 3. Tier 2b (Hermes A2A Execution Workers via `swarm_worker` — `worker|implementer|monitor|narrator`):
@@ -421,6 +422,12 @@ async def swarm_manage(
     coordinator_conversation_id: str | None = None,
     conversation_id: str | None = None,
     project_id: str | None = None,
+    name: str | None = None,
+    role: str | None = None,
+    assignment: str | None = None,
+    state: str | None = None,
+    runtime: str | None = None,
+    channels: list[str] | None = None,
     model: str | None = None,
     provider: str | None = None,
     plan: dict[str, Any] | None = None,
@@ -431,7 +438,7 @@ async def swarm_manage(
     states: list[str] | None = None,
     ctx: Context | None = None,
 ) -> str:
-    """Manage 1:1 session-bound swarm lifecycle (`init|title|bind_coordinator|set_plan|status|clear_finished|channel`)."""
+    """Manage 1:1 session-bound swarm lifecycle (`init|title|bind_coordinator|register_member|remove_member|set_plan|status|clear_finished|channel`)."""
     act = str(action or "status").strip().lower()
     resolved_ws, _ = await _resolve_active_workdir(workspace, ctx)
     resolved_ws = runtime_mod._canonical_workspace_path(resolved_ws) if resolved_ws else None
@@ -558,6 +565,99 @@ async def swarm_manage(
             "model": eff_model,
             "provider": eff_provider,
             "meta": meta,
+        })
+
+    if act in ("register_member", "add_member"):
+        clean_name = str(name or "").strip().lstrip("@")
+        if not clean_name:
+            raise ValueError("`name` is required for action='register_member'.")
+        eff_runtime = str(runtime or "antigravity").strip().lower() or "antigravity"
+        cid = str(conversation_id or coordinator_conversation_id or "").strip() or None
+        existing_meta = await asyncio.to_thread(_swarm_mgr.store.read_meta, sid)
+        prim_for_check = str(primary_conversation_id or (existing_meta or {}).get("primaryConversationId") or "").strip() or None
+        coord_for_check = str((existing_meta or {}).get("coordinatorConversationId") or "").strip() or None
+        if eff_runtime == "antigravity":
+            if not cid:
+                raise ValueError("`conversation_id` is required when registering an Antigravity member.")
+            valid_cid, valid_err = await asyncio.to_thread(
+                runtime_mod.validate_coordinator_conversation_id,
+                cid,
+                coord_for_check or prim_for_check,
+            )
+            if not valid_cid:
+                raise ValueError(valid_err or f"Invalid conversation_id: {cid!r}")
+
+        eff_model = str(model or "").strip() or None
+        eff_provider = str(provider or "").strip() or ("antigravity" if eff_runtime == "antigravity" else None)
+        if cid and eff_runtime == "antigravity" and not eff_model:
+            t_summary = await asyncio.to_thread(
+                runtime_mod.extract_antigravity_transcript_summary,
+                [cid],
+                primary_cid=None,
+            )
+            eff_model = str(t_summary.get("model") or "").strip() or None
+            if t_summary.get("provider"):
+                eff_provider = str(t_summary["provider"]).strip() or eff_provider
+
+        eff_role = models.normalize_member_role(role or "engineer", runtime=eff_runtime)
+        eff_state_raw = str(state or models.MemberState.WORKING.value).strip().lower() or models.MemberState.WORKING.value
+        is_killed = eff_state_raw == models.MemberState.KILLED.value
+        eff_assignment = assignment if assignment is not None else (goal or mission)
+        member_rec = await asyncio.to_thread(
+            _swarm_mgr.board_service.upsert_member,
+            clean_name,
+            role=eff_role,
+            tier=2,
+            runtime=eff_runtime,
+            state=eff_state_raw,
+            killed=False if not is_killed else True,
+            assignment=eff_assignment,
+            conversation_id=cid,
+            model=eff_model,
+            provider=eff_provider,
+            workdir=resolved_ws or (existing_meta or {}).get("workspace"),
+            channels=channels or ["*"],
+            swarm_id=sid,
+        )
+        meta = existing_meta or models.default_swarm_meta(sid)
+        if cid:
+            meta = await asyncio.to_thread(
+                _swarm_mgr.store.upsert_meta,
+                sid,
+                extra_conversation_ids=[cid],
+            )
+        if _http_ctrl.is_running():
+            await asyncio.to_thread(_http_ctrl._register_self, swarm_id=sid)
+        return _json_str({
+            "swarm_id": sid,
+            "open_board": _OPEN_BOARD_LINK,
+            "member": member_rec,
+            "meta": meta,
+        })
+
+    if act in ("remove_member", "unregister_member"):
+        clean_name = str(name or "").strip().lstrip("@")
+        if not clean_name:
+            raise ValueError("`name` is required for action='remove_member'.")
+        eff_state_raw = str(state or models.MemberState.KILLED.value).strip().lower() or models.MemberState.KILLED.value
+        is_killed = eff_state_raw == models.MemberState.KILLED.value
+        board_doc = await asyncio.to_thread(_swarm_mgr.board_service.read_board, sid)
+        prev_mem = (board_doc.get("members") or {}).get(clean_name) if isinstance(board_doc.get("members"), dict) else None
+        prev_runtime = str((prev_mem or {}).get("runtime") or runtime or "antigravity").strip().lower() or "antigravity"
+        prev_role = str((prev_mem or {}).get("role") or role or "engineer")
+        member_rec = await asyncio.to_thread(
+            _swarm_mgr.board_service.upsert_member,
+            clean_name,
+            role=prev_role,
+            runtime=prev_runtime,
+            state=eff_state_raw,
+            killed=is_killed,
+            swarm_id=sid,
+        )
+        return _json_str({
+            "swarm_id": sid,
+            "open_board": _OPEN_BOARD_LINK,
+            "member": member_rec,
         })
 
     if act == "set_plan":

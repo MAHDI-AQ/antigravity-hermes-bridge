@@ -648,6 +648,9 @@
         statTag = `<span class="o2-mstat bad">${x.issue.kind==='stuck' ? 'Stuck' : 'Error'}</span>`;
       } else if(x.roleWorker){
         statTag = st==='working' ? `<span class="o2-mstat info">${esc(x.role || n)} · Working</span>` : `<span class="o2-mstat">${esc(x.role || n)} · Watching</span>`;
+      } else if(x.runtime === 'antigravity'){
+        const rolePrefix = (x.role && x.role!=='worker') ? `${esc(x.role)} · ` : '';
+        statTag = st==='working' ? `<span class="o2-mstat info">${rolePrefix}Antigravity · Active</span>` : (st==='waiting_on' && x.waiting_on ? `<span class="o2-mstat warn">${esc(waitOn(x.waiting_on))}</span>` : `<span class="o2-mstat">${rolePrefix}Antigravity</span>`);
       } else if(st==='working'){
         statTag = `<span class="o2-mstat info">${x.role && x.role!=='worker' ? esc(x.role) + ' · ' : ''}Working</span>`;
       } else if(st==='waiting_on' && x.waiting_on){
@@ -1044,7 +1047,7 @@
         if (subEl && subEl !== b) return;
         const btn = e.target.closest('button');
         if (btn && btn !== b) return;
-        if (b.tagName === 'BUTTON' || b.dataset.openSubagent) e.stopPropagation();
+        e.stopPropagation();
         if (hooks.member) hooks.member(memTarget(), b.dataset.openSubagent || '');
       };
       if (b.getAttribute('role') === 'button') {
@@ -1303,6 +1306,8 @@
       const lastSeenVal = m.last_seen ?? m.lastSeen;
       members[n] = {
         rawName:m.name, role:m.role,
+        runtime: String(m.runtime || (n==='coordinator' ? 'antigravity' : 'hermes')).toLowerCase(),
+        conversationId: String(m.conversationId || m.conversation_id || ''),
         title: n==='coordinator' ? 'Coordinator · Antigravity' : taskTitleFor(m.name),
         model:m.model||'', status, waiting_on, waiting_seq, waiting_for:'', now, live, ask, issue,
         steps:Number(m.steps)||0, toolCalls:Number(m.toolCalls)||0,
@@ -1325,7 +1330,7 @@
         subagents: Array.isArray(m.subagents) ? m.subagents : [],
       };
     });
-    if(!members.coordinator) members.coordinator = { rawName:L, role:'coordinator', title:'Coordinator · Antigravity', model:'', status:'parked', now:'', ask:null, steps:0, toolCalls:0, currentTool:null, recentTools:[], tokens:null, tps:0, tpsEstimated:false, elapsedMs:0, costUsd:null, posts:0, lastPostSeq:0, lastReadSeq:0, last:null, subagents:[] };
+    if(!members.coordinator) members.coordinator = { rawName:L, role:'coordinator', runtime:'antigravity', conversationId:String(snap.coordinatorConversationId || snap.meta?.coordinatorConversationId || ''), title:'Coordinator · Antigravity', model:'', status:'parked', now:'', ask:null, steps:0, toolCalls:0, currentTool:null, recentTools:[], tokens:null, tps:0, tpsEstimated:false, elapsedMs:0, costUsd:null, posts:0, lastPostSeq:0, lastReadSeq:0, last:null, subagents:[] };
     const roleBounds = Object.create(null);
     rawMsgs.forEach(q => {
       if (!q || (q.control && typeof q.control === 'object')) return;

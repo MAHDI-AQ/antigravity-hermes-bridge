@@ -1239,7 +1239,8 @@ class BoardService:
             resolved_sid = sid
             members = board.setdefault("members", {})
             prev = dict(members.get(key) or {})
-            eff_role = models.normalize_role(role or prev.get("role"))
+            eff_runtime = str(runtime or prev.get("runtime") or "hermes").strip().lower() or "hermes"
+            eff_role = models.normalize_member_role(role or prev.get("role"), runtime=eff_runtime)
             eff_channels = channels if channels is not None else prev.get("channels")
             if eff_role in _ALL_CHANNEL_ROLES:
                 eff_channels = ["*"]
@@ -1263,7 +1264,7 @@ class BoardService:
                 key,
                 role=eff_role,
                 tier=tier if prev.get("tier") is None else int(tier or prev["tier"]),
-                runtime=runtime or prev.get("runtime") or "hermes",
+                runtime=eff_runtime,
                 state=eff_state,
                 assignment=(assignment[:280] if assignment is not None else str(prev.get("assignment") or "")),
                 channels=eff_channels if eff_channels != ["*"] else None,

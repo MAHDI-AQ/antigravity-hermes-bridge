@@ -2437,15 +2437,21 @@ test('Phase-3 Observer UI: HEXD SVG, e.source guard, ov-system, ov-open-coord, N
     await page.waitForSelector('#ov-frame:not(.hidden) iframe[data-testid="swarm-overview-iframe"]', { timeout: 10000 });
     assert.equal(await page.evaluate(() => localStorage.getItem('swarm_board.narrator_plain')), '0');
 
-    // 3. ov-system & ov-open-coord (opens in-pane coordinator Agent Tab without calling toggleConversation)
+    // 3. ov-system & ov-open-coord: opens native conversation via toggleConversation inside Antigravity, falls back to Agent Tab standalone
     await page.waitForSelector('#ov-system:not(.hidden)', { timeout: 3000 });
     assert.match(await page.textContent('#ov-system'), /Action needed on Phase-3 check/);
     await page.waitForSelector('#ov-open-coord:not(.hidden)', { timeout: 3000 });
     await page.click('#ov-open-coord');
+    assert.deepEqual(await page.evaluate(() => window.__coordToggleCalls), ['conv-coord-p3']);
+    assert.equal(await page.locator('.tab-agent[data-agent-tab="coordinator"]').count(), 0);
+    await page.evaluate(() => { delete window.sidecar.ui.toggleConversation; });
+    await page.click('#ov-open-coord');
     await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
-    assert.deepEqual(await page.evaluate(() => window.__coordToggleCalls), []);
     await page.click('[data-close-agent="coordinator"]');
     await page.waitForSelector('#tab-overview.active', { timeout: 3000 });
+    await page.evaluate(() => {
+      window.sidecar.ui.toggleConversation = (cid) => window.__coordToggleCalls.push(cid);
+    });
 
     // 4. Narrator NAVIGATE urlHosts & allowedFiles enforcement (fresh page at ?tab=overview so parentInputAt === -Infinity)
     async function triggerNavAction(btnSel) {
@@ -3732,24 +3738,31 @@ test('Phase-3 v3 UI: 400+ msg windowing & #seq jump, billable token economy, liv
   );
   assert.equal(await page.locator('#tab-agent.active').count(), 0);
 
-  // Clicking coordinator opens in-pane Agent Tab without calling toggleConversation; secondary Open Primary Chat opens primaryConversationId
+  // Clicking coordinator in Members calls toggleConversation natively inside Antigravity; standalone fallback opens Agent Tab + Open Primary Chat
   await page.click('#tabbtn-members');
   await page.waitForSelector('#tab-members.active');
   await page.evaluate(() => {
-    window.__toggledConvId = null;
+    window.__toggledConvIds = [];
     window.sidecar = {
       ...(window.sidecar || {}),
       ui: {
-        toggleConversation: (id) => { window.__toggledConvId = id; },
+        toggleConversation: (id) => window.__toggledConvIds.push(id),
       },
     };
   });
   await page.click('#members [data-open-member="coordinator"]');
+  assert.deepEqual(await page.evaluate(() => window.__toggledConvIds), ['conv-v3-coord']);
+  assert.equal(await page.locator('.tab-agent[data-agent-tab="coordinator"]').count(), 0);
+  await page.evaluate(() => { delete window.sidecar.ui.toggleConversation; });
+  await page.click('#members [data-open-member="coordinator"]');
   await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
-  assert.equal(await page.evaluate(() => window.__toggledConvId), null, 'Clicking coordinator must NOT hijack to toggleConversation');
+  await page.evaluate(() => {
+    window.sidecar.ui.toggleConversation = (id) => window.__toggledConvIds.push(id);
+  });
+  await page.click('[data-ag-refresh]');
   await page.waitForSelector('[data-ag-open-primary="conv-v3-primary"]', { timeout: 3000 });
   await page.click('[data-ag-open-primary="conv-v3-primary"]');
-  assert.equal(await page.evaluate(() => window.__toggledConvId), 'conv-v3-primary');
+  assert.deepEqual(await page.evaluate(() => window.__toggledConvIds), ['conv-v3-coord', 'conv-v3-primary']);
 
   await context.close();
   const realFailed = obs.failedRequests.filter(
@@ -4298,6 +4311,7 @@ test('UI/UX hardening: coordinator in-pane tab, resetSwarm(), Mentions node clic
       {
         name: 'coordinator',
         role: 'coordinator',
+        runtime: 'antigravity',
         status: 'working',
         model: 'google/gemini-4-hydrogen-medium',
         conversationId: 'conv-ux-coord-fake',
@@ -4306,6 +4320,22 @@ test('UI/UX hardening: coordinator in-pane tab, resetSwarm(), Mentions node clic
         tokens: { totalProcessed: 42000, pureInput: 10000, cachedInput: 30000, output: 2000, contextUsed: 42000, contextLimit: 1048576 },
         tps: 64.0,
         now: 'Coordinating UX hardening',
+        subagents: [],
+      },
+      {
+        name: 'kernel-arch',
+        role: 'architect',
+        runtime: 'antigravity',
+        status: 'working',
+        model: 'google/gemini-4-pro-high',
+        conversationId: 'conv-ux-ide-arch',
+        workspace: 'C:/Projects/taskflow-demo',
+        steps: 3,
+        toolCalls: 4,
+        tokens: { totalProcessed: 28000, pureInput: 8000, cachedInput: 18500, output: 1500, contextUsed: 28000, contextLimit: 1000000 },
+        tps: 71.0,
+        assignment: 'Design prompt indexing fix',
+        now: 'Inspecting kernel indexing',
         subagents: [],
       },
       {
@@ -4555,38 +4585,59 @@ test('UI/UX hardening: coordinator in-pane tab, resetSwarm(), Mentions node clic
   assert.match(ovText, /65\/100/, 'parseProg must support denominators > 60');
   assert.match(ovText, /120k proc · 5\.0k out/, 'Overview must show unified proc + out');
 
-  // Clicking .o2-lead opens coordinator in-pane Agent Tab (no toggleConversation call)
+  // Clicking .o2-lead opens coordinator natively via toggleConversation (single call, no in-pane Agent Tab)
+  await page.click('#tab-overview .o2-lead');
+  assert.deepEqual(await page.evaluate(() => window.__toggledConvs), ['conv-ux-coord-fake']);
+  assert.equal(await page.locator('.tab-agent[data-agent-tab="coordinator"]').count(), 0);
+
+  // When toggleConversation is unavailable (standalone browser), clicking .o2-lead falls back to in-pane Agent Tab
+  await page.evaluate(() => { delete window.sidecar.ui.toggleConversation; });
   await page.click('#tab-overview .o2-lead');
   await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
-  assert.deepEqual(await page.evaluate(() => window.__toggledConvs), []);
   const coordTabText = await page.textContent('#agent-header');
   assert.match(coordTabText, /gemini-4-hydrogen/, 'Coordinator Agent Tab must show shortened model badge');
   assert.match(coordTabText, /42\.0k proc/, 'Empty {} tokens must fall back to member.tokens');
   assert.match(coordTabText, /2\.0k out/, 'Agent Tab header must show output tokens');
+  await page.evaluate(() => {
+    window.sidecar.ui.toggleConversation = (cid) => window.__toggledConvs.push(cid);
+  });
+  await page.click('[data-ag-refresh]');
   await page.click('[data-ag-open-primary="conv-ux-primary-a"]');
-  assert.deepEqual(await page.evaluate(() => window.__toggledConvs), ['conv-ux-primary-a']);
+  assert.deepEqual(await page.evaluate(() => window.__toggledConvs), ['conv-ux-coord-fake', 'conv-ux-primary-a']);
   const coordWorkSummary = await page.textContent('#agent-committed details.ag-work-group > summary');
   assert.match(coordWorkSummary, /Worked for 6s/, 'Reasoning-only reply must use prevEndMs fallback');
   await page.click('[data-close-agent="coordinator"]');
 
-  // 2. Members: shortened model badges, empty-search state, Tier-3 subagent tokens/TPS
+  // 2. Members: shortened model badges, Antigravity IDE member click -> toggleConversation, empty-search state, Tier-3 subagent tokens/TPS
   await page.click('#tabbtn-members');
   await page.waitForSelector('#tab-members.active');
   const membersCheck = await page.evaluate(() => {
     const storeRow = document.querySelector('.o2-mrow[data-open-member="store-dev"]');
     const coordRow = document.querySelector('.o2-mrow[data-open-member="coordinator"]');
+    const archRow = document.querySelector('.o2-mrow[data-open-member="kernel-arch"]');
     return {
       coordModel: coordRow?.querySelector('.o2-mts')?.textContent || '',
+      archStatus: archRow?.querySelector('.o2-mstat')?.textContent || '',
+      archModel: archRow?.querySelector('.o2-mts')?.textContent || '',
       storeModel: storeRow?.querySelector('.o2-mts')?.textContent || '',
       storeMetrics: storeRow?.querySelector('.o2-mmetrics')?.textContent || '',
       subMeta: storeRow?.querySelector('.o2-sub-meta')?.textContent || '',
     };
   });
   assert.match(membersCheck.coordModel, /gemini-4-hydrogen/);
+  assert.match(membersCheck.archStatus, /architect · Antigravity · Active/);
+  assert.match(membersCheck.archModel, /gemini-4-pro/);
   assert.match(membersCheck.storeModel, /claude-sonnet-4/);
   assert.equal(membersCheck.storeModel.includes('anthropic/'), false, 'Provider prefix must be shortened');
   assert.match(membersCheck.storeMetrics, /5\.0k out/);
   assert.match(membersCheck.subMeta, /gemini-2\.5-flash · 3 steps · 9\.4k proc · 89 t\/s/);
+
+  await page.click('.o2-mrow[data-open-member="kernel-arch"]');
+  assert.deepEqual(
+    await page.evaluate(() => window.__toggledConvs),
+    ['conv-ux-coord-fake', 'conv-ux-primary-a', 'conv-ux-ide-arch'],
+  );
+  assert.equal(await page.locator('.tab-agent[data-agent-tab="kernel-arch"]').count(), 0);
 
   await page.fill('#members .o2-msin', 'no-such-worker-xyz');
   await page.waitForFunction(() => document.querySelector('.o2-mempty')?.hidden === false, null, { timeout: 2000 });
@@ -4605,21 +4656,25 @@ test('UI/UX hardening: coordinator in-pane tab, resetSwarm(), Mentions node clic
   await page.waitForFunction(() => document.querySelectorAll('#feed .msg').length === 4, null, { timeout: 2000 });
 
   await page.click('#feed .msg[data-seq="1"] .msg-author-btn');
-  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
-  await page.click('[data-close-agent="coordinator"]');
+  assert.deepEqual(
+    await page.evaluate(() => window.__toggledConvs),
+    ['conv-ux-coord-fake', 'conv-ux-primary-a', 'conv-ux-ide-arch', 'conv-ux-coord-fake'],
+  );
 
-  // 4. Mentions Graph: clicking worker .node and coordinator .node opens Agent Tab
+  // 4. Mentions Graph: clicking coordinator .node calls toggleConversation; clicking Hermes worker .node opens Agent Tab
   await page.click('#tabbtn-graph');
   await page.waitForSelector('#tab-graph.active');
   await page.click('#gview-mentions');
   await page.waitForSelector('#graph .node[data-member="store-dev"]', { timeout: 3000 });
   await page.click('#graph .node[data-member="coordinator"]');
-  await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
-  await page.click('[data-close-agent="coordinator"]');
+  assert.deepEqual(
+    await page.evaluate(() => window.__toggledConvs),
+    ['conv-ux-coord-fake', 'conv-ux-primary-a', 'conv-ux-ide-arch', 'conv-ux-coord-fake', 'conv-ux-coord-fake'],
+  );
 
-  await page.click('#tabbtn-graph');
   await page.click('#graph .node[data-member="store-dev"]');
   await page.waitForSelector('.tab-agent[data-agent-tab="store-dev"].active', { timeout: 4000 });
+  assert.equal(await page.evaluate(() => window.__toggledConvs.length), 5, 'Clicking Hermes worker must NOT call toggleConversation');
   await page.waitForSelector('#agent-committed .ag-user-pill', { timeout: 4000 });
 
   // 5. Agent Tab: unwrapUserPrompt array + nested [TASK], workspace-scoped & normalized filesChanged, countLines, live tail dedup & <details> stability
@@ -5009,9 +5064,33 @@ test('Regression #11a/#11b/#11c & coordinator live tail: stripSwarmPreamble, non
   );
   await page.click('[data-close-agent="worker-sim"]');
 
-  // Coordinator live tail rendering (live.transcript + committed DONE)
+  // Coordinator live tail rendering (live.transcript + committed DONE):
+  // Inside SidecarApp (with toggleConversation), clicking .o2-lead calls toggleConversation('conv-reg11-coord');
+  // In standalone mode (without toggleConversation), clicking .o2-lead opens the live coordinator Agent Tab.
   await page.click('#tabbtn-overview');
+  await page.evaluate(() => {
+    window.__reg11Toggled = [];
+    if (window.sidecar?.ui?.toggleConversation) {
+      const orig = window.sidecar.ui.toggleConversation;
+      window.sidecar.ui.toggleConversation = (cid) => {
+        window.__reg11Toggled.push(cid);
+        return orig.call(window.sidecar.ui, cid);
+      };
+    }
+  });
   await page.click('#tab-overview .o2-lead');
+  const hadToggle = await page.evaluate(() => {
+    const toggled = window.__reg11Toggled || [];
+    if (window.sidecar?.ui?.toggleConversation) {
+      delete window.sidecar.ui.toggleConversation;
+      return toggled;
+    }
+    return null;
+  });
+  if (hadToggle !== null) {
+    assert.deepEqual(hadToggle, ['conv-reg11-coord']);
+    await page.click('#tab-overview .o2-lead');
+  }
   await page.waitForSelector('.tab-agent[data-agent-tab="coordinator"].active', { timeout: 4000 });
   await page.waitForFunction(
     () => (document.querySelector('#agent-live-tail .ag-live-reply')?.textContent || '').includes('Coordinator live streaming line'),
