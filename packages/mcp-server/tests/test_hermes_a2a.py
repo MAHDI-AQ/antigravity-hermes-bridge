@@ -6557,5 +6557,1071 @@ class RolePolicyTests(unittest.TestCase):
             asyncio.run(_run())
 
 
+class BackendPerfAndFreezeRegressionTests(unittest.TestCase):
+    """Regression coverage for transcript cache, ETag stability/compact/member, SQLite memoization, lock split, idle coordinator, and off-loop wakeup."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="hermes-perf-")
+        self.tmp_root = Path(self._tmp.name)
+        self.state_dir = self.tmp_root / "state"
+        self.repo_dir = self.tmp_root / "repo"
+        self.repo_dir.mkdir(parents=True, exist_ok=True)
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in (
+                "HERMES_A2A_STATE_DIR",
+                "HERMES_A2A_SWARM_ID",
+                "HERMES_HOME",
+                "ANTIGRAVITY_APP_DATA_DIR",
+                "HERMES_SWARM_ROLE_POLICY",
+            )
+        }
+        os.environ["HERMES_A2A_STATE_DIR"] = str(self.state_dir)
+        os.environ.pop("HERMES_A2A_SWARM_ID", None)
+
+    def tearDown(self) -> None:
+        for k, val in self._env_backup.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+        self._tmp.cleanup()
+
+    def test_transcript_mtime_size_cache_hit_invalidation_and_incremental_slicing(self) -> None:
+        app_data = self.tmp_root / "ag_cache"
+        brain_dir = app_data / "brain"
+        prim_uuid = "aaaa1111-1111-4111-8111-111111111111"
+        coord_uuid = "bbbb2222-2222-4222-8222-222222222222"
+        logs_dir = brain_dir / coord_uuid / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        tfile = logs_dir / "transcript_full.jsonl"
+        step0 = {
+            "step_index": 0,
+            "type": "SYSTEM_MESSAGE",
+            "status": "DONE",
+            "created_at": "2026-11-28T10:00:00Z",
+            "content": "Boot",
+        }
+        step1 = {
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "status": "DONE",
+            "created_at": "2026-11-28T10:00:04Z",
+            "model": "gemini-4-cache-test",
+            "input_tokens": 500,
+            "output_tokens": 120,
+            "content": "First step done",
+            "tool_calls": [],
+        }
+        tfile.write_text("\n".join(json.dumps(s) for s in (step0, step1)) + "\n", encoding="utf-8")
+
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        mgr.store.upsert_meta(
+            prim_uuid,
+            title="Cache Test",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=prim_uuid,
+            coordinator_conversation_id=coord_uuid,
+        )
+        mgr.board_service.upsert_member(
+            "coordinator",
+            role="coordinator",
+            runtime="antigravity",
+            state="working",
+            conversation_id=coord_uuid,
+            swarm_id=prim_uuid,
+        )
+
+        read_count = 0
+        orig_read_text = Path.read_text
+
+        def _counting_read_text(path_obj: Path, *args, **kwargs):
+            nonlocal read_count
+            if path_obj == tfile:
+                read_count += 1
+            return orig_read_text(path_obj, *args, **kwargs)
+
+        try:
+            with (
+                patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_data)}),
+                patch.object(Path, "read_text", autospec=True, side_effect=_counting_read_text),
+            ):
+                p1 = runtime_mod._parse_antigravity_transcript(tfile)
+                self.assertEqual(read_count, 1)
+                self.assertEqual(len(p1["messages"]), 2)
+                # Mutating returned dict/list must NOT corrupt cache
+                p1["messages"].append({"id": 999, "role": "user", "content": "mutated"})
+
+                p2 = runtime_mod._parse_antigravity_transcript(tfile)
+                self.assertEqual(read_count, 1)
+                self.assertEqual(len(p2["messages"]), 2)
+
+                # Summary call hits cache without re-reading disk
+                s1 = runtime_mod.extract_antigravity_transcript_summary([coord_uuid], primary_cid=prim_uuid)
+                s2 = runtime_mod.extract_antigravity_transcript_summary([coord_uuid], primary_cid=prim_uuid)
+                self.assertEqual(read_count, 1)
+                self.assertEqual(s1["model"], "gemini-4-cache-test")
+                self.assertEqual(s2["steps"], 1)
+
+                # Incremental after_id polls slice cached entries safely with 0 extra disk reads
+                h_full = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator")
+                self.assertEqual(read_count, 1)
+                self.assertEqual(len(h_full["messages"]), 2)
+                h_caught_up = runtime_mod.query_member_session_history(
+                    self.state_dir, prim_uuid, "coordinator", after_id=h_full["lastId"]
+                )
+                self.assertEqual(read_count, 1)
+                self.assertEqual(h_caught_up["messages"], [])
+                h_after_first = runtime_mod.query_member_session_history(
+                    self.state_dir, prim_uuid, "coordinator", after_id=h_full["messages"][0]["id"]
+                )
+                self.assertEqual(read_count, 1)
+                self.assertEqual([m["content"] for m in h_after_first["messages"]], ["First step done"])
+
+                # Updating file (size + mtime change) invalidates cache and reads exactly once more
+                step2 = {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "created_at": "2026-11-28T10:00:09Z",
+                    "model": "gemini-4-cache-test",
+                    "input_tokens": 600,
+                    "output_tokens": 80,
+                    "content": "Second step done",
+                    "tool_calls": [],
+                }
+                tfile.write_text("\n".join(json.dumps(s) for s in (step0, step1, step2)) + "\n", encoding="utf-8")
+                h_inc2 = runtime_mod.query_member_session_history(
+                    self.state_dir, prim_uuid, "coordinator", after_id=h_full["lastId"]
+                )
+                self.assertEqual(read_count, 2)
+                self.assertEqual([m["content"] for m in h_inc2["messages"]], ["Second step done"])
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_etag_stability_compact_mode_member_preserved_and_fast_unchanged(self) -> None:
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-perf-etag"
+        coord_conv = "conv-perf-etag-coord"
+        mgr.store.upsert_meta(
+            sid,
+            title="ETag Stability Swarm",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=sid,
+            coordinator_conversation_id=coord_conv,
+        )
+        mgr.board_service.upsert_member("coordinator", role="coordinator", runtime="antigravity", state="waiting", conversation_id=coord_conv, swarm_id=sid)
+        mgr.board_service.upsert_member("w-active", role="worker", state="working", model="m-test", provider="custom", swarm_id=sid)
+        mgr.board_service.post_message(sender="coordinator", summary="@w-active start", swarm_id=sid)
+
+        rt = mgr.get_runtime(sid)
+        with rt._state_rlock:
+            rt._tasks["task-tps-1"] = {
+                "id": "task-tps-1",
+                "contextId": "ctx-tps-1",
+                "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+                "artifacts": [],
+                "history": [],
+                "metadata": {
+                    "createdAt": "2026-11-28T10:00:00Z",
+                    "workerConfig": {"worker_name": "w-active", "role": "worker", "model": "m-test", "provider": "custom"},
+                    "tokens": {"input": 1000, "output": 500, "total": 1500, "contextUsed": 1500, "contextLimit": 100000},
+                    "liveActivity": {
+                        "startedAt": "2026-11-28T10:00:00Z",
+                        "lastEventAt": models.now_iso(),
+                        "steps": 2,
+                        "toolCalls": 3,
+                        "lastTool": "bash",
+                        "currentTool": {"name": "bash", "preview": "pytest", "startedAt": models.now_iso()},
+                        "recentTools": [],
+                        "elapsedMs": 10_000,
+                        "llmActiveMs": 0,
+                        "tps": 50.0,
+                    },
+                },
+            }
+
+        try:
+            # 1) Wall-clock elapsedMs/TPS drift while active must NOT invalidate ETag
+            with patch.object(runtime_mod, "_elapsed_ms", side_effect=[10_000, 15_000, 25_000, 35_000]):
+                snap_a = http_server.build_observer_snapshot(mgr, sid)
+                snap_b = http_server.build_observer_snapshot(mgr, sid)
+            self.assertNotEqual(snap_a["telemetry"]["liveTps"], snap_b["telemetry"]["liveTps"])
+            self.assertEqual(snap_a["etag"], snap_b["etag"])
+
+            # 2) HTTP ?compact=1 & ?include_raw=0 skip raw_blob while preserving core fields
+            app = http_server.create_a2a_app(mgr)
+            client = TestClient(app, base_url="http://127.0.0.1")
+
+            r_compact = client.get(f"/board?conversationId={coord_conv}&compact=1")
+            self.assertEqual(r_compact.status_code, 200)
+            j_compact = r_compact.json()
+            self.assertEqual(j_compact["raw"], {})
+            self.assertEqual(j_compact["member"], "coordinator")
+            self.assertTrue(j_compact["members"])
+            etag = j_compact["etag"]
+
+            r_no_raw = client.get(f"/board?conversationId={coord_conv}&include_raw=0")
+            self.assertEqual(r_no_raw.status_code, 200)
+            self.assertEqual(r_no_raw.json()["raw"], {})
+
+            # 3) Matching ?etag= with matching representation (?compact=1) preserves "member" AND short-circuits build_observer_snapshot
+            with patch.object(http_server, "build_observer_snapshot", side_effect=AssertionError("Expected fast-path short-circuit")):
+                r_unchanged = client.get(f"/board?conversationId={coord_conv}&compact=1&etag={etag}")
+                self.assertEqual(r_unchanged.status_code, 200)
+                j_unchanged = r_unchanged.json()
+                self.assertTrue(j_unchanged["unchanged"])
+                self.assertEqual(j_unchanged["member"], "coordinator")
+                self.assertEqual(j_unchanged["etag"], etag)
+
+                r_304 = client.get(f"/board?conversationId={coord_conv}&compact=1", headers={"If-None-Match": etag})
+                self.assertEqual(r_304.status_code, 304)
+                self.assertEqual(r_304.headers.get("etag"), etag)
+                self.assertEqual(r_304.headers.get("x-swarm-member"), "coordinator")
+
+            # 4) Real board mutation invalidates fast-path cache immediately
+            mgr.board_service.post_message(sender="w-active", summary="@coordinator progress", swarm_id=sid)
+            r_changed = client.get(f"/board?conversationId={coord_conv}&etag={etag}&compact=1")
+            self.assertEqual(r_changed.status_code, 200)
+            self.assertFalse(r_changed.json().get("unchanged", False))
+            self.assertNotEqual(r_changed.json()["etag"], etag)
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_task_to_summary_row_sqlite_lookup_memoization(self) -> None:
+        fake_hh = self.tmp_root / "hh_memo"
+        fake_hh.mkdir(parents=True, exist_ok=True)
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-sqlite-memo"
+        mgr.store.upsert_meta(sid, title="SQLite Memo", workspace=str(self.repo_dir), primary_conversation_id=sid)
+        mgr.board_service.upsert_member("w-old", role="worker", state="waiting", session_id="hs-memo-1", swarm_id=sid)
+        rt = mgr.get_runtime(sid)
+        with rt._state_rlock:
+            rt._tasks["task-memo-1"] = {
+                "id": "task-memo-1",
+                "contextId": "ctx-memo-1",
+                "status": {"state": models.TaskState.COMPLETED.value, "timestamp": "2026-11-28T09:00:00Z"},
+                "artifacts": [],
+                "history": [],
+                "metadata": {
+                    "createdAt": "2026-11-28T08:59:00Z",
+                    "workerConfig": {"worker_name": "w-old", "role": "worker"},
+                    "liveActivity": {"hermesSessionId": "hs-memo-1", "endedAt": "2026-11-28T09:00:00Z"},
+                },
+            }
+
+        calls = 0
+
+        def _fake_query(session_id: str, **kwargs):
+            nonlocal calls
+            calls += 1
+            # Return model with NULL billingProvider (the exact live case that previously looped forever)
+            return {}, None, {"model": "memo-model", "billingProvider": None}
+
+        try:
+            with (
+                patch.dict(os.environ, {"HERMES_HOME": str(fake_hh)}),
+                patch.object(runtime_mod, "_query_hermes_session_stats", side_effect=_fake_query),
+            ):
+                s1 = http_server.build_observer_snapshot(mgr, sid)
+                s2 = http_server.build_observer_snapshot(mgr, sid)
+                s3 = http_server.build_observer_snapshot(mgr, sid)
+            self.assertEqual(calls, 1)
+            for snap in (s1, s2, s3):
+                row = next(t for t in snap["tasks"] if t["taskId"] == "task-memo-1")
+                self.assertEqual(row["model"], "memo-model")
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_stale_and_done_coordinator_transitions_to_waiting_while_running_stays_working(self) -> None:
+        app_data = self.tmp_root / "ag_coord_idle"
+        brain_dir = app_data / "brain"
+        prim_done = "cccc3333-3333-4333-8333-333333333333"
+        coord_done = "dddd4444-4444-4444-8444-444444444444"
+        done_logs = brain_dir / coord_done / ".system_generated" / "logs"
+        done_logs.mkdir(parents=True, exist_ok=True)
+        tfile = done_logs / "transcript_full.jsonl"
+
+        # Case 1: Active RUNNING step -> MUST stay "working"
+        running_steps = [
+            {"step_index": 0, "type": "SYSTEM_MESSAGE", "status": "DONE", "created_at": "2026-11-28T11:00:00Z", "content": "Start"},
+            {"step_index": 1, "type": "PLANNER_RESPONSE", "status": "RUNNING", "created_at": "2026-11-28T11:00:02Z", "model": "gemini-live", "content": "Working..."},
+        ]
+        tfile.write_text("\n".join(json.dumps(s) for s in running_steps) + "\n", encoding="utf-8")
+
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        mgr.store.upsert_meta(
+            prim_done,
+            title="Coord Idle Test",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=prim_done,
+            coordinator_conversation_id=coord_done,
+        )
+        mgr.board_service.upsert_member(
+            "coordinator",
+            role="coordinator",
+            runtime="antigravity",
+            state="working",
+            conversation_id=coord_done,
+            swarm_id=prim_done,
+        )
+
+        # Case 2: Coordinator with NO transcript bound >60s ago and 0 active workers -> "waiting"
+        prim_stale = "eeee5555-5555-4555-8555-555555555555"
+        mgr.store.upsert_meta(
+            prim_stale,
+            title="Stale Bound Test",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=prim_stale,
+            coordinator_conversation_id="ffff6666-6666-4666-8666-666666666666",
+        )
+        mgr.board_service.upsert_member(
+            "coordinator",
+            role="coordinator",
+            runtime="antigravity",
+            state="working",
+            conversation_id="ffff6666-6666-4666-8666-666666666666",
+            swarm_id=prim_stale,
+        )
+        b_stale = mgr.board_service.read_board(prim_stale)
+        b_stale["members"]["coordinator"]["updatedAt"] = "2020-01-01T00:00:00Z"
+        b_stale["members"]["coordinator"]["lastHeartbeatAt"] = "2020-01-01T00:00:00Z"
+        mgr.store.write_board(prim_stale, b_stale)
+        m_stale = mgr.store.read_meta(prim_stale)
+        assert m_stale is not None
+        m_stale["updatedAt"] = "2020-01-01T00:00:00Z"
+        store.atomic_write_json(mgr.store.paths(prim_stale).meta_file, m_stale)
+
+        try:
+            with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_data)}):
+                snap_run = http_server.build_observer_snapshot(mgr, prim_done)
+                coord_run = next(m for m in snap_run["members"] if m["name"] == "coordinator")
+                self.assertEqual(coord_run["status"], "working")
+                hist_run = runtime_mod.query_member_session_history(self.state_dir, prim_done, "coordinator")
+                self.assertEqual(hist_run["state"], "working")
+                self.assertTrue(hist_run["live"]["active"])
+
+                # Transition transcript to terminal DONE -> coordinator reflects as "waiting" immediately
+                done_steps = [
+                    running_steps[0],
+                    {
+                        "step_index": 1,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": "2026-11-28T11:00:05Z",
+                        "model": "gemini-live",
+                        "output_tokens": 50,
+                        "content": "All done.",
+                        "tool_calls": [],
+                    },
+                ]
+                tfile.write_text("\n".join(json.dumps(s) for s in done_steps) + "\n", encoding="utf-8")
+                snap_done = http_server.build_observer_snapshot(mgr, prim_done)
+                coord_done_m = next(m for m in snap_done["members"] if m["name"] == "coordinator")
+                self.assertEqual(coord_done_m["status"], "waiting")
+                hist_done = runtime_mod.query_member_session_history(self.state_dir, prim_done, "coordinator")
+                self.assertEqual(hist_done["state"], "waiting")
+                self.assertFalse(hist_done["live"]["active"])
+
+                # Stale coordinator with no transcript > 60s and 0 active workers -> "waiting"
+                snap_stale = http_server.build_observer_snapshot(mgr, prim_stale)
+                coord_stale_m = next(m for m in snap_stale["members"] if m["name"] == "coordinator")
+                self.assertEqual(coord_stale_m["status"], "waiting")
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_lock_decoupling_wakeup_offload_and_role_policy_cache(self) -> None:
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-lock-wakeup"
+        mgr.store.upsert_meta(sid, title="Lock & Wakeup", workspace=str(self.repo_dir), primary_conversation_id=sid)
+        rt = mgr.get_runtime(sid)
+
+        try:
+            # 1) Runtime state lock, board thread lock, and log lock are strictly decoupled
+            board_lock = store.get_swarm_thread_lock(sid)
+            log_lock = store.get_swarm_log_lock(sid)
+            self.assertIsNot(rt._state_rlock, board_lock)
+            self.assertIsNot(log_lock, board_lock)
+            self.assertIsNot(rt._state_rlock, log_lock)
+
+            # Holding board_lock in one thread must NOT block rt.get_task_snapshots() in another thread
+            lock_held = threading.Event()
+            release_lock = threading.Event()
+
+            def _hold_board_lock() -> None:
+                with board_lock:
+                    lock_held.set()
+                    release_lock.wait(timeout=2.0)
+
+            holder = threading.Thread(target=_hold_board_lock, daemon=True)
+            holder.start()
+            self.assertTrue(lock_held.wait(timeout=1.0))
+            try:
+                t0 = time.monotonic()
+                snaps = rt.get_task_snapshots()
+                elapsed = time.monotonic() - t0
+                self.assertIsInstance(snaps, list)
+                self.assertLess(elapsed, 0.5)
+            finally:
+                release_lock.set()
+                holder.join(timeout=2.0)
+
+            # 2) wakeup.poll_disk_once runs disk I/O off the asyncio event loop
+            mgr.board_service.post_message(sender="coordinator", summary="seed post", swarm_id=sid)
+            orig_read_board = mgr.board_service.read_board
+            caller_threads: list[int] = []
+
+            def _slow_read_board(target_sid: str = "default", **kwargs):
+                caller_threads.append(threading.get_ident())
+                time.sleep(0.12)
+                return orig_read_board(target_sid, **kwargs)
+
+            async def _check_non_blocking() -> None:
+                loop_tid = threading.get_ident()
+                ticks = 0
+
+                async def _heartbeat() -> None:
+                    nonlocal ticks
+                    for _ in range(5):
+                        await asyncio.sleep(0.02)
+                        ticks += 1
+
+                with patch.object(mgr.board_service, "read_board", side_effect=_slow_read_board):
+                    hb = asyncio.create_task(_heartbeat())
+                    await mgr.mention_router.poll_disk_once([sid])
+                    await hb
+
+                self.assertTrue(caller_threads, "Expected poll_disk_once to read changed board")
+                self.assertTrue(all(tid != loop_tid for tid in caller_threads))
+                self.assertGreaterEqual(ticks, 3)
+
+            asyncio.run(_check_non_blocking())
+
+            # 3) server._load_role_policy_cached caches by mtime+size and honors HERMES_SWARM_ROLE_POLICY overrides
+            pfile = self.tmp_root / "cached_role_policy.json"
+            pfile.write_text(json.dumps({"version": 1, "enforcement": "reject"}), encoding="utf-8")
+            import role_policy as rp_mod
+
+            load_calls = 0
+            orig_load = rp_mod.load_role_policy
+
+            def _counting_load(ws=None):
+                nonlocal load_calls
+                load_calls += 1
+                return orig_load(ws)
+
+            with (
+                patch.object(rp_mod, "load_role_policy", side_effect=_counting_load),
+                patch.dict(os.environ, {"HERMES_SWARM_ROLE_POLICY": str(pfile)}),
+            ):
+                pol1 = mcp_srv._load_role_policy_cached(str(self.repo_dir))
+                pol2 = mcp_srv._load_role_policy_cached(str(self.repo_dir))
+                self.assertEqual(pol1["enforcement"], "reject")
+                self.assertEqual(pol2["enforcement"], "reject")
+                self.assertEqual(load_calls, 1)
+
+                # Modifying policy file invalidates cache
+                pfile.write_text(json.dumps({"version": 1, "enforcement": "warn", "note": "updated"}), encoding="utf-8")
+                pol3 = mcp_srv._load_role_policy_cached(str(self.repo_dir))
+                self.assertEqual(pol3["enforcement"], "warn")
+                self.assertEqual(load_calls, 2)
+
+            # Env override "default" bypasses cached file immediately
+            with patch.dict(os.environ, {"HERMES_SWARM_ROLE_POLICY": "default"}):
+                pol_def = mcp_srv._load_role_policy_cached(str(self.repo_dir))
+                self.assertEqual(pol_def["source"], "default")
+                self.assertEqual(pol_def["enforcement"], "warn")
+        finally:
+            asyncio.run(mgr.shutdown())
+
+
+class AuditPhase2BackendBugfixTests(unittest.TestCase):
+    """Regression coverage for #292 backend findings: C1, C2, H1, H2, H3, H4, H5, M3, M4, M6, M7."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="hermes-bh-fix-")
+        self.tmp_root = Path(self._tmp.name)
+        self.state_dir = self.tmp_root / "state"
+        self.repo_dir = self.tmp_root / "repo"
+        self.repo_dir.mkdir(parents=True, exist_ok=True)
+        self._env_backup = {
+            k: os.environ.get(k)
+            for k in (
+                "HERMES_A2A_STATE_DIR",
+                "HERMES_A2A_SWARM_ID",
+                "HERMES_HOME",
+                "ANTIGRAVITY_APP_DATA_DIR",
+                "ANTIGRAVITY_EXECUTABLE_DATA_DIR",
+            )
+        }
+        os.environ["HERMES_A2A_STATE_DIR"] = str(self.state_dir)
+        os.environ.pop("HERMES_A2A_SWARM_ID", None)
+
+    def tearDown(self) -> None:
+        for k, val in self._env_backup.items():
+            if val is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = val
+        self._tmp.cleanup()
+
+    def test_c1_observer_etag_cache_toctou_does_not_poison_on_mid_build_mutation(self) -> None:
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-c1-toctou"
+        coord_conv = "conv-c1-toctou-c"
+        mgr.store.upsert_meta(
+            sid,
+            title="C1 TOCTOU",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=sid,
+            coordinator_conversation_id=coord_conv,
+        )
+        mgr.board_service.upsert_member("coordinator", role="coordinator", runtime="antigravity", state="waiting", conversation_id=coord_conv, swarm_id=sid)
+        post_t0 = mgr.board_service.post_message(sender="coordinator", summary="post T0", swarm_id=sid)
+        head_t0 = int(post_t0["seq"])
+        # Pre-warm runtime so manager.get_runtime(sid) does not call read_board before base_sig_before
+        rt = mgr.get_runtime(sid)
+
+        paths = mgr.store.paths(sid)
+        cache_key = (str(paths.swarm_dir), sid)
+        orig_read_board = mgr.board_service.read_board
+        injected = False
+
+        def _mutating_read_board(target_sid: str = "default", **kwargs):
+            nonlocal injected
+            snap_board = orig_read_board(target_sid, **kwargs)
+            if not injected and target_sid == sid:
+                injected = True
+                # Simulate a concurrent post landing AFTER T0 read and BEFORE T1 cache store!
+                mgr.board_service.post_message(sender="coordinator", summary="post T1 concurrent", swarm_id=sid)
+            return snap_board
+
+        try:
+            with patch.object(mgr.board_service, "read_board", side_effect=_mutating_read_board):
+                snap_t0 = http_server.build_observer_snapshot(mgr, sid)
+            self.assertTrue(injected)
+            self.assertEqual(snap_t0["head"], head_t0)
+            # C1: Because light_sig_before != light_sig_after, T0 ETag must NOT be cached!
+            with http_server._OBSERVER_ETAG_CACHE_LOCK:
+                self.assertNotIn(cache_key, http_server._OBSERVER_ETAG_CACHE)
+            self.assertIsNone(
+                http_server.try_fast_unchanged_snapshot(
+                    mgr, sid, conv_id=sid, known_etag=snap_t0["etag"], include_raw=True
+                )
+            )
+            # Subsequent poll with T0 ETag must observe T1 post cleanly (not swallowed as unchanged)
+            app = http_server.create_a2a_app(mgr)
+            client = TestClient(app, base_url="http://127.0.0.1")
+            r_next = client.get(f"/board?conversationId={sid}&etag={snap_t0['etag']}")
+            self.assertEqual(r_next.status_code, 200)
+            j_next = r_next.json()
+            self.assertFalse(j_next.get("unchanged", False))
+            self.assertEqual(j_next["head"], head_t0 + 1)
+            self.assertNotEqual(j_next["etag"], snap_t0["etag"])
+
+            # Also verify in-memory runtime mutation mid-snapshot does NOT poison _OBSERVER_ETAG_CACHE
+            orig_get_tasks = rt.get_task_snapshots
+            mutated_rt = False
+
+            def _mutating_get_tasks(*args, **kwargs):
+                nonlocal mutated_rt
+                res = orig_get_tasks(*args, **kwargs)
+                if not mutated_rt:
+                    mutated_rt = True
+                    with rt._state_rlock:
+                        rt._tasks["task-c1-race"] = {
+                            "id": "task-c1-race",
+                            "contextId": "ctx-c1",
+                            "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+                            "artifacts": [],
+                            "history": [],
+                            "metadata": {"workerConfig": {"worker_name": "w-c1", "role": "worker"}},
+                        }
+                return res
+
+            with patch.object(rt, "get_task_snapshots", side_effect=_mutating_get_tasks):
+                snap_rt_t0 = http_server.build_observer_snapshot(mgr, sid)
+            self.assertTrue(mutated_rt)
+            with http_server._OBSERVER_ETAG_CACHE_LOCK:
+                self.assertNotIn(cache_key, http_server._OBSERVER_ETAG_CACHE)
+            self.assertIsNone(
+                http_server.try_fast_unchanged_snapshot(
+                    mgr, sid, conv_id=sid, known_etag=snap_rt_t0["etag"], include_raw=True
+                )
+            )
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_c2_coordinator_pending_tools_mid_turn_stale_running_and_lp_ts_parity(self) -> None:
+        app_data = self.tmp_root / "ag_c2"
+        brain_dir = app_data / "brain"
+        prim_uuid = "1111aaaa-1111-4111-8111-111111111111"
+        coord_uuid = "2222bbbb-2222-4222-8222-222222222222"
+        logs_dir = brain_dir / coord_uuid / ".system_generated" / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        tfile = logs_dir / "transcript_full.jsonl"
+
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        mgr.store.upsert_meta(
+            prim_uuid,
+            title="C2 Coord State",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=prim_uuid,
+            coordinator_conversation_id=coord_uuid,
+        )
+        mgr.board_service.upsert_member(
+            "coordinator",
+            role="coordinator",
+            runtime="antigravity",
+            state="working",
+            conversation_id=coord_uuid,
+            swarm_id=prim_uuid,
+        )
+        rt = mgr.get_runtime(prim_uuid)
+
+        try:
+            with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_data)}):
+                # 1) PLANNER_RESPONSE status="DONE" with pending tool_calls -> MUST stay "working"
+                steps_pending_tc = [
+                    {
+                        "step_index": 0,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": models.now_iso(),
+                        "model": "gemini-c2",
+                        "content": "Running command...",
+                        "tool_calls": [{"id": "tc-1", "name": "run_command", "args": {"cmd": "pytest"}}],
+                    },
+                ]
+                tfile.write_text("\n".join(json.dumps(s) for s in steps_pending_tc) + "\n", encoding="utf-8")
+                snap1 = http_server.build_observer_snapshot(mgr, prim_uuid)
+                coord1 = next(m for m in snap1["members"] if m["name"] == "coordinator")
+                hist1 = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator", runtime=rt)
+                self.assertEqual(coord1["status"], "working")
+                self.assertEqual(hist1["state"], "working")
+
+                # 2) GENERIC status="DONE" (tool result returned, LLM thinking next turn, fresh <60s) -> stays "working"
+                steps_generic_tail = [
+                    *steps_pending_tc,
+                    {
+                        "step_index": 1,
+                        "type": "GENERIC",
+                        "status": "DONE",
+                        "created_at": models.now_iso(),
+                        "content": "pytest passed",
+                    },
+                ]
+                tfile.write_text("\n".join(json.dumps(s) for s in steps_generic_tail) + "\n", encoding="utf-8")
+                snap2 = http_server.build_observer_snapshot(mgr, prim_uuid)
+                coord2 = next(m for m in snap2["members"] if m["name"] == "coordinator")
+                hist2 = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator", runtime=rt)
+                self.assertEqual(coord2["status"], "working")
+                self.assertEqual(hist2["state"], "working")
+
+                # 3) Crashed RUNNING step with transcript mtime > 120s old -> transitions to "waiting"
+                steps_crashed_run = [
+                    {
+                        "step_index": 0,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "RUNNING",
+                        "created_at": "2020-01-01T00:00:00Z",
+                        "model": "gemini-c2",
+                        "content": "Stuck running...",
+                    },
+                ]
+                tfile.write_text("\n".join(json.dumps(s) for s in steps_crashed_run) + "\n", encoding="utf-8")
+                stale_epoch = time.time() - 180.0
+                os.utime(tfile, (stale_epoch, stale_epoch))
+                snap3 = http_server.build_observer_snapshot(mgr, prim_uuid)
+                coord3 = next(m for m in snap3["members"] if m["name"] == "coordinator")
+                hist3 = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator", runtime=rt)
+                self.assertEqual(coord3["status"], "waiting")
+                self.assertEqual(hist3["state"], "waiting")
+                self.assertFalse(hist3["live"]["active"])
+
+                # 4) Stale GENERIC (>60s old mtime) + old meta/member updatedAt, BUT fresh coordinator board post lp["ts"] -> BOTH agree "working"
+                tfile.write_text("\n".join(json.dumps(s) for s in steps_generic_tail) + "\n", encoding="utf-8")
+                stale_gen = time.time() - 90.0
+                os.utime(tfile, (stale_gen, stale_gen))
+                mgr.board_service.post_message(sender="coordinator", summary="fresh board post", swarm_id=prim_uuid)
+                # Backdate member updatedAt/lastHeartbeatAt & meta.updatedAt so ONLY lp["ts"] is fresh
+                b_doc = mgr.board_service.read_board(prim_uuid)
+                b_doc["members"]["coordinator"]["updatedAt"] = "2020-01-01T00:00:00Z"
+                b_doc["members"]["coordinator"]["lastHeartbeatAt"] = "2020-01-01T00:00:00Z"
+                mgr.store.write_board(prim_uuid, b_doc)
+                m_doc = mgr.store.read_meta(prim_uuid)
+                assert m_doc is not None
+                m_doc["updatedAt"] = "2020-01-01T00:00:00Z"
+                store.atomic_write_json(mgr.store.paths(prim_uuid).meta_file, m_doc)
+
+                snap4 = http_server.build_observer_snapshot(mgr, prim_uuid)
+                coord4 = next(m for m in snap4["members"] if m["name"] == "coordinator")
+                hist4 = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator", runtime=rt)
+                self.assertEqual(coord4["status"], "working")
+                self.assertEqual(hist4["state"], "working")
+
+                # 5) Terminal text-only PLANNER_RESPONSE (zero pending tool calls) -> immediately "waiting"
+                steps_final_done = [
+                    *steps_generic_tail,
+                    {
+                        "step_index": 2,
+                        "type": "PLANNER_RESPONSE",
+                        "status": "DONE",
+                        "created_at": models.now_iso(),
+                        "model": "gemini-c2",
+                        "content": "Completed!",
+                        "tool_calls": [],
+                    },
+                ]
+                tfile.write_text("\n".join(json.dumps(s) for s in steps_final_done) + "\n", encoding="utf-8")
+                snap5 = http_server.build_observer_snapshot(mgr, prim_uuid)
+                coord5 = next(m for m in snap5["members"] if m["name"] == "coordinator")
+                hist5 = runtime_mod.query_member_session_history(self.state_dir, prim_uuid, "coordinator", runtime=rt)
+                self.assertEqual(coord5["status"], "waiting")
+                self.assertEqual(hist5["state"], "waiting")
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_h1_scan_disk_view_change_does_not_swallow_concurrent_board_post(self) -> None:
+        async def _run() -> None:
+            bs = board_mod.BoardService(self.state_dir)
+            sid = "conv-h1-view-race"
+            bs.upsert_member("narrator", role="narrator", state="waiting", swarm_id=sid)
+            bs.upsert_member("w-target", role="worker", state="waiting", swarm_id=sid)
+            bs.post_message(sender="coordinator", summary="seed #1", swarm_id=sid)
+
+            woken_prompts: list[tuple[str, str]] = []
+
+            async def _wake(swarm_id: str, target: str, prompt: str) -> bool:
+                woken_prompts.append((target, prompt))
+                return True
+
+            router = wakeup_mod.MentionRouter(bs, wake_worker=_wake, debounce_seconds=0.0)
+            router.seed_existing([sid])
+
+            # Narrator updates view.json (view_changed=True, sig_changed=False)
+            paths = store.resolve_swarm_paths(sid, state_dir=self.state_dir)
+            (paths.swarm_dir / "view.json").write_text(json.dumps({"summary": "v1"}), encoding="utf-8")
+
+            orig_mark = bs.mark_member_read
+            concurrent_posted = False
+
+            def _racy_mark(agent: str, seq: int, **kwargs):
+                nonlocal concurrent_posted
+                res = orig_mark(agent, seq, **kwargs)
+                if not concurrent_posted:
+                    concurrent_posted = True
+                    # Message #2 arrives right between read_board() and st_after stat()!
+                    bs.post_message(sender="coordinator", summary="@w-target urgent #2", swarm_id=sid)
+                return res
+
+            with patch.object(bs, "mark_member_read", side_effect=_racy_mark):
+                await router.poll_disk_once([sid])
+            # Even if a second poll runs, #2 must already be routed on the first poll (and never dropped!)
+            self.assertTrue(
+                any(t == "w-target" and "urgent #2" in p for t, p in woken_prompts),
+                msg=f"Concurrent post #2 was dropped during view.json update! woken={woken_prompts}",
+            )
+
+        asyncio.run(_run())
+
+    def test_h2_and_h3_compact_vs_full_etag_distinct_and_unchanged_has_conversation_ids(self) -> None:
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-h23-prim"
+        coord_conv = "conv-h23-coord"
+        third_conv = "conv-h23-worker3"
+        mgr.store.upsert_meta(
+            sid,
+            title="H2 H3 Test",
+            workspace=str(self.repo_dir),
+            primary_conversation_id=sid,
+            coordinator_conversation_id=coord_conv,
+        )
+        # Add 3rd conversation ID into meta.conversationIds
+        m_doc = mgr.store.read_meta(sid)
+        assert m_doc is not None
+        m_doc["conversationIds"] = [sid, coord_conv, third_conv]
+        store.atomic_write_json(mgr.store.paths(sid).meta_file, m_doc)
+        with store._META_CACHE_LOCK:
+            store._META_CACHE.clear()
+        with store._CONV_RESOLVE_CACHE_LOCK:
+            store._CONV_RESOLVE_CACHE.clear()
+
+        mgr.board_service.upsert_member("coordinator", role="coordinator", runtime="antigravity", state="waiting", conversation_id=coord_conv, swarm_id=sid)
+        mgr.board_service.post_message(sender="coordinator", summary="hello world", swarm_id=sid)
+
+        app = http_server.create_a2a_app(mgr)
+        client = TestClient(app, base_url="http://127.0.0.1")
+        try:
+            # H2: compact ETag vs full ETag must be distinct and NEVER cross-match!
+            r_comp = client.get(f"/board?conversationId={third_conv}&compact=1")
+            self.assertEqual(r_comp.status_code, 200)
+            j_comp = r_comp.json()
+            self.assertEqual(j_comp["raw"], {})
+            etag_compact = j_comp["etag"]
+
+            # Passing compact ETag to full /board (include_raw=True) MUST NOT return unchanged or 304
+            r_full_with_comp_q = client.get(f"/board?conversationId={third_conv}&etag={etag_compact}")
+            self.assertEqual(r_full_with_comp_q.status_code, 200)
+            j_full = r_full_with_comp_q.json()
+            self.assertFalse(j_full.get("unchanged", False))
+            self.assertIn("board", j_full["raw"])
+            self.assertTrue(bool(j_full["raw"]["board"]))
+            etag_full = j_full["etag"]
+            self.assertNotEqual(etag_full, etag_compact)
+
+            r_full_with_comp_hdr = client.get(f"/board?conversationId={third_conv}", headers={"If-None-Match": etag_compact})
+            self.assertEqual(r_full_with_comp_hdr.status_code, 200)
+            self.assertIn("board", r_full_with_comp_hdr.json()["raw"])
+
+            # Both compact & full ETags hit fast-path unchanged for their own representation AND carry conversationIds (H3)
+            with patch.object(http_server, "build_observer_snapshot", side_effect=AssertionError("Expected fast-path")):
+                r_fast_full = client.get(f"/board?conversationId={third_conv}&etag={etag_full}")
+                self.assertEqual(r_fast_full.status_code, 200)
+                jf = r_fast_full.json()
+                self.assertTrue(jf["unchanged"])
+                self.assertIn(third_conv, jf.get("conversationIds") or [])
+                self.assertIn(sid, jf.get("conversationIds") or [])
+                self.assertIn(coord_conv, jf.get("conversationIds") or [])
+
+                r_fast_comp = client.get(f"/board?conversationId={third_conv}&compact=1&etag={etag_compact}")
+                self.assertEqual(r_fast_comp.status_code, 200)
+                jc = r_fast_comp.json()
+                self.assertTrue(jc["unchanged"])
+                self.assertIn(third_conv, jc.get("conversationIds") or [])
+
+            # Full-path unchanged (fast-path bypassed) must ALSO carry conversationIds (H3)
+            with patch.object(http_server, "try_fast_unchanged_snapshot", return_value=None):
+                r_slow_unchanged = client.get(f"/board?conversationId={third_conv}&etag={etag_full}")
+                self.assertEqual(r_slow_unchanged.status_code, 200)
+                js = r_slow_unchanged.json()
+                self.assertTrue(js["unchanged"])
+                self.assertIn(third_conv, js.get("conversationIds") or [])
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_h4_subagent_stuck_expiry_and_new_brain_view_json_busts_cache(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        app_data = self.tmp_root / "ag_h4"
+        brain_dir = app_data / "brain"
+        brain_dir.mkdir(parents=True, exist_ok=True)
+        narr_cid = "3333cccc-3333-4333-8333-333333333333"
+
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-h4-cache"
+        mgr.store.upsert_meta(sid, title="H4 Test", workspace=str(self.repo_dir), primary_conversation_id=sid)
+        mgr.board_service.upsert_member("narrator", role="narrator", state="waiting", conversation_id=narr_cid, swarm_id=sid)
+        mgr.board_service.upsert_member("w-parent", role="worker", state="working", swarm_id=sid)
+
+        old_ts = "2020-01-01T00:00:00Z"
+        rt = mgr.get_runtime(sid)
+        with rt._state_rlock:
+            rt._tasks["task-h4-parent"] = {
+                "id": "task-h4-parent",
+                "contextId": "ctx-h4",
+                "status": {"state": models.TaskState.WORKING.value, "timestamp": old_ts},
+                "artifacts": [],
+                "history": [],
+                "metadata": {
+                    "createdAt": old_ts,
+                    "workerConfig": {"worker_name": "w-parent", "role": "worker", "model": "m1", "provider": "p1"},
+                    "liveActivity": {
+                        "startedAt": old_ts,
+                        "lastEventAt": old_ts,
+                        "currentTool": {"name": "delegate_task", "preview": "sub", "startedAt": old_ts},
+                    },
+                },
+            }
+        with mgr.board_service._locked_board(sid, mutate=True) as (_, b_fix, _):
+            b_fix["members"]["w-parent"]["lastHeartbeatAt"] = old_ts
+            b_fix["members"]["w-parent"]["updatedAt"] = old_ts
+
+        # Subagent updated 9m58s ago -> 2s left before STUCK_MS
+        sub_near_stale = (datetime.now(timezone.utc) - timedelta(seconds=598)).isoformat().replace("+00:00", "Z")
+        mgr.board_service.upsert_subagents(
+            "w-parent",
+            [{"id": "sub-h4-1", "name": "subagent-1", "status": "working", "updatedAt": sub_near_stale}],
+            swarm_id=sid,
+        )
+
+        paths = mgr.store.paths(sid)
+        cache_key = (str(paths.swarm_dir), sid)
+        try:
+            with patch.dict(os.environ, {"ANTIGRAVITY_APP_DATA_DIR": str(app_data)}):
+                before_m = time.monotonic()
+                snap1 = http_server.build_observer_snapshot(mgr, sid)
+                self.assertFalse(any(a.get("kind") == "stuck" for a in snap1["systemAttention"]))
+                self.assertFalse(snap1["view"]["exists"])
+                with http_server._OBSERVER_ETAG_CACHE_LOCK:
+                    entry = dict(http_server._OBSERVER_ETAG_CACHE[cache_key])
+                # H4 part 1: nextExpiryMono must be bounded by sub_updated_ms + STUCK_MS (not inf!)
+                self.assertTrue(entry["nextExpiryMono"] < float("inf"))
+                self.assertLessEqual(entry["nextExpiryMono"] - before_m, 10.0)
+
+                # H4 part 2: Creating brain/<narr_cid>/swarm_view/view.json later MUST bust fast-path cache!
+                # Bump nextExpiryMono so we isolate the brain-dir view.json detection specifically.
+                with http_server._OBSERVER_ETAG_CACHE_LOCK:
+                    http_server._OBSERVER_ETAG_CACHE[cache_key]["nextExpiryMono"] = time.monotonic() + 300.0
+                self.assertIsNotNone(
+                    http_server.try_fast_unchanged_snapshot(
+                        mgr, sid, conv_id=sid, known_etag=snap1["etag"], include_raw=True
+                    )
+                )
+                brain_view_dir = brain_dir / narr_cid / "swarm_view"
+                brain_view_dir.mkdir(parents=True, exist_ok=True)
+                (brain_view_dir / "view.json").write_text(json.dumps({"summary": "fresh brain view"}), encoding="utf-8")
+                self.assertIsNone(
+                    http_server.try_fast_unchanged_snapshot(
+                        mgr, sid, conv_id=sid, known_etag=snap1["etag"], include_raw=True
+                    )
+                )
+                snap2 = http_server.build_observer_snapshot(mgr, sid)
+                self.assertTrue(snap2["view"]["exists"])
+                self.assertEqual(snap2["view"]["source"], "brain")
+        finally:
+            asyncio.run(mgr.shutdown())
+
+    def test_h5_swarms_with_pending_thread_safe_under_concurrent_requeue(self) -> None:
+        async def _run() -> None:
+            bs = board_mod.BoardService(self.state_dir)
+            router = wakeup_mod.MentionRouter(bs, debounce_seconds=0.0)
+            stop_flag = threading.Event()
+            errors: list[Exception] = []
+
+            def _writer_thread(idx: int) -> None:
+                try:
+                    for j in range(60):
+                        if stop_flag.is_set():
+                            break
+                        sid = f"sw-h5-{idx}-{j % 12}"
+                        router._enqueue_batch_on_failure(sid, "w1", [{"seq": j + 1, "summary": "retry"}])
+                except Exception as exc:
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=_writer_thread, args=(i,), daemon=True) for i in range(4)]
+            for t in threads:
+                t.start()
+            try:
+                for _ in range(25):
+                    await router.poll_disk_once()
+                    await asyncio.sleep(0.002)
+            finally:
+                stop_flag.set()
+                for t in threads:
+                    t.join(timeout=5.0)
+            self.assertEqual(errors, [])
+
+        asyncio.run(_run())
+
+    def test_m3_m4_m6_m7_fingerprint_wakeseq_reap_lock_and_transcript_cas(self) -> None:
+        # M6: _reap_lock_file MUST refuse to reap a live holder lock when expected_token is None
+        lpath = self.tmp_root / "m6.lock"
+        lpath.write_text(
+            json.dumps({"pid": os.getpid(), "ts": time.time(), "token": "live-holder-tok", "released": False}),
+            encoding="utf-8",
+        )
+        self.assertFalse(store._reap_lock_file(lpath, expected_token=None))
+        self.assertTrue(lpath.exists())
+        # When lock genuinely has no token (None), expected_token=None succeeds
+        lpath_notok = self.tmp_root / "m6_notok.lock"
+        lpath_notok.write_text(json.dumps({"pid": 9999999, "ts": 0.0, "released": False}), encoding="utf-8")
+        self.assertTrue(store._reap_lock_file(lpath_notok, expected_token=None))
+        self.assertFalse(lpath_notok.exists())
+
+        # M3 + M4: get_observer_state_fingerprint covers all live fields & list_active_wake_swarms honors memory wakeSeq
+        mgr = runtime_mod.SwarmManager(state_dir=self.state_dir)
+        sid = "conv-m34"
+        mgr.store.upsert_meta(sid, title="M3 M4", workspace=str(self.repo_dir), primary_conversation_id=sid)
+        rt = mgr.get_runtime(sid)
+        try:
+            # M4: memory wakeSeq ahead of disk meta.json
+            with mgr._lock:
+                mgr._wake_seq_by_swarm[sid] = 9
+            swarms = mgr.list_active_wake_swarms()
+            row = next(s for s in swarms if s["swarmId"] == sid)
+            self.assertEqual(row["wakeSeq"], 9)
+
+            # M3: every live field mutates get_observer_state_fingerprint()
+            with rt._state_rlock:
+                rt._tasks["t-m3"] = {
+                    "id": "t-m3",
+                    "contextId": "ctx-m3",
+                    "status": {"state": models.TaskState.WORKING.value, "timestamp": models.now_iso()},
+                    "artifacts": [],
+                    "history": [],
+                    "metadata": {
+                        "createdAt": models.now_iso(),
+                        "workerConfig": {"worker_name": "w1", "role": "worker"},
+                        "tokens": {"pureInput": 100, "cachedInput": 200, "cacheWrite": 10, "output": 50, "total": 360},
+                        "worktreePath": "/wt/a",
+                        "worktreeBranch": "br-a",
+                        "liveActivity": {
+                            "currentTool": {"name": "bash", "preview": "ls", "startedAt": "2026-11-28T10:00:00Z"},
+                            "lastTextPreview": "hello",
+                            "recentTools": [{"name": "read", "preview": "a.py", "status": "ok", "at": "t1"}],
+                            "lastEventAt": "2026-11-28T10:00:01Z",
+                            "hermesSessionId": "hs-1",
+                        },
+                    },
+                }
+
+            seen_fps: list[tuple] = [rt.get_observer_state_fingerprint()]
+            mutations = [
+                lambda t: t["metadata"]["liveActivity"]["currentTool"].__setitem__("preview", "pytest -q"),
+                lambda t: t["metadata"]["liveActivity"].__setitem__("lastTextPreview", "updated preview"),
+                lambda t: t["metadata"]["liveActivity"]["recentTools"].append({"name": "edit", "preview": "b.py", "status": "ok", "at": "t2"}),
+                lambda t: t["metadata"]["liveActivity"].__setitem__("lastEventAt", "2026-11-28T10:00:05Z"),
+                lambda t: t["metadata"]["liveActivity"].__setitem__("hermesSessionId", "hs-2"),
+                lambda t: t["metadata"].__setitem__("worktreePath", "/wt/b"),
+                lambda t: t["metadata"].__setitem__("worktreeBranch", "br-b"),
+                lambda t: t["metadata"]["tokens"].__setitem__("pureInput", 120),
+                lambda t: t["metadata"]["tokens"].__setitem__("cachedInput", 180),
+                lambda t: t["metadata"]["tokens"].__setitem__("cacheWrite", 25),
+            ]
+            for idx_m, fn in enumerate(mutations):
+                with rt._state_rlock:
+                    fn(rt._tasks["t-m3"])
+                fp = rt.get_observer_state_fingerprint()
+                self.assertNotEqual(fp, seen_fps[-1], f"Mutation #{idx_m} did not change observer fingerprint")
+                seen_fps.append(fp)
+
+            # M3: active incomplete SQLite meta lookup bounds nextExpiryMono by _TASK_SESSION_META_ACTIVE_TTL_S (15s)
+            with patch.object(runtime_mod, "_query_hermes_session_stats", return_value=({}, None, {"model": None, "billingProvider": None})):
+                t_before = time.monotonic()
+                http_server.build_observer_snapshot(mgr, sid)
+            paths = mgr.store.paths(sid)
+            with http_server._OBSERVER_ETAG_CACHE_LOCK:
+                c_ent = http_server._OBSERVER_ETAG_CACHE.get((str(paths.swarm_dir), sid))
+            self.assertIsNotNone(c_ent)
+            assert c_ent is not None
+            self.assertLessEqual(c_ent["nextExpiryMono"] - t_before, http_server._TASK_SESSION_META_ACTIVE_TTL_S + 2.0)
+
+            # M7: transcript cache key includes st_ino and slower parser cannot evict newer revision
+            tpath = self.tmp_root / "m7_transcript.jsonl"
+            s1 = {"step_index": 0, "type": "PLANNER_RESPONSE", "status": "DONE", "content": "rev1", "tool_calls": []}
+            tpath.write_text(json.dumps(s1) + "\n", encoding="utf-8")
+            st1 = tpath.stat()
+            older_key = (str(tpath), int(st1.st_mtime_ns), int(st1.st_size), int(getattr(st1, "st_ino", 0)))
+            self.assertEqual(len(older_key), 4)
+
+            # Pre-seed a newer revision key in _TRANSCRIPT_PATH_KEYS + _TRANSCRIPT_PARSE_CACHE
+            newer_key = (str(tpath), int(st1.st_mtime_ns) + 1_000_000_000, int(st1.st_size) + 50, int(getattr(st1, "st_ino", 0)))
+            newer_entry = runtime_mod._empty_parsed_transcript()
+            newer_entry["model"] = "newer-rev-model"
+            newer_entry["_msg_ids"] = []
+            with runtime_mod._TRANSCRIPT_CACHE_LOCK:
+                runtime_mod._TRANSCRIPT_PARSE_CACHE[newer_key] = newer_entry
+                runtime_mod._TRANSCRIPT_SUMMARY_CACHE[newer_key] = runtime_mod._build_transcript_summary_from_parsed(newer_entry)
+                runtime_mod._TRANSCRIPT_PATH_KEYS[str(tpath)] = newer_key
+            # Parsing the older disk revision must NOT evict newer_key
+            runtime_mod._parse_antigravity_transcript_cached_entry(tpath)
+            with runtime_mod._TRANSCRIPT_CACHE_LOCK:
+                self.assertEqual(runtime_mod._TRANSCRIPT_PATH_KEYS.get(str(tpath)), newer_key)
+                self.assertIn(newer_key, runtime_mod._TRANSCRIPT_PARSE_CACHE)
+        finally:
+            asyncio.run(mgr.shutdown())
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

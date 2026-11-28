@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import bisect
+from collections import OrderedDict
 from datetime import datetime, timezone
 import json
 import math
@@ -97,12 +99,29 @@ _PREVIEW_KEY_ORDER = (
     "action",
     "name",
 )
-_CONTEXT_YAML_CACHE: dict[str, tuple[int, dict[str, Any]]] = {}
+_CONTEXT_YAML_CACHE: dict[str, tuple[tuple[int, int, int], dict[str, Any]]] = {}
 _CONTEXT_YAML_LOCK = threading.Lock()
 _SQLITE_SCHEMA_CACHE: dict[tuple[str, str], tuple[int, set[str]]] = {}
 _SQLITE_SCHEMA_CACHE_LOCK = threading.Lock()
 _COMMITTED_TC_CACHE: dict[tuple[str, str, int], tuple[int, int, set[str], set[str]]] = {}
 _COMMITTED_TC_CACHE_LOCK = threading.Lock()
+_TRANSCRIPT_CACHE_LOCK = threading.Lock()
+_TRANSCRIPT_PARSE_CACHE: OrderedDict[tuple[str, int, int, int], dict[str, Any]] = OrderedDict()
+_TRANSCRIPT_SUMMARY_CACHE: OrderedDict[tuple[str, int, int, int], dict[str, Any]] = OrderedDict()
+_TRANSCRIPT_PATH_KEYS: dict[str, tuple[str, int, int, int]] = {}
+_TRANSCRIPT_CACHE_MAX = 64
+COORDINATOR_STALE_MS = 60_000
+COORDINATOR_RUNNING_STALE_MS = 120_000
+_TERMINAL_TRANSCRIPT_STATUSES = frozenset({
+    "DONE",
+    "COMPLETED",
+    "ERROR",
+    "INVALID",
+    "CANCELED",
+    "CANCELLED",
+    "STOPPED",
+    "FAILED",
+})
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 _CONV_ID_RE = re.compile(r"^[A-Za-z0-9_-]{4,128}$")
 _TRANSCRIPT_COMPLETED_AT_RE = re.compile(r"^Completed At:\s*(\S+)", re.MULTILINE)
@@ -206,13 +225,13 @@ def _read_yaml_cached(path: Path) -> dict[str, Any]:
         return {}
     try:
         st = path.stat()
-        mtime_ns = int(st.st_mtime_ns)
+        sig = (int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0)))
     except OSError:
         return {}
     key = str(path)
     with _CONTEXT_YAML_LOCK:
         cached = _CONTEXT_YAML_CACHE.get(key)
-        if cached and cached[0] == mtime_ns:
+        if cached and cached[0] == sig:
             return cached[1]
     try:
         parsed = yaml.safe_load(path.read_text(encoding="utf-8", errors="replace"))
@@ -220,7 +239,7 @@ def _read_yaml_cached(path: Path) -> dict[str, Any]:
     except Exception:
         data = {}
     with _CONTEXT_YAML_LOCK:
-        _CONTEXT_YAML_CACHE[key] = (mtime_ns, data)
+        _CONTEXT_YAML_CACHE[key] = (sig, data)
     return data
 
 
@@ -873,7 +892,8 @@ class SwarmRuntime:
         self._loop: asyncio.AbstractEventLoop | None = loop
         self.http_url: str | None = http_url
 
-        self._state_rlock = store.get_swarm_thread_lock(self.swarm_id)
+        # Dedicated in-memory state lock decoupled from BoardService / log file locks.
+        self._state_rlock = threading.RLock()
         self._async_lock = asyncio.Lock()
         self._async_lock_loop: asyncio.AbstractEventLoop | None = loop
 
@@ -1194,12 +1214,12 @@ class SwarmRuntime:
         else:
             act["tps"] = float(act.get("tps") or 0.0)
 
-    def get_task_snapshots(self) -> list[dict[str, Any]]:
-        """Thread-safe shallow copy of persisted/in-memory tasks for cross-thread HTTP observers."""
+    def get_task_snapshots(self, *, include_artifacts: bool = True) -> list[dict[str, Any]]:
+        """Thread-safe snapshot of persisted/in-memory tasks for cross-thread HTTP observers."""
         with self._state_rlock:
             out: list[dict[str, Any]] = []
             for tid, task in self._tasks.items():
-                view = models.format_task_view(task, include_artifacts=True)
+                view = models.format_task_view(task, include_artifacts=include_artifacts)
                 buf = self._live_buffers.get(tid)
                 meta = view.setdefault("metadata", {})
                 if buf:
@@ -1210,6 +1230,77 @@ class SwarmRuntime:
                 out.append(view)
             out.sort(key=lambda t: str(((t.get("status") or {}).get("timestamp")) or ""), reverse=True)
             return out
+
+    def get_observer_state_fingerprint(self) -> tuple[Any, ...]:
+        """Return a cheap immutable digest of in-memory task state (no deep copies, excludes wall-clock TPS)."""
+        with self._state_rlock:
+            task_sigs: list[tuple[Any, ...]] = []
+            for tid, task in sorted(self._tasks.items()):
+                status = task.get("status") if isinstance(task.get("status"), dict) else {}
+                meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+                act = meta.get("liveActivity") if isinstance(meta.get("liveActivity"), dict) else {}
+                wcfg = meta.get("workerConfig") if isinstance(meta.get("workerConfig"), dict) else {}
+                tok = meta.get("tokens") if isinstance(meta.get("tokens"), dict) else {}
+                cur_tool = act.get("currentTool") if isinstance(act.get("currentTool"), dict) else None
+                fail = meta.get("failure") if isinstance(meta.get("failure"), dict) else None
+                raw_recent = act.get("recentTools") if isinstance(act.get("recentTools"), list) else ()
+                recent_sig = tuple(
+                    (
+                        str(item.get("name") or ""),
+                        str(item.get("preview") or ""),
+                        str(item.get("status") or ""),
+                        str(item.get("at") or ""),
+                    )
+                    for item in raw_recent[-_RECENT_TOOLS_LIMIT:]
+                    if isinstance(item, dict)
+                )
+                pure_in = int(
+                    tok["pureInput"]
+                    if tok.get("pureInput") is not None
+                    else (
+                        tok["uncachedInput"]
+                        if tok.get("uncachedInput") is not None
+                        else (tok.get("input") or tok.get("input_tokens") or 0)
+                    )
+                )
+                cached_in = int(
+                    tok["cachedInput"]
+                    if tok.get("cachedInput") is not None
+                    else (tok.get("cacheRead") or tok.get("cache_read_tokens") or 0)
+                )
+                cache_write = int(tok.get("cacheWrite") or tok.get("cache_write_tokens") or 0)
+                task_sigs.append((
+                    tid,
+                    status.get("state"),
+                    status.get("timestamp"),
+                    wcfg.get("worker_name"),
+                    wcfg.get("model") or meta.get("resolvedModel") or act.get("model"),
+                    wcfg.get("provider") or meta.get("resolvedProvider"),
+                    int(act.get("steps") or 0),
+                    int(act.get("toolCalls") or 0),
+                    act.get("lastTool"),
+                    cur_tool.get("name") if cur_tool else None,
+                    cur_tool.get("preview") if cur_tool else None,
+                    cur_tool.get("startedAt") if cur_tool else None,
+                    act.get("lastTextPreview") or "",
+                    recent_sig,
+                    act.get("lastEventAt"),
+                    act.get("hermesSessionId"),
+                    meta.get("worktreePath"),
+                    meta.get("worktreeBranch"),
+                    pure_in,
+                    cached_in,
+                    cache_write,
+                    int(tok.get("total") or tok.get("totalProcessed") or 0),
+                    int(tok.get("output") or tok.get("output_tokens") or 0),
+                    int(tok.get("contextUsed") or tok.get("context_used") or 0),
+                    act.get("endedAt"),
+                    act.get("lastError"),
+                    fail.get("kind") if fail else None,
+                    meta.get("costUsd"),
+                    len(task.get("artifacts") or ()),
+                ))
+            return (tuple(sorted(self._killed_workers)), tuple(task_sigs))
 
     def is_worker_busy(self, worker_name: str) -> bool:
         wlow = str(worker_name or "").strip().lower()
@@ -1510,6 +1601,7 @@ class SwarmRuntime:
         """Must be called with `self._async_lock` held."""
         cfg = config or models.WorkerConfig()
         is_new_task = not bool(task_id)
+        swarm_meta_doc = await asyncio.to_thread(store.read_swarm_meta, self.swarm_id, state_dir=self._state_dir) or {}
 
         with self._state_rlock:
             if task_id:
@@ -1599,7 +1691,6 @@ class SwarmRuntime:
             task["metadata"]["workerConfig"] = cfg.to_metadata()
 
             token_file = self._token_file_provider() if self._token_file_provider else None
-            swarm_meta_doc = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir) or {}
             swarm_conv_id = str(
                 swarm_meta_doc.get("primaryConversationId")
                 or swarm_meta_doc.get("coordinatorConversationId")
@@ -1651,20 +1742,20 @@ class SwarmRuntime:
             self._suppress_all_finished_wake = False
             self._last_active_worker_count = self._count_active_workers_unlocked()
 
-        existing_meta = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir)
+        existing_meta = await asyncio.to_thread(store.read_swarm_meta, self.swarm_id, state_dir=self._state_dir)
         existing_ws = (existing_meta or {}).get("workspace")
         cand_ws = _canonical_workspace_path(cfg.workdir)
         meta_ws_update: str | None = None
         if cand_ws and (not existing_ws or _is_worktree_subpath(existing_ws)):
             meta_ws_update = cand_ws
-        store.upsert_swarm_meta(self.swarm_id, workspace=meta_ws_update, state_dir=self._state_dir)
+        await asyncio.to_thread(store.upsert_swarm_meta, self.swarm_id, workspace=meta_ws_update, state_dir=self._state_dir)
         await self._save_state_async()
 
         assignment_val: str | None = None
         if is_new_task and not preserve_assignment:
             extracted_assign = _extract_task_assignment(prompt_body) or prompt_body[:240]
             try:
-                cur_board = self._board.read_board(self.swarm_id)
+                cur_board = await asyncio.to_thread(self._board.read_board, self.swarm_id)
                 cur_mem = (cur_board.get("members") or {}).get(worker_name)
                 cur_assign = str((cur_mem or {}).get("assignment") or "").strip() if isinstance(cur_mem, dict) else ""
                 if not cur_assign:
@@ -1673,7 +1764,8 @@ class SwarmRuntime:
                 assignment_val = extracted_assign
 
         try:
-            self._board.upsert_member(
+            await asyncio.to_thread(
+                self._board.upsert_member,
                 worker_name,
                 role=cfg.role,
                 tier=2,
@@ -1726,7 +1818,8 @@ class SwarmRuntime:
                         if t:
                             t["metadata"]["worktreePath"] = worktree_path
                             t["metadata"]["worktreeBranch"] = worktree_branch
-                    self._board.upsert_member(
+                    await asyncio.to_thread(
+                        self._board.upsert_member,
                         worker_name,
                         role=cfg.role,
                         state=models.MemberState.WORKING.value,
@@ -1741,7 +1834,7 @@ class SwarmRuntime:
                     await self._finalize_failure(task_id, f"Worktree setup failed: {exc}", [])
                     return
 
-            prompt_path.write_text(full_prompt, encoding="utf-8")
+            await asyncio.to_thread(prompt_path.write_text, full_prompt, encoding="utf-8")
             cmd, cwd = self._build_hermes_command(
                 cfg,
                 resume_session_id=resume_session_id,
@@ -1776,7 +1869,7 @@ class SwarmRuntime:
                 env["HERMES_SWARM_HTTP_URL"] = str(self.http_url)
             if token_file is not None:
                 env["HERMES_SWARM_TOKEN_FILE"] = str(token_file)
-            swarm_meta_doc = store.read_swarm_meta(self.swarm_id, state_dir=self._state_dir) or {}
+            swarm_meta_doc = await asyncio.to_thread(store.read_swarm_meta, self.swarm_id, state_dir=self._state_dir) or {}
             swarm_conv_id = str(
                 swarm_meta_doc.get("primaryConversationId")
                 or swarm_meta_doc.get("coordinatorConversationId")
@@ -2285,7 +2378,12 @@ class SwarmRuntime:
                                     sub_recs.append(rec)
                                 if sub_recs:
                                     try:
-                                        self._board.upsert_subagents(worker_name, sub_recs, swarm_id=self.swarm_id)
+                                        await asyncio.to_thread(
+                                            self._board.upsert_subagents,
+                                            worker_name,
+                                            sub_recs,
+                                            swarm_id=self.swarm_id,
+                                        )
                                     except Exception:
                                         pass
 
@@ -2467,7 +2565,12 @@ class SwarmRuntime:
                                     updated_recs.append(fallback_rec)
                                 if updated_recs:
                                     try:
-                                        self._board.upsert_subagents(worker_name, updated_recs, swarm_id=self.swarm_id)
+                                        await asyncio.to_thread(
+                                            self._board.upsert_subagents,
+                                            worker_name,
+                                            updated_recs,
+                                            swarm_id=self.swarm_id,
+                                        )
                                     except Exception:
                                         pass
 
@@ -2862,7 +2965,7 @@ class SwarmRuntime:
                     if stderr_lines and state == models.TaskState.FAILED.value:
                         task["metadata"]["stderrTail"] = stderr_lines[-10:]
 
-                self._save_state()
+                await self._save_state_async()
                 self._publish_stream_event(
                     task_id,
                     {
@@ -2874,56 +2977,59 @@ class SwarmRuntime:
                     },
                 )
                 self._publish_stream_event(task_id, None)
-                ev = self._events.pop(task_id, None) if state in models.TERMINAL_STATES else self._events.get(task_id)
-                if ev:
-                    ev.set()
+                done_ev = self._events.pop(task_id, None) if state in models.TERMINAL_STATES else self._events.get(task_id)
 
-            roster_state = (
-                models.MemberState.INPUT_REQUIRED.value
-                if state == models.TaskState.INPUT_REQUIRED.value
-                else (models.MemberState.WAITING.value if state == models.TaskState.COMPLETED.value else models.MemberState.FAILED.value)
-            )
             try:
-                self._board.upsert_member(
-                    worker_name,
-                    role=cfg.role,
-                    state=roster_state,
-                    task_id=task_id,
-                    context_id=task["contextId"],
-                    session_id=hermes_session_id or None,
-                    model=final_model,
-                    provider=final_provider,
-                    workdir=cfg.workdir,
-                    worktree_path=worktree_path,
-                    worktree_branch=worktree_branch,
-                    swarm_id=self.swarm_id,
+                roster_state = (
+                    models.MemberState.INPUT_REQUIRED.value
+                    if state == models.TaskState.INPUT_REQUIRED.value
+                    else (models.MemberState.WAITING.value if state == models.TaskState.COMPLETED.value else models.MemberState.FAILED.value)
                 )
-                if (
-                    str(cfg.role or "").strip().lower() == models.Role.NARRATOR.value
-                    or worker_name.lower().startswith("narrator")
-                ) and state in (models.TaskState.COMPLETED.value, models.TaskState.INPUT_REQUIRED.value):
-                    cur_board_after = self._board.read_board(self.swarm_id)
-                    cur_head = self._board.head_seq(cur_board_after)
-                    if cur_head > 0:
-                        self._board.mark_member_read(worker_name, cur_head, swarm_id=self.swarm_id)
-            except Exception:
-                pass
-
-            # Replay queued @mentions that arrived while this worker was busy.
-            if state != models.TaskState.CANCELED.value and not self._is_worker_killed(worker_name):
                 try:
-                    await self._router.flush_pending_for_worker(self.swarm_id, worker_name)
+                    await asyncio.to_thread(
+                        self._board.upsert_member,
+                        worker_name,
+                        role=cfg.role,
+                        state=roster_state,
+                        task_id=task_id,
+                        context_id=task["contextId"],
+                        session_id=hermes_session_id or None,
+                        model=final_model,
+                        provider=final_provider,
+                        workdir=cfg.workdir,
+                        worktree_path=worktree_path,
+                        worktree_branch=worktree_branch,
+                        swarm_id=self.swarm_id,
+                    )
+                    if (
+                        str(cfg.role or "").strip().lower() == models.Role.NARRATOR.value
+                        or worker_name.lower().startswith("narrator")
+                    ) and state in (models.TaskState.COMPLETED.value, models.TaskState.INPUT_REQUIRED.value):
+                        cur_board_after = await asyncio.to_thread(self._board.read_board, self.swarm_id)
+                        cur_head = self._board.head_seq(cur_board_after)
+                        if cur_head > 0:
+                            await asyncio.to_thread(self._board.mark_member_read, worker_name, cur_head, swarm_id=self.swarm_id)
                 except Exception:
                     pass
 
-            self._emit_observer_event("task_updated", {"taskId": task_id, "state": state, "worker": worker_name})
-            self._emit_task_wake_if_needed(
-                task_id=task_id,
-                worker_name=worker_name,
-                worker_role=str(cfg.role or models.Role.WORKER.value),
-                state=state,
-                error_text=err_msg or (prompt_msg if state == models.TaskState.FAILED.value else ""),
-            )
+                # Replay queued @mentions that arrived while this worker was busy.
+                if state != models.TaskState.CANCELED.value and not self._is_worker_killed(worker_name):
+                    try:
+                        await self._router.flush_pending_for_worker(self.swarm_id, worker_name)
+                    except Exception:
+                        pass
+
+                self._emit_observer_event("task_updated", {"taskId": task_id, "state": state, "worker": worker_name})
+                self._emit_task_wake_if_needed(
+                    task_id=task_id,
+                    worker_name=worker_name,
+                    worker_role=str(cfg.role or models.Role.WORKER.value),
+                    state=state,
+                    error_text=err_msg or (prompt_msg if state == models.TaskState.FAILED.value else ""),
+                )
+            finally:
+                if done_ev:
+                    done_ev.set()
         finally:
             self._bg_jobs.pop(task_id, None)
 
@@ -3063,40 +3169,43 @@ class SwarmRuntime:
                             recent.append(rcopy)
                     act["recentTools"] = recent[-_RECENT_TOOLS_LIMIT:]
 
-            self._save_state()
+            await self._save_state_async()
             self._publish_stream_event(task_id, None)
-            ev = self._events.pop(task_id, None)
-            if ev:
-                ev.set()
+            done_ev = self._events.pop(task_id, None)
 
-        if worker_name:
-            if not self._is_worker_killed(worker_name):
-                try:
-                    self._board.upsert_member(
-                        worker_name,
-                        role=str(wcfg.get("role") or models.Role.WORKER.value),
-                        state=models.MemberState.FAILED.value,
-                        task_id=task_id,
-                        context_id=ctx_id,
-                        model=wcfg.get("model"),
-                        workdir=wcfg.get("workdir"),
-                        swarm_id=self.swarm_id,
-                    )
-                except Exception:
-                    pass
-                try:
-                    await self._router.flush_pending_for_worker(self.swarm_id, worker_name)
-                except Exception:
-                    pass
+        try:
+            if worker_name:
+                if not self._is_worker_killed(worker_name):
+                    try:
+                        await asyncio.to_thread(
+                            self._board.upsert_member,
+                            worker_name,
+                            role=str(wcfg.get("role") or models.Role.WORKER.value),
+                            state=models.MemberState.FAILED.value,
+                            task_id=task_id,
+                            context_id=ctx_id,
+                            model=wcfg.get("model"),
+                            workdir=wcfg.get("workdir"),
+                            swarm_id=self.swarm_id,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        await self._router.flush_pending_for_worker(self.swarm_id, worker_name)
+                    except Exception:
+                        pass
 
-        self._emit_observer_event("task_updated", {"taskId": task_id, "state": models.TaskState.FAILED.value})
-        self._emit_task_wake_if_needed(
-            task_id=task_id,
-            worker_name=worker_name or task_id,
-            worker_role=str(wcfg.get("role") or models.Role.WORKER.value),
-            state=models.TaskState.FAILED.value,
-            error_text=error_text,
-        )
+            self._emit_observer_event("task_updated", {"taskId": task_id, "state": models.TaskState.FAILED.value})
+            self._emit_task_wake_if_needed(
+                task_id=task_id,
+                worker_name=worker_name or task_id,
+                worker_role=str(wcfg.get("role") or models.Role.WORKER.value),
+                state=models.TaskState.FAILED.value,
+                error_text=error_text,
+            )
+        finally:
+            if done_ev:
+                done_ev.set()
 
     async def get_task(
         self,
@@ -3226,7 +3335,7 @@ class SwarmRuntime:
                 ctx_id = task.get("contextId")
                 hermes_sid = str((act.get("hermesSessionId") if isinstance(act, dict) else "") or self._context_sessions.get(ctx_id) or "").strip()
                 self._last_active_worker_count = self._count_active_workers_unlocked()
-            self._save_state()
+            await self._save_state_async()
 
         if hermes_sid:
             try:
@@ -3245,7 +3354,8 @@ class SwarmRuntime:
         wname = str(wcfg.get("worker_name") or "")
         if wname:
             try:
-                self._board.upsert_member(
+                await asyncio.to_thread(
+                    self._board.upsert_member,
                     wname,
                     role=str(wcfg.get("role") or models.Role.WORKER.value),
                     state=models.MemberState.CANCELED.value,
@@ -3341,7 +3451,8 @@ class SwarmRuntime:
                 norm_ch = models.normalize_channel_name(raw_ch)
                 if norm_ch not in (models.DEFAULT_CHANNEL, "*"):
                     try:
-                        self._board.channel_action(
+                        await asyncio.to_thread(
+                            self._board.channel_action,
                             "subscribe",
                             channel=norm_ch,
                             members=worker_names,
@@ -3482,7 +3593,8 @@ class SwarmRuntime:
         """Switch a waiting worker's (or coordinator's) model/provider/reasoning while preserving its A2A `contextId`."""
         clean_name = str(name or "").strip().lstrip("@")
         if clean_name.lower() == models.Role.COORDINATOR.value:
-            self._board.upsert_member(
+            await asyncio.to_thread(
+                self._board.upsert_member,
                 models.Role.COORDINATOR.value,
                 role=models.Role.COORDINATOR.value,
                 model=model,
@@ -3556,7 +3668,8 @@ class SwarmRuntime:
             if route_changed:
                 await self._save_state_async()
 
-            self._board.upsert_member(
+            await asyncio.to_thread(
+                self._board.upsert_member,
                 clean_name,
                 role=wcfg.role,
                 model=wcfg.model,
@@ -3608,7 +3721,7 @@ class SwarmRuntime:
         """Permanently terminate a worker (or `<name>-1..k` group), mark killed on board, and release claims."""
         clean_name = str(name or "").strip().lstrip("@")
         wlow = clean_name.lower()
-        board = self._board.read_board(self.swarm_id)
+        board = await asyncio.to_thread(self._board.read_board, self.swarm_id)
         members_map = board.get("members") or {}
         all_tasks = self._find_worker_tasks(clean_name)
         if clean_name not in members_map and not all_tasks and wlow:
@@ -3644,7 +3757,7 @@ class SwarmRuntime:
         all_tasks = self._find_worker_tasks(name)
         latest = all_tasks[0] if all_tasks else None
 
-        board = self._board.read_board(self.swarm_id)
+        board = await asyncio.to_thread(self._board.read_board, self.swarm_id)
         existing_mem = (board.get("members") or {}).get(name)
         role_val = (
             (((latest.get("metadata") or {}).get("workerConfig") or {}).get("role") if latest else None)
@@ -3658,14 +3771,15 @@ class SwarmRuntime:
 
         # Atomically mark killed and clear queued mentions FIRST so no router/observer
         # race sees a non-killed window or dispatches pending wakeups while canceling.
-        self._board.upsert_member(
+        await asyncio.to_thread(
+            self._board.upsert_member,
             name,
             role=role_val,
             state=models.MemberState.KILLED.value,
             killed=True,
             swarm_id=self.swarm_id,
         )
-        self._board.drain_pending_mentions(name, swarm_id=self.swarm_id)
+        await asyncio.to_thread(self._board.drain_pending_mentions, name, swarm_id=self.swarm_id)
 
         canceled_task: dict[str, Any] | None = None
         for t in all_tasks:
@@ -3725,14 +3839,15 @@ class SwarmRuntime:
         with self._state_rlock:
             self._last_active_worker_count = self._count_active_workers_unlocked()
 
-        self._board.upsert_member(
+        await asyncio.to_thread(
+            self._board.upsert_member,
             name,
             role=role_val,
             state=models.MemberState.KILLED.value,
             killed=True,
             swarm_id=self.swarm_id,
         )
-        released = self._board.release_scope(holder=name, swarm_id=self.swarm_id)
+        released = await asyncio.to_thread(self._board.release_scope, holder=name, swarm_id=self.swarm_id)
         self._emit_observer_event("member_killed", {"worker": name})
         return {
             "killed": True,
@@ -3845,7 +3960,7 @@ class SwarmRuntime:
                         self._subscribers.pop(tid, None)
                         removed.append(tid)
             if removed:
-                self._save_state()
+                await self._save_state_async()
         if removed:
             self._emit_observer_event("tasks_cleared", {"removedTaskIds": removed})
         return {"swarmId": self.swarm_id, "removedCount": len(removed), "removedTaskIds": removed}
@@ -3883,6 +3998,7 @@ class SwarmManager:
         self._global_wake_subscribers: list[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]] = []
         self._wake_history: dict[str, list[dict[str, Any]]] = {}
         self._wake_seq_by_swarm: dict[str, int] = {}
+        self._bg_persist_tasks: set[asyncio.Task[Any]] = set()
         self._internal_token: str | None = None
         self._internal_token_file: Path | None = None
 
@@ -4131,8 +4247,11 @@ class SwarmManager:
                 continue
             board = self.board_service.read_board(sid)
             head = self.board_service.head_seq(board)
-            rt = self.get_runtime(sid)
-            active_workers = rt.get_active_worker_count()
+            with self._lock:
+                rt = self._runtimes.get(sid)
+                mem_wake_seq = max(0, int(self._wake_seq_by_swarm.get(sid, 0) or 0))
+            active_workers = rt.get_active_worker_count() if rt is not None else 0
+            disk_wake_seq = max(0, int(meta.get("wakeSeq") or 0))
             updated_at = max(str(meta.get("updatedAt") or ""), str(board.get("updatedAt") or "")) or str(meta.get("createdAt") or "")
             out.append({
                 "swarmId": sid,
@@ -4140,6 +4259,7 @@ class SwarmManager:
                 "coordinatorConversationId": meta.get("coordinatorConversationId"),
                 "projectId": meta.get("projectId"),
                 "head": head,
+                "wakeSeq": max(disk_wake_seq, mem_wake_seq),
                 "updatedAt": updated_at,
                 "activeWorkerCount": active_workers,
             })
@@ -4300,17 +4420,49 @@ class SwarmManager:
         collected.sort(key=lambda ev: (int(ev.get("seq") or 0), int(ev.get("wakeSeq") or 0)))
         return collected
 
+    def _schedule_wake_seq_persist(self, loop: asyncio.AbstractEventLoop, sid: str, wake_seq: int) -> None:
+        if loop.is_closed() or not loop.is_running():
+            return
+
+        async def _persist() -> None:
+            try:
+                await asyncio.to_thread(self.store.persist_wake_seq, sid, wake_seq)
+            except Exception:
+                pass
+
+        try:
+            task = loop.create_task(_persist())
+            self._bg_persist_tasks.add(task)
+            task.add_done_callback(self._bg_persist_tasks.discard)
+        except RuntimeError:
+            pass
+
     def _emit_board_event(self, swarm_id: str, event_type: str, payload: dict[str, Any]) -> None:
         sid = store.sanitize_swarm_id(swarm_id) or "default"
         is_wake = event_type in ("coordinator_wake", "primary_wake")
         meta = (self.store.read_meta(sid) or {}) if is_wake else None
 
+        try:
+            cur_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            cur_loop = None
+
         global_subs: list[tuple[asyncio.Queue[dict[str, Any]], asyncio.AbstractEventLoop | None]] = []
-        wake_seq = self.store.allocate_wake_seq(sid) if is_wake else 0
+        wake_seq = 0
+        defer_persist_seq = 0
+        if is_wake and cur_loop is None:
+            wake_seq = self.store.allocate_wake_seq(sid)
         with self._lock:
             if is_wake:
-                self._wake_seq_by_swarm[sid] = max(self._wake_seq_by_swarm.get(sid, 0), wake_seq)
-                wake_seq = self._wake_seq_by_swarm[sid]
+                if cur_loop is not None:
+                    disk_seq = max(0, int((meta or {}).get("wakeSeq") or 0))
+                    next_seq = max(self._wake_seq_by_swarm.get(sid, 0), disk_seq) + 1
+                    self._wake_seq_by_swarm[sid] = next_seq
+                    wake_seq = next_seq
+                    defer_persist_seq = next_seq
+                else:
+                    self._wake_seq_by_swarm[sid] = max(self._wake_seq_by_swarm.get(sid, 0), wake_seq)
+                    wake_seq = self._wake_seq_by_swarm[sid]
                 ev = self._build_wake_event_payload(sid, event_type, payload or {}, wake_seq=wake_seq, meta=meta)
                 hist = self._wake_history.setdefault(sid, [])
                 hist.append(ev)
@@ -4321,10 +4473,8 @@ class SwarmManager:
                 ev = {"type": event_type, "swarmId": sid, "at": models.now_iso(), **(payload or {})}
             subs = list(self._board_subscribers.get(sid) or [])
 
-        try:
-            cur_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            cur_loop = None
+        if defer_persist_seq > 0 and cur_loop is not None:
+            self._schedule_wake_seq_persist(cur_loop, sid, defer_persist_seq)
 
         for q, sub_loop in subs:
             if sub_loop is not None and not sub_loop.is_closed() and sub_loop.is_running() and sub_loop is not cur_loop:
@@ -4346,6 +4496,9 @@ class SwarmManager:
 
     async def shutdown(self) -> None:
         await self.mention_router.stop_watcher()
+        persist_tasks = [t for t in list(self._bg_persist_tasks) if not t.done()]
+        if persist_tasks:
+            await asyncio.gather(*persist_tasks, return_exceptions=True)
         with self._lock:
             runtimes = list(self._runtimes.values())
             board_subs = [sub for subs in self._board_subscribers.values() for sub in subs]
@@ -4627,8 +4780,77 @@ def _resolve_antigravity_transcript_file(
     return None, None
 
 
-def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
-    """Parse an Antigravity JSONL transcript into Agent Chat messages and telemetry."""
+def _empty_parsed_transcript() -> dict[str, Any]:
+    return {
+        "messages": [],
+        "model": None,
+        "provider": None,
+        "tokens": {},
+        "tps": 0.0,
+        "steps": 0,
+        "toolCalls": 0,
+        "elapsedMs": 0,
+        "llmActiveMs": 0,
+        "lastStatus": "",
+        "lastStepType": "",
+        "pendingToolCalls": 0,
+        "hasPendingTools": False,
+        "tailPlannerHasToolCalls": False,
+        "liveActive": False,
+        "mtimeMs": 0,
+        "lastTimestampMs": None,
+        "live": {
+            "active": False,
+            "transcript": "",
+            "reasoning": "",
+            "toolCalls": [],
+            "toolTrace": [],
+            "currentTool": None,
+            "recentTools": [],
+        },
+    }
+
+
+def _build_transcript_summary_from_parsed(parsed: dict[str, Any]) -> dict[str, Any]:
+    live_blk = parsed.get("live") if isinstance(parsed.get("live"), dict) else {}
+    cur_tool = live_blk.get("currentTool")
+    return {
+        "model": parsed.get("model"),
+        "provider": parsed.get("provider"),
+        "tokens": dict(parsed.get("tokens") or {}),
+        "tps": float(parsed.get("tps") or 0.0),
+        "steps": int(parsed.get("steps") or 0),
+        "toolCalls": int(parsed.get("toolCalls") or 0),
+        "elapsedMs": int(parsed.get("elapsedMs") or 0),
+        "llmActiveMs": int(parsed.get("llmActiveMs") or 0),
+        "lastStatus": str(parsed.get("lastStatus") or ""),
+        "lastStepType": str(parsed.get("lastStepType") or ""),
+        "pendingToolCalls": int(parsed.get("pendingToolCalls") or 0),
+        "hasPendingTools": bool(parsed.get("hasPendingTools")),
+        "tailPlannerHasToolCalls": bool(parsed.get("tailPlannerHasToolCalls")),
+        "liveActive": bool(parsed.get("liveActive") or live_blk.get("active")),
+        "mtimeMs": int(parsed.get("mtimeMs") or 0),
+        "lastTimestampMs": parsed.get("lastTimestampMs"),
+        "currentTool": dict(cur_tool) if isinstance(cur_tool, dict) else None,
+    }
+
+
+def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str, Any], list[int]]:
+    """Parse an Antigravity JSONL transcript with bounded LRU caching keyed by `(str(path), mtime_ns, size, ino)`."""
+    path_str = str(log_path)
+    try:
+        st = log_path.stat()
+        cache_key = (path_str, int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0)))
+        mtime_ms = int(st.st_mtime * 1000)
+    except OSError:
+        return _empty_parsed_transcript(), []
+
+    with _TRANSCRIPT_CACHE_LOCK:
+        cached = _TRANSCRIPT_PARSE_CACHE.get(cache_key)
+        if cached is not None:
+            _TRANSCRIPT_PARSE_CACHE.move_to_end(cache_key)
+            return cached, cached["_msg_ids"]
+
     messages: list[dict[str, Any]] = []
     pending_tools: list[tuple[str, str]] = []
     model_name: str | None = None
@@ -4643,6 +4865,8 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
     prev_ready_ms: int | None = None
     llm_active_ms = 0
     last_step_status = ""
+    last_step_type = ""
+    tail_planner_has_tools = False
     last_id = 0
     live_active = False
     live_transcript = ""
@@ -4651,17 +4875,6 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
     live_tool_trace: list[dict[str, Any]] = []
     live_current_tool: dict[str, Any] | None = None
     live_recent_tools: list[str] = []
-
-    def _empty_live() -> dict[str, Any]:
-        return {
-            "active": False,
-            "transcript": "",
-            "reasoning": "",
-            "toolCalls": [],
-            "toolTrace": [],
-            "currentTool": None,
-            "recentTools": [],
-        }
 
     def _clear_live() -> None:
         nonlocal live_active, live_transcript, live_reasoning, live_tool_calls, live_tool_trace, live_current_tool
@@ -4675,19 +4888,7 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
     try:
         raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return {
-            "messages": [],
-            "model": None,
-            "provider": None,
-            "tokens": {},
-            "tps": 0.0,
-            "steps": 0,
-            "toolCalls": 0,
-            "elapsedMs": 0,
-            "llmActiveMs": 0,
-            "lastStatus": "",
-            "live": _empty_live(),
-        }
+        return _empty_parsed_transcript(), []
 
     for line_idx, raw_line in enumerate(raw_lines):
         line = raw_line.strip()
@@ -4708,6 +4909,7 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
 
         step_type = str(step.get("type") or "").strip().upper()
         step_status = str(step.get("status") or "").strip().upper()
+        last_step_type = step_type
         last_step_status = step_status
         created_at = step.get("created_at")
         ts_ms = _normalize_epoch_ms(created_at)
@@ -4742,6 +4944,8 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
             })
         elif step_type == "USER_INPUT":
             _clear_live()
+            pending_tools.clear()
+            tail_planner_has_tools = False
             msg_id = max(last_id + 1, step_idx + 1)
             last_id = msg_id
             messages.append({
@@ -4775,6 +4979,7 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
 
             if step_status == "RUNNING":
                 live_active = True
+                tail_planner_has_tools = bool(tcs_out)
                 live_transcript = str(step.get("content") or "")
                 live_reasoning = str(step.get("thinking") or step.get("reasoning") or "")
                 live_tool_calls = list(tcs_out)
@@ -4804,12 +5009,15 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
                 continue
 
             _clear_live()
-            is_err = step_status in ("ERROR", "INVALID") or bool(step.get("error"))
+            is_err = step_status in ("ERROR", "INVALID", "CANCELED", "CANCELLED", "STOPPED", "FAILED") or bool(step.get("error"))
             err_detail = str(step.get("error") or "").strip()
             content_val = step.get("content") or ""
             if not str(content_val).strip() and err_detail:
                 content_val = err_detail if err_detail.lower().startswith("error") else f"Error: {err_detail}"
             reasoning_val = step.get("thinking") or step.get("reasoning") or None
+            if is_err:
+                pending_tools.clear()
+                tail_planner_has_tools = False
             if is_err and not str(content_val).strip() and not reasoning_val and not tcs_out:
                 continue
 
@@ -4828,12 +5036,18 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
             if (s_in + s_cached + s_out) > 0:
                 last_ctx_used = s_in + s_cached + s_out
 
-            for tc in tcs_out:
-                pending_tools.append((tc["id"], tc["name"]))
-                tool_calls_count += 1
-                if tc["name"] and (not live_recent_tools or live_recent_tools[-1] != tc["name"]):
-                    live_recent_tools.append(tc["name"])
-            live_recent_tools = live_recent_tools[-8:]
+            if not is_err:
+                if tcs_out:
+                    tail_planner_has_tools = True
+                    for tc in tcs_out:
+                        pending_tools.append((tc["id"], tc["name"]))
+                        tool_calls_count += 1
+                        if tc["name"] and (not live_recent_tools or live_recent_tools[-1] != tc["name"]):
+                            live_recent_tools.append(tc["name"])
+                    live_recent_tools = live_recent_tools[-8:]
+                else:
+                    pending_tools.clear()
+                    tail_planner_has_tools = False
 
             msg_id = max(last_id + 1, step_idx + 1)
             last_id = msg_id
@@ -4909,6 +5123,8 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
             if step_status == "RUNNING":
                 continue
             _clear_live()
+            pending_tools.clear()
+            tail_planner_has_tools = False
             err_raw = str(step.get("content") or "").strip()
             err_detail = str(step.get("error") or "").strip()
             if not err_raw and err_detail:
@@ -4947,7 +5163,10 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
     )
     tps_ms = llm_active_ms if llm_active_ms >= 250 else elapsed_ms
     tps = _compute_tps(out_sum, tps_ms)
-    return {
+    msg_ids = [int(m["id"]) for m in messages]
+    pending_count = len(pending_tools)
+    has_pending = pending_count > 0 or bool(live_tool_calls) or (live_current_tool is not None)
+    entry: dict[str, Any] = {
         "messages": messages,
         "model": model_name,
         "provider": "antigravity" if model_name else None,
@@ -4958,6 +5177,13 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
         "elapsedMs": elapsed_ms,
         "llmActiveMs": llm_active_ms,
         "lastStatus": last_step_status,
+        "lastStepType": last_step_type,
+        "pendingToolCalls": pending_count,
+        "hasPendingTools": has_pending,
+        "tailPlannerHasToolCalls": tail_planner_has_tools,
+        "liveActive": live_active,
+        "mtimeMs": mtime_ms,
+        "lastTimestampMs": last_ts_ms,
         "live": {
             "active": live_active,
             "transcript": live_transcript,
@@ -4967,7 +5193,72 @@ def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
             "currentTool": live_current_tool,
             "recentTools": live_recent_tools,
         },
+        "_msg_ids": msg_ids,
     }
+    summary_entry = _build_transcript_summary_from_parsed(entry)
+    try:
+        st_after = log_path.stat()
+        key_after = (path_str, int(st_after.st_mtime_ns), int(st_after.st_size), int(getattr(st_after, "st_ino", 0)))
+    except OSError:
+        key_after = None
+
+    if key_after == cache_key:
+        with _TRANSCRIPT_CACHE_LOCK:
+            prev_key = _TRANSCRIPT_PATH_KEYS.get(path_str)
+            should_store = True
+            if prev_key is not None and prev_key != cache_key:
+                prev_rev = (prev_key[1], prev_key[2], prev_key[3])
+                cur_rev = (cache_key[1], cache_key[2], cache_key[3])
+                if cur_rev[:2] < prev_rev[:2]:
+                    should_store = False
+                elif cur_rev[:2] == prev_rev[:2]:
+                    # Tie on (mtime_ns, size): only evict prev_key if cur_rev >= prev_rev (or disk matches cache_key).
+                    if cur_rev[2] < prev_rev[2]:
+                        try:
+                            st_live = log_path.stat()
+                            live_key = (
+                                path_str,
+                                int(st_live.st_mtime_ns),
+                                int(st_live.st_size),
+                                int(getattr(st_live, "st_ino", 0)),
+                            )
+                            if live_key != cache_key:
+                                should_store = False
+                        except OSError:
+                            should_store = False
+            if should_store:
+                if prev_key is not None and prev_key != cache_key:
+                    _TRANSCRIPT_PARSE_CACHE.pop(prev_key, None)
+                    _TRANSCRIPT_SUMMARY_CACHE.pop(prev_key, None)
+                _TRANSCRIPT_PARSE_CACHE[cache_key] = entry
+                _TRANSCRIPT_PARSE_CACHE.move_to_end(cache_key)
+                _TRANSCRIPT_SUMMARY_CACHE[cache_key] = summary_entry
+                _TRANSCRIPT_SUMMARY_CACHE.move_to_end(cache_key)
+                _TRANSCRIPT_PATH_KEYS[path_str] = cache_key
+                while len(_TRANSCRIPT_PARSE_CACHE) > _TRANSCRIPT_CACHE_MAX:
+                    evicted_key, _ = _TRANSCRIPT_PARSE_CACHE.popitem(last=False)
+                    if _TRANSCRIPT_PATH_KEYS.get(evicted_key[0]) == evicted_key:
+                        _TRANSCRIPT_PATH_KEYS.pop(evicted_key[0], None)
+                while len(_TRANSCRIPT_SUMMARY_CACHE) > _TRANSCRIPT_CACHE_MAX:
+                    _TRANSCRIPT_SUMMARY_CACHE.popitem(last=False)
+    return entry, msg_ids
+
+
+def _parse_antigravity_transcript(log_path: Path) -> dict[str, Any]:
+    """Parse an Antigravity JSONL transcript into Agent Chat messages and telemetry (mtime/size/ino cached)."""
+    entry, _ = _parse_antigravity_transcript_cached_entry(log_path)
+    out = {k: v for k, v in entry.items() if k != "_msg_ids"}
+    out["messages"] = list(entry.get("messages") or [])
+    out["tokens"] = dict(entry.get("tokens") or {})
+    live = entry.get("live") if isinstance(entry.get("live"), dict) else {}
+    out["live"] = {
+        **live,
+        "toolCalls": list(live.get("toolCalls") or []),
+        "toolTrace": list(live.get("toolTrace") or []),
+        "recentTools": list(live.get("recentTools") or []),
+        "currentTool": dict(live["currentTool"]) if isinstance(live.get("currentTool"), dict) else None,
+    }
+    return out
 
 
 def extract_antigravity_transcript_summary(
@@ -4975,15 +5266,150 @@ def extract_antigravity_transcript_summary(
     *,
     primary_cid: str | None = None,
 ) -> dict[str, Any]:
-    """Read Antigravity transcript summary (model, tokens, tps, steps, toolCalls) for Coordinator."""
+    """Read Antigravity transcript summary (model, tokens, tps, steps, toolCalls, status) cached by mtime/size/ino."""
     resolved_cid, log_path = _resolve_antigravity_transcript_file(conv_ids, primary_cid=primary_cid)
     if log_path is None:
         return {}
-    parsed = _parse_antigravity_transcript(log_path)
-    parsed["conversationId"] = resolved_cid
-    parsed.pop("messages", None)
-    parsed.pop("live", None)
-    return parsed
+    path_str = str(log_path)
+    try:
+        st = log_path.stat()
+        cache_key = (path_str, int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0)))
+    except OSError:
+        return {}
+    with _TRANSCRIPT_CACHE_LOCK:
+        cached_sum = _TRANSCRIPT_SUMMARY_CACHE.get(cache_key)
+        if cached_sum is not None:
+            _TRANSCRIPT_SUMMARY_CACHE.move_to_end(cache_key)
+            out = dict(cached_sum)
+            out["tokens"] = dict(cached_sum.get("tokens") or {})
+            if isinstance(cached_sum.get("currentTool"), dict):
+                out["currentTool"] = dict(cached_sum["currentTool"])
+            out["conversationId"] = resolved_cid
+            return out
+    parsed, _ = _parse_antigravity_transcript_cached_entry(log_path)
+    out = _build_transcript_summary_from_parsed(parsed)
+    out["conversationId"] = resolved_cid
+    return out
+
+
+def _compute_coordinator_updated_ms(
+    member_rec: dict[str, Any] | None,
+    meta: dict[str, Any] | None,
+    *,
+    last_post_ts_ms: int = 0,
+    board_messages: list[Any] | None = None,
+    coord_name: str = "coordinator",
+) -> int:
+    """Compute consistent coordinator last-activity timestamp across observer snapshot and session history."""
+    lp_ms = max(0, int(last_post_ts_ms or 0))
+    if lp_ms <= 0 and isinstance(board_messages, list):
+        cname_low = str(coord_name or models.Role.COORDINATOR.value).strip().lower()
+        latest_post_ms = 0
+        latest_ctrl_ms = 0
+        for m in board_messages:
+            if not isinstance(m, dict):
+                continue
+            sender_low = str(m.get("sender") or m.get("agent") or "").strip().lower()
+            srole_low = str(m.get("senderRole") or "").strip().lower()
+            if sender_low != cname_low and srole_low != models.Role.COORDINATOR.value:
+                continue
+            mts = _normalize_epoch_ms(m.get("createdAt") or m.get("time")) or 0
+            if isinstance(m.get("control"), dict):
+                if mts > latest_ctrl_ms:
+                    latest_ctrl_ms = mts
+            else:
+                if mts > latest_post_ms:
+                    latest_post_ms = mts
+        lp_ms = latest_post_ms or latest_ctrl_ms
+    mrec = member_rec if isinstance(member_rec, dict) else {}
+    smeta = meta if isinstance(meta, dict) else {}
+    return max(
+        _normalize_epoch_ms(mrec.get("lastHeartbeatAt")) or 0,
+        _normalize_epoch_ms(mrec.get("updatedAt")) or 0,
+        lp_ms,
+        _normalize_epoch_ms(smeta.get("updatedAt")) or 0,
+    )
+
+
+def reconcile_coordinator_state(
+    raw_ui_status: str,
+    *,
+    killed: bool = False,
+    coord_stats: dict[str, Any] | None = None,
+    active_worker_count: int = 0,
+    member_updated_ms: int = 0,
+    now_ms: int | None = None,
+) -> tuple[str, int | None]:
+    """Reconcile coordinator UI status (`working` | `waiting` | `killed`) and optional staleness deadline ms.
+
+    - Active `RUNNING` steps and pending/unanswered `tool_calls` stay `working` until stale/crashed (>120s).
+    - Terminal text-only `PLANNER_RESPONSE` (zero pending tool calls) or `ERROR_MESSAGE` transitions to `waiting`.
+    - Mid-turn `GENERIC` / `USER_INPUT` tails stay `working` while fresh (<60s), transitioning to `waiting` once
+      stale (>60s since transcript mtime AND >60s since last post/bind with 0 active workers).
+    """
+    if killed or raw_ui_status == "killed":
+        return "killed", None
+
+    cur_now_ms = int(time.time() * 1000) if now_ms is None else int(now_ms)
+    stats = coord_stats if isinstance(coord_stats, dict) and coord_stats else None
+    if stats is not None:
+        last_status = str(stats.get("lastStatus") or "").strip().upper()
+        last_step_type = str(stats.get("lastStepType") or "").strip().upper()
+        live_blk = stats.get("live") if isinstance(stats.get("live"), dict) else {}
+        live_active = bool(stats.get("liveActive") or live_blk.get("active"))
+        pending_tools_cnt = max(0, int(stats.get("pendingToolCalls") or 0))
+        has_pending_tools = bool(stats.get("hasPendingTools")) or pending_tools_cnt > 0
+        tail_planner_has_tools = bool(stats.get("tailPlannerHasToolCalls"))
+        mtime_ms = int(stats.get("mtimeMs") or 0)
+        last_ts_ms = int(stats.get("lastTimestampMs") or 0)
+        transcript_ms = mtime_ms if mtime_ms > 0 else last_ts_ms
+
+        if live_active or last_status == "RUNNING":
+            ref_run_ms = transcript_ms if transcript_ms > 0 else member_updated_ms
+            if ref_run_ms > 0:
+                if (cur_now_ms - ref_run_ms) >= COORDINATOR_RUNNING_STALE_MS:
+                    return "waiting", None
+                return "working", ref_run_ms + COORDINATOR_RUNNING_STALE_MS
+            return "working", None
+
+        if has_pending_tools:
+            ref_tool_ms = transcript_ms if transcript_ms > 0 else member_updated_ms
+            if ref_tool_ms > 0:
+                if (cur_now_ms - ref_tool_ms) >= COORDINATOR_RUNNING_STALE_MS:
+                    return "waiting", None
+                return "working", ref_tool_ms + COORDINATOR_RUNNING_STALE_MS
+            return "working", None
+
+        is_terminal_err = last_status in ("ERROR", "INVALID", "CANCELED", "CANCELLED", "STOPPED", "FAILED")
+        if (
+            (last_step_type == "PLANNER_RESPONSE" and last_status in _TERMINAL_TRANSCRIPT_STATUSES and (is_terminal_err or not tail_planner_has_tools))
+            or (last_step_type == "ERROR_MESSAGE" and last_status != "RUNNING")
+            or (not last_step_type and last_status in _TERMINAL_TRANSCRIPT_STATUSES)
+        ):
+            return "waiting", None
+
+        is_mid_turn = last_step_type in ("GENERIC", "USER_INPUT") or (
+            last_step_type == "PLANNER_RESPONSE" and tail_planner_has_tools
+        )
+        ref_ms = max(transcript_ms, member_updated_ms)
+        if active_worker_count == 0:
+            if ref_ms > 0:
+                if (cur_now_ms - ref_ms) >= COORDINATOR_STALE_MS:
+                    return "waiting", None
+                if is_mid_turn or raw_ui_status == "working":
+                    return "working", ref_ms + COORDINATOR_STALE_MS
+                return raw_ui_status, None
+            return raw_ui_status, None
+
+        if is_mid_turn and transcript_ms > 0 and (cur_now_ms - transcript_ms) < COORDINATOR_STALE_MS:
+            return "working", transcript_ms + COORDINATOR_STALE_MS
+        return raw_ui_status, None
+
+    if raw_ui_status == "working" and active_worker_count == 0 and member_updated_ms > 0:
+        if (cur_now_ms - member_updated_ms) >= COORDINATOR_STALE_MS:
+            return "waiting", None
+        return "working", member_updated_ms + COORDINATOR_STALE_MS
+    return raw_ui_status, None
 
 
 def _sqlite_table_columns(
@@ -5116,36 +5542,51 @@ def query_member_session_history(
             [c for c in (coord_cid, str(member_rec.get("conversationId") or "")) if c],
             primary_cid=meta_primary,
         )
-        parsed = _parse_antigravity_transcript(log_path) if log_path is not None else {
-            "messages": [],
-            "model": None,
-            "provider": None,
-            "tokens": {},
-            "tps": 0.0,
-            "steps": 0,
-            "toolCalls": 0,
-            "elapsedMs": 0,
-            "llmActiveMs": 0,
-            "lastStatus": "",
-        }
+        if log_path is not None:
+            parsed, msg_ids = _parse_antigravity_transcript_cached_entry(log_path)
+        else:
+            parsed, msg_ids = _empty_parsed_transcript(), []
         all_msgs: list[dict[str, Any]] = parsed.get("messages") or []
         total_count = len(all_msgs)
         if before_val > 0:
-            cand = [m for m in all_msgs if int(m.get("id") or 0) < before_val]
-            has_more = len(cand) > clamped_limit
-            messages = cand[-clamped_limit:]
+            end_idx = bisect.bisect_left(msg_ids, before_val)
+            has_more = end_idx > clamped_limit
+            start_idx = max(0, end_idx - clamped_limit)
+            messages = [dict(m) for m in all_msgs[start_idx:end_idx]]
         elif since_id > 0:
-            cand = [m for m in all_msgs if int(m.get("id") or 0) > since_id]
-            has_more = len(cand) > clamped_limit
-            messages = cand[:clamped_limit]
+            if not msg_ids or msg_ids[-1] <= since_id:
+                has_more = False
+                messages = []
+            else:
+                start_idx = bisect.bisect_right(msg_ids, since_id)
+                remaining = total_count - start_idx
+                has_more = remaining > clamped_limit
+                messages = [dict(m) for m in all_msgs[start_idx : start_idx + clamped_limit]]
         else:
-            has_more = len(all_msgs) > clamped_limit
-            messages = all_msgs[-clamped_limit:]
+            has_more = total_count > clamped_limit
+            messages = [dict(m) for m in all_msgs[-clamped_limit:]]
         last_id = max(since_id, int(messages[-1]["id"])) if messages else since_id
         coord_model = member_rec.get("model") or parsed.get("model")
         coord_provider = member_rec.get("provider") or parsed.get("provider")
         parsed_live = parsed.get("live") if isinstance(parsed.get("live"), dict) else {}
-        coord_live_active = bool(parsed_live.get("active")) or worker_state == "working"
+        active_worker_count = runtime.get_active_worker_count() if runtime is not None else 0
+        coord_updated_ms = _compute_coordinator_updated_ms(
+            member_rec,
+            swarm_meta,
+            board_messages=board.get("messages") if isinstance(board, dict) else None,
+            coord_name=canonical_name or models.Role.COORDINATOR.value,
+        )
+        worker_state, _ = reconcile_coordinator_state(
+            worker_state,
+            killed=board_killed,
+            coord_stats=parsed if log_path is not None else None,
+            active_worker_count=active_worker_count,
+            member_updated_ms=coord_updated_ms,
+        )
+        coord_live_active = (worker_state == "working") and (
+            bool(parsed_live.get("active")) if log_path is not None else True
+        )
+        cur_tool_live = parsed_live.get("currentTool")
         return {
             "ok": True,
             "swarm": sid,
@@ -5161,10 +5602,10 @@ def query_member_session_history(
             "hasMore": has_more,
             "totalCount": total_count,
             "lastId": last_id,
-            "tokens": parsed.get("tokens") or {},
+            "tokens": dict(parsed.get("tokens") or {}),
             "tps": float(parsed.get("tps") or 0.0),
             "tpsEstimated": False,
-            "currentTool": parsed_live.get("currentTool"),
+            "currentTool": dict(cur_tool_live) if isinstance(cur_tool_live, dict) else None,
             "state": worker_state,
             "model": coord_model,
             "provider": coord_provider,
@@ -5178,7 +5619,7 @@ def query_member_session_history(
                 "transcript": str(parsed_live.get("transcript") or ""),
                 "reasoning": str(parsed_live.get("reasoning") or ""),
                 "toolCalls": list(parsed_live.get("toolCalls") or []),
-                "currentTool": parsed_live.get("currentTool"),
+                "currentTool": dict(cur_tool_live) if isinstance(cur_tool_live, dict) else None,
                 "recentTools": list(parsed_live.get("recentTools") or []),
                 "toolTrace": list(parsed_live.get("toolTrace") or []),
                 "startedAt": all_msgs[0].get("timestamp") if all_msgs else None,

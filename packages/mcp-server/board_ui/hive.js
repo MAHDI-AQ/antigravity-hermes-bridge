@@ -31,8 +31,11 @@
   const tileTint = n => `color-mix(in srgb, ${tcol(n)} 22%, var(--sw-card, #16171b))`;
   const hexBG = n => n==='coordinator' ? `background:var(--sw-coord-bg, #1C1B22) url('data:image/svg+xml,${HEXD}')` : `background:${tileTint(n)}`;
 
-  function drawBee(cv, name, beeState, frame){
-    const W=22,H=18; cv.width=W; cv.height=H; const c=cv.getContext('2d'); c.imageSmoothingEnabled=false; c.clearRect(0,0,W,H);
+  const BEE_SPRITES = new Map();
+  function renderBeeSprite(name, beeState, frame){
+    const W=22,H=18;
+    const cv=document.createElement('canvas'); cv.width=W; cv.height=H;
+    const c=cv.getContext('2d'); c.imageSmoothingEnabled=false; c.clearRect(0,0,W,H);
     const R=ramp(name), isCoord=name==='coordinator', landed=(beeState==='parked'||beeState==='landed'), asleep=beeState==='parked';
     const P=(x,y,col)=>{ if(x<0||y<0||x>=W||y>=H) return; c.fillStyle=col; c.fillRect(x,y,1,1); };
     const cx=11, cy=10.5, rx=7.3, ry=4.8;
@@ -72,27 +75,50 @@
     else { [[7,5],[6,4],[5,3]].forEach(([x,y])=>P(x,y,R.ol)); P(4,3,R.sk); [[9,5],[9,4],[9,3]].forEach(([x,y])=>P(x,y,R.ol)); P(8,2,R.sk); }
     drawWing(front,true);
     if(asleep){ const z='#8C90A6'; [[0,0],[1,0],[2,0],[3,0],[2,1],[1,2],[0,3],[1,3],[2,3],[3,3]].forEach(([x,y])=>P(x,y,z)); }
+    return cv;
+  }
+  function getBeeSprite(name, beeState, frame){
+    const isCoord=name==='coordinator';
+    const landed=(beeState==='parked'||beeState==='landed');
+    const asleep=beeState==='parked';
+    const key=`${isCoord?'C':hueOf(name)}|${asleep?'p':(landed?'l':'f')}|${landed?0:(frame===0?0:1)}`;
+    let cv=BEE_SPRITES.get(key);
+    if(!cv){ cv=renderBeeSprite(name, beeState, frame); BEE_SPRITES.set(key, cv); }
+    return cv;
+  }
+  function drawBee(cv, name, beeState, frame){
+    const W=22,H=18;
+    if(cv.width!==W) cv.width=W;
+    if(cv.height!==H) cv.height=H;
+    const c=cv.getContext('2d');
+    if(!c) return;
+    c.imageSmoothingEnabled=false;
+    c.clearRect(0,0,W,H);
+    c.drawImage(getBeeSprite(name, beeState, frame), 0, 0);
   }
   const spriteTag = (n, beeState) => `<span class="beebox" data-state="${esc(beeState||'working')}"><span class="beewrap" data-bee="${esc(n)}" data-state="${esc(beeState||'working')}"><canvas></canvas><canvas></canvas></span><i class="gsh"></i></span>`;
-  function paintSprites(el){ el.querySelectorAll('.beewrap').forEach(w=>{ const [a,b]=w.querySelectorAll('canvas'); drawBee(a, w.dataset.bee, w.dataset.state, 0); drawBee(b, w.dataset.bee, w.dataset.state, 1); }); }
+  function paintSprites(el){ el.querySelectorAll('.beewrap').forEach(w=>{ const [a,b]=w.querySelectorAll('canvas'); if(a) drawBee(a, w.dataset.bee, w.dataset.state, 0); if(b) drawBee(b, w.dataset.bee, w.dataset.state, 1); }); }
 
   const beeImgs = new Map();
   function beeImg(n){
-    if(!beeImgs.has(n)){ const cv=document.createElement('canvas'); drawBee(cv, n, 'landed', 0); beeImgs.set(n, cv.toDataURL()); }
+    if(!beeImgs.has(n)){ beeImgs.set(n, getBeeSprite(n, 'landed', 0).toDataURL()); }
     return beeImgs.get(n);
   }
 
   function snapBees(root){
+    if(!root || !root.isConnected || root.offsetParent === null) return;
+    const tab = root.closest('.tab-body');
+    if(tab && !tab.classList.contains('active')) return;
     const dpr=window.devicePixelRatio||1;
     const boxes=[...root.querySelectorAll('.beebox')];
+    if(!boxes.length) return;
     const rects=boxes.map(b=>{ const r=b.getBoundingClientRect(); const m=/translate\(([-\d.]+)px,\s*([-\d.]+)px\)/.exec(b.style.transform||''); return {x:r.left-(m?+m[1]:0), y:r.top-(m?+m[2]:0)}; });
     boxes.forEach((b,i)=>{ const fx=(rects[i].x*dpr)%1, fy=(rects[i].y*dpr)%1; const dx=(fx>0.5?1-fx:-fx)/dpr, dy=(fy>0.5?1-fy:-fy)/dpr;
       b.style.transform = (Math.abs(dx)>0.01||Math.abs(dy)>0.01) ? `translate(${dx}px,${dy}px)` : ''; });
   }
-  let snapQueued=false;
-  const snapAll=()=>{ if(snapQueued) return; snapQueued=true; requestAnimationFrame(()=>{ snapQueued=false; document.querySelectorAll('.pane').forEach(snapBees); }); };
-  window.addEventListener('scroll', snapAll, {passive:true, capture:true});
-  window.addEventListener('resize', snapAll);
+  let snapTimer=0;
+  const snapActiveOnResize=()=>{ clearTimeout(snapTimer); snapTimer=setTimeout(()=>{ snapTimer=0; requestAnimationFrame(()=>{ document.querySelectorAll('.tab-body.active .pane').forEach(snapBees); }); }, 150); };
+  window.addEventListener('resize', snapActiveOnResize, {passive:true});
 
   const COPY_UI = { team:'The team', lead:'Coordinator · Antigravity', blocked:'Blocked', running:'Running', planned:'Planned next', done:'Done',
     more:'+{n} more', goal:'Goal', threads:'Threads', now:'Now', progress:'Progress', compare:'Compare with now', expand:'Open full timeline', none_blocked:'Nothing blocked', needs:'Needs attention', waiting:'Waiting on @coordinator', stuck:'Stuck', none_waiting:'Nothing waiting', none_stuck:'Nothing stuck', none_needs:'Nothing needs attention', none_running:'Nothing running', none_planned:'Nothing planned' };
@@ -716,12 +742,12 @@
     const icon = n => `<span class="o2-onb-i" style="${hexBG(n)}"><img src="${beeImg(n)}" alt="" width="22" height="18"></span>`;
     return `<section class="o2-onb" data-testid="swarm-onboarding">
       <div class="o2-onb-stage" aria-hidden="true">
-        <svg class="o2-onb-paths" viewBox="0 0 320 156" width="320" height="156">
+        <svg class="o2-onb-paths" viewBox="0 0 320 156" preserveAspectRatio="none">
           <g class="o2-onb-lines">${Y.map(path).join('')}</g>
           ${ws.map((n,i)=>dot(i, tcol('coordinator'), false, i*0.8) + dot(i, tcol(n), true, i*0.8+1.2)).join('')}
         </svg>
-        ${bee('coordinator', 'o2-onb-q', 'left:24px;top:56px')}
-        ${ws.map((n,i)=>bee(n, `o2-onb-w s${i}`, `left:236px;top:${Y[i]-22}px`)).join('')}
+        ${bee('coordinator', 'o2-onb-q', 'left:7.5%;top:56px')}
+        ${ws.map((n,i)=>bee(n, `o2-onb-w s${i}`, `right:7.5%;top:${Y[i]-22}px`)).join('')}
       </div>
       <h2 class="o2-onb-h">Your swarm is starting</h2>
       <ol class="o2-onb-steps">
@@ -734,6 +760,7 @@
   }
 
   const ONBOARD_MIN_MS = 30000;
+  let onboardTimer = 0;
 
   function overviewView(sc, el){
     state.style = 'bees';
@@ -781,7 +808,11 @@
         ${list.length ? `<div class="o2-cards">${vis.map(card).join('')}</div>${more>0?`<button class="o2-more" data-o2="${k}">${ui('more').replace('{n}',more)}</button>`:''}` : `<p class="o2-none">${ui(none)}</p>`}</section>`; };
 
     if(sc.starting){
-      if(!state.onboardAt && el && el.offsetWidth){ state.onboardAt = Date.now(); setTimeout(() => { ROOTS.forEach(r => { r.etag = ''; }); sync(); }, ONBOARD_MIN_MS); }
+      if(!state.onboardAt && el && el.offsetWidth){
+        state.onboardAt = Date.now();
+        clearTimeout(onboardTimer);
+        onboardTimer = setTimeout(() => { onboardTimer = 0; ROOTS.forEach(r => { r.etag = ''; }); sync(); }, ONBOARD_MIN_MS);
+      }
       if(!sc.workerStarted || !state.onboardAt || Date.now() - state.onboardAt < ONBOARD_MIN_MS) return `<div class="o2">${sourceChip(sc.source, true)}${onboardView(sc)}${team}</div>`;
     }
     const TM = threadModel(sc);
@@ -818,6 +849,35 @@
 
   /* ---------- render ---------- */
   const LAST_RENDER = new WeakMap();
+  function extractMembersBody(html) {
+    const marker = '<div class="o2-mbody">';
+    const idx = html.indexOf(marker);
+    if (idx === -1) return null;
+    const endIdx = html.lastIndexOf('</div>\n    </div>');
+    const inner = html.slice(idx + marker.length, endIdx !== -1 ? endIdx : html.lastIndexOf('</div>'));
+    return inner.replace(/<\/div>\s*$/, '');
+  }
+  function syncMembersSourceChip(el, srcHtml) {
+    const root = el.querySelector('.o2-members');
+    if (!root) return false;
+    const existing = root.querySelector(':scope > .o2-src');
+    if (!srcHtml) {
+      if (existing) existing.remove();
+      return true;
+    }
+    const tpl = document.createElement('template');
+    tpl.innerHTML = srcHtml.trim();
+    const nextEl = tpl.content.firstElementChild;
+    if (!nextEl) return false;
+    if (existing) {
+      existing.replaceWith(nextEl);
+    } else {
+      const mtop = root.querySelector(':scope > .o2-mtop');
+      if (mtop) root.insertBefore(nextEl, mtop);
+      else root.prepend(nextEl);
+    }
+    return true;
+  }
   function render(el, view) {
     const sc = S.live;
     if (!sc) return;
@@ -825,24 +885,34 @@
     const html = v === 'cards' ? membersView(sc) : overviewView(sc, el);
     const prev = LAST_RENDER.get(el);
     if (prev && prev.view === v && prev.html === html && el.dataset.view === v) return;
-    LAST_RENDER.set(el, { view: v, html });
-    if (v === 'cards' && el.dataset.view === 'cards') {
+    const bodyHtml = v === 'cards' ? extractMembersBody(html) : null;
+    const srcHtml = v === 'cards' ? sourceChip(sc.source) : null;
+    if (v === 'cards' && el.dataset.view === 'cards' && bodyHtml !== null) {
       const mbody = el.querySelector('.o2-mbody');
-      const marker = '<div class="o2-mbody">';
-      const idx = html.indexOf(marker);
-      if (mbody && idx !== -1) {
-        const inner = html.slice(idx + marker.length, html.lastIndexOf('</div>\n    </div>') !== -1 ? html.lastIndexOf('</div>\n    </div>') : html.lastIndexOf('</div>'));
-        const bodyHtml = inner.replace(/<\/div>\s*$/, '');
-        if (mbody.innerHTML !== bodyHtml) {
-          mbody.innerHTML = bodyHtml;
-          paintSprites(mbody);
-          requestAnimationFrame(() => snapBees(mbody));
-          bind(mbody);
-          if (state.o2mq) applyMemberFilter(el, state.o2mq);
+      if (mbody) {
+        if (!prev || prev.srcHtml !== srcHtml) {
+          syncMembersSourceChip(el, srcHtml);
         }
+        const inp = el.querySelector('.o2-msin');
+        const wantQ = String(state.o2mq || '');
+        if (inp && document.activeElement !== inp && inp.value !== wantQ) {
+          inp.value = wantQ;
+          applyMemberFilter(el, wantQ);
+        }
+        if (prev && prev.bodyHtml === bodyHtml) {
+          LAST_RENDER.set(el, { view: v, html, bodyHtml, srcHtml });
+          return;
+        }
+        LAST_RENDER.set(el, { view: v, html, bodyHtml, srcHtml });
+        mbody.innerHTML = bodyHtml;
+        paintSprites(mbody);
+        requestAnimationFrame(() => snapBees(mbody));
+        bind(mbody);
+        if (state.o2mq) applyMemberFilter(el, state.o2mq);
         return;
       }
     }
+    LAST_RENDER.set(el, { view: v, html, bodyHtml, srcHtml });
     const active = document.activeElement;
     const typing = active && active.classList && active.classList.contains('o2-msin') && el.contains(active)
         ? {start: active.selectionStart, end: active.selectionEnd} : null;
@@ -1596,14 +1666,18 @@
     const ux = q => 1.5 * q, uy = (q, r) => 2 * K * (r + q / 2);
     const xs = [0, ...slots.map(([q]) => ux(q))], ys = [0, ...slots.map(([q, r]) => uy(q, r))];
     const spanX = Math.max(...xs) - Math.min(...xs) + 2, spanY = Math.max(...ys) - Math.min(...ys) + 2 * K;
-    const fit = (W - 8) / spanX, gap = fit < 44 ? 3 : 7;
-    const Rfit = Math.max(12, Math.min(108, fit - gap / 2)), zmax = 108 / Rfit;
+    const pad = 8;
+    const fit = Math.max(8, (W - pad * 2) / spanX), gap = fit < 44 ? 3 : 7;
+    const Rfit = Math.max(8, Math.min(108, fit - gap / 2)), zmax = 108 / Rfit;
     HV.zmax = zmax; HV.zoom = Math.max(1, Math.min(zmax, HV.zoom));
     HV.key = `${S.etag}|${seq}|${W}|${HV.zoom}|${HV.sel}`;
+    const prevDrawW = HV.lastW || 0;
+    HV.lastW = W;
     const R = Math.min(108, Rfit * HV.zoom), G = R + gap / 2;
     const mode = R >= 76 ? 'full' : R >= 40 ? 'mid' : 'tiny';
-    const CW = Math.max(W, Math.ceil(spanX * G + 8));
-    const ox = CW / 2 - (Math.max(...xs) + Math.min(...xs)) / 2 * G, oy = 4 + K * R - Math.min(...ys) * G, H = Math.ceil(spanY * G + 8);
+    const rawCW = Math.ceil(spanX * G + pad * 2);
+    const CW = Math.max(W, rawCW);
+    const ox = CW / 2 - (Math.max(...xs) + Math.min(...xs)) / 2 * G, oy = pad + K * R - Math.min(...ys) * G, H = Math.ceil(spanY * G + pad * 2);
     const hex = (x, y, r, a0) => { let d = ''; for (let k = 0; k < 6; k++) { const a = (a0 + 60 * k) * Math.PI / 180; d += (k ? 'L' : 'M') + (x + r * Math.cos(a)).toFixed(1) + ' ' + (y + r * Math.sin(a)).toFixed(1); } return d + 'Z'; };
     const wrap = (t, max) => { const out = []; let cur = ''; String(t).split(' ').forEach(w => { if (cur && (cur + ' ' + w).length > max) { out.push(cur); cur = w; } else cur = (cur + ' ' + w).trim(); }); if (cur) out.push(cur); if (out.length > 2) { out.length = 2; out[1] = out[1].replace(/.$/, '…'); } return out; };
     const clip = (t, max) => { const s = String(t); return s.length > max ? s.slice(0, Math.max(1, max - 1)).trimEnd() + '…' : s; };
@@ -1685,14 +1759,28 @@
     stage.style.width = CW + 'px';
     svg.setAttribute('viewBox', `0 0 ${CW} ${H}`);
     const zoomed = HV.zoom > 1.001, f = HV.focus; HV.focus = null;
+    const scrollable = !zoomed && CW > W + 1;
     view.classList.toggle('zoomed', zoomed);
-    view.style.height = zoomed ? Math.max(320, Math.min(Math.ceil(spanY * (Rfit + gap / 2) + 8), window.innerHeight - 160)) + 'px' : '';
+    view.classList.toggle('scrollable', scrollable);
+    if (zoomed) {
+      const wrap = root.closest('.tab-body') || root.parentElement;
+      const wrapRect = wrap ? wrap.getBoundingClientRect() : null;
+      const viewRect = view.getBoundingClientRect();
+      const availH = wrapRect
+        ? Math.floor(wrapRect.bottom - viewRect.top - 40)
+        : Math.floor(window.innerHeight - viewRect.top - 40);
+      const maxH = Math.max(200, availH);
+      const fitH = Math.ceil(spanY * (Rfit + gap / 2) + pad * 2);
+      view.style.height = `${Math.max(200, Math.min(fitH, maxH))}px`;
+    } else {
+      view.style.height = '';
+    }
     if (zoomed && f) { view.scrollLeft = ox + f.u * G - (f.ax ?? view.clientWidth / 2); view.scrollTop = oy + f.v * G - (f.ay ?? view.clientHeight / 2); }
     HV.geo = {ox, oy, G, units: [[0, 0], ...slots.map(([q, r]) => [ux(q), uy(q, r)])]};
     const zg = root.querySelector('.hv-zoom'), [zOut, zIn, zFit] = zg.querySelectorAll('button');
     zg.hidden = zmax < 1.15; zOut.disabled = zFit.disabled = !zoomed; zIn.disabled = HV.zoom > zmax - .001;
     root.querySelector('.hv').classList.toggle('can-zoom', zmax >= 1.15 && mode !== 'full');
-    if (HV.lastZoom !== HV.zoom) { const j = HV.jump = (HV.jump || 0) + 1; layer.classList.add('jump'); requestAnimationFrame(() => requestAnimationFrame(() => { if (j === HV.jump) layer.classList.remove('jump'); })); HV.lastZoom = HV.zoom; }
+    if (HV.lastZoom !== HV.zoom || !layer.children.length || (prevDrawW && prevDrawW !== W)) { const j = HV.jump = (HV.jump || 0) + 1; layer.classList.add('jump'); requestAnimationFrame(() => requestAnimationFrame(() => { if (j === HV.jump) layer.classList.remove('jump'); })); HV.lastZoom = HV.zoom; }
     svg.classList.toggle('fresh', fresh);
     HV.beam = beam ? beam.s : null;
     svg.innerHTML = cellSvg + selSvg + lines + textSvg;
@@ -1702,8 +1790,9 @@
     const have = new Map([...layer.children].map(b => [b.dataset.n, b]));
     Object.keys(pos).forEach(n => { const x = sc.members[n], s = hs.st[n]; if (!x || !s || tucked.has(n)) return;
       let b = have.get(n);
-      if (!b) { b = document.createElement('button'); b.type = 'button'; b.className = 'hv-bee'; b.dataset.n = n;
-        b.innerHTML = `${spriteTag(n, 'landed')}<i class="hv-dot"></i><span class="hv-nm">${esc(n)}</span>`; layer.appendChild(b); }
+      const isNew = !b;
+      if (isNew) { b = document.createElement('button'); b.type = 'button'; b.className = 'hv-bee'; b.dataset.n = n;
+        b.innerHTML = `${spriteTag(n, 'landed')}<i class="hv-dot"></i><span class="hv-nm">${esc(n)}</span>`; }
       have.delete(n);
       const isCoord = n === 'coordinator', art = s.st === 'working' ? 'working' : s.st === 'wait' ? 'waiting_on' : 'landed', size = pos[n].size;
       if (b.dataset.art !== art) { b.dataset.art = art; b.querySelectorAll('.beebox, .beewrap').forEach(e => { e.dataset.state = art; }); paintSprites(b); }
@@ -1713,7 +1802,8 @@
       b.style.transform = `translate(${Math.round(pos[n].x - w / 2)}px,${Math.round(pos[n].y - h / 2)}px)`;
       const what = label(s);
       const tip = `@${n}${x.title && !isCoord ? ' · ' + x.title : ''}${what ? ' · ' + what : ''}`;
-      b.title = tip; b.setAttribute('aria-label', tip); });
+      b.title = tip; b.setAttribute('aria-label', tip);
+      if (isNew) layer.appendChild(b); });
     have.forEach(b => b.remove());
     const card = root.querySelector('.hv-card');
     card.hidden = !selC;
@@ -1771,12 +1861,36 @@
           if (moved) { HV.dragged = true; setTimeout(() => { HV.dragged = false; }, 0); } };
         window.addEventListener('pointermove', move); window.addEventListener('pointerup', up); window.addEventListener('pointercancel', up); });
       if (HV.ro) HV.ro.disconnect();
-      HV.ro = new ResizeObserver(() => { try { hiveDraw(); } catch (e) { console.warn('SwarmHive', e); } });
+      if (HV.raf) { cancelAnimationFrame(HV.raf); HV.raf = 0; }
+      HV.lastW = 0; HV.prevW = 0; HV.lastResizeAt = 0;
+      HV.ro = new ResizeObserver(() => {
+        if (!HV.root || !HV.root.isConnected) return;
+        const tab = HV.root.closest('.tab-body');
+        if (tab && !tab.classList.contains('active')) return;
+        const hvEl = HV.root.querySelector('.hv');
+        const nextW = hvEl ? Math.floor(hvEl.clientWidth) : 0;
+        if (nextW < 40) return;
+        const curW = HV.lastW || 0;
+        if (Math.abs(nextW - curW) < 4) return;
+        const now = Date.now();
+        // Guard against vertical-scrollbar toggle oscillation (~10-16px ping-pong).
+        if (HV.prevW && nextW === HV.prevW && Math.abs(nextW - curW) <= 18 && now - (HV.lastResizeAt || 0) < 350) {
+          return;
+        }
+        HV.prevW = curW;
+        HV.lastResizeAt = now;
+        cancelAnimationFrame(HV.raf);
+        HV.raf = requestAnimationFrame(() => {
+          HV.raf = 0;
+          try { hiveDraw(); } catch (e) { console.warn('SwarmHive', e); }
+        });
+      });
       HV.ro.observe(HV.root);
     }
     HV.args = {seq: opts && opts.seq != null ? Number(opts.seq) : null};
     try {
       if (swarmKey !== S.swarm) {
+        clearTimeout(onboardTimer); onboardTimer = 0;
         S.swarm = swarmKey;
         S.etag = '';
         S.live = null;
@@ -1804,6 +1918,7 @@
       window.SwarmHive.embedded = true;
       let r = ROOTS.get(el);
       if (!r || !r.root.isConnected || r.root.parentNode !== el) {
+        if (r && r.root) RO.unobserve(r.root);
         el.innerHTML = '';
         const root = document.createElement('div');
         root.className = 'pane embedded';
@@ -1814,6 +1929,7 @@
       }
       const swarmKey = snap.swarm || snap.id;
       if (swarmKey !== S.swarm) {
+        clearTimeout(onboardTimer); onboardTimer = 0;
         closeReel();
         for (const k of Object.keys(state)) delete state[k];
         state.view = 'overview';

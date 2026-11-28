@@ -10,6 +10,7 @@ from datetime import datetime
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
 import random
@@ -60,9 +61,18 @@ STEP_ERROR_SETTLE_MS = 60_000
 QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|quota|\b429\b|exhausted your capacity|rate.?limit", re.I)
 _ROLE_WORKER_RE = re.compile(r"^(?:narrator|monitor)(?:$|[-_0-9])", re.I)
 _FILE_CACHE_LOCK = threading.Lock()
-_FILE_CACHE: OrderedDict[str, tuple[tuple[int, int], Any]] = OrderedDict()
+_FILE_CACHE: OrderedDict[str, tuple[tuple[int, int, int], Any]] = OrderedDict()
 _VIEW_JSON_CACHE_LOCK = threading.Lock()
 _VIEW_JSON_CACHE: OrderedDict[str, tuple[dict[str, Any], int]] = OrderedDict()
+_URL_HOSTS_CACHE_LOCK = threading.Lock()
+_URL_HOSTS_CACHE: dict[str, tuple[tuple[int, int, int], list[str]]] = {}
+_TASK_SESSION_META_LOCK = threading.Lock()
+_TASK_SESSION_META_CACHE: OrderedDict[tuple[str, str, str], tuple[str | None, str | None, float]] = OrderedDict()
+_TASK_SESSION_META_CACHE_MAX = 512
+_TASK_SESSION_META_ACTIVE_TTL_S = 15.0
+_OBSERVER_ETAG_CACHE_LOCK = threading.Lock()
+_OBSERVER_ETAG_CACHE: OrderedDict[tuple[str, str], dict[str, Any]] = OrderedDict()
+_OBSERVER_ETAG_CACHE_MAX = 128
 _SSE_SUBSCRIBERS_LOCK = threading.Lock()
 _ACTIVE_SSE_QUEUES: set[asyncio.Queue[Any]] = set()
 
@@ -78,6 +88,27 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return str(raw).strip().lower() not in ("0", "false", "no", "off")
 
 
+def _url_hosts_file_path() -> Path:
+    return Path.home() / ".gemini" / "config" / "plugins" / "hermes-swarm" / "sidecars" / "swarm_board" / "url_hosts.json"
+
+
+def _stat_sig_triple(path: Path | None) -> tuple[int, int, int, int] | None:
+    if path is None:
+        return None
+    try:
+        st = path.stat()
+        return (int(st.st_mtime_ns), int(st.st_size), int(st.st_ctime_ns), int(getattr(st, "st_ino", 0)))
+    except OSError:
+        return None
+
+
+def _url_hosts_sig() -> tuple[str, tuple[int, int, int, int] | None]:
+    env_raw = (os.environ.get("HERMES_SWARM_URL_HOSTS") or "").strip()
+    if env_raw:
+        return (env_raw, None)
+    return ("", _stat_sig_triple(_url_hosts_file_path()))
+
+
 def _load_url_hosts() -> list[str]:
     raw = (os.environ.get("HERMES_SWARM_URL_HOSTS") or "").strip()
     if raw:
@@ -87,15 +118,31 @@ def _load_url_hosts() -> list[str]:
                 return [str(h).strip() for h in parsed if str(h).strip()]
         except Exception:
             return [h.strip() for h in raw.split(",") if h.strip()]
-    cand = Path.home() / ".gemini" / "config" / "plugins" / "hermes-swarm" / "sidecars" / "swarm_board" / "url_hosts.json"
-    if cand.is_file():
-        try:
-            parsed = json.loads(cand.read_text(encoding="utf-8"))
-            if isinstance(parsed, list):
-                return [str(h).strip() for h in parsed if str(h).strip()]
-        except Exception:
-            pass
-    return []
+    cand = _url_hosts_file_path()
+    try:
+        st = cand.stat()
+        sig = (int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0)))
+    except OSError:
+        with _URL_HOSTS_CACHE_LOCK:
+            _URL_HOSTS_CACHE.pop(str(cand), None)
+        return []
+    key = str(cand)
+    with _URL_HOSTS_CACHE_LOCK:
+        cached = _URL_HOSTS_CACHE.get(key)
+        if cached is not None and cached[0] == sig:
+            return list(cached[1])
+    hosts: list[str] = []
+    try:
+        parsed = json.loads(cand.read_text(encoding="utf-8"))
+        if isinstance(parsed, list):
+            hosts = [str(h).strip() for h in parsed if str(h).strip()]
+    except Exception:
+        hosts = []
+    with _URL_HOSTS_CACHE_LOCK:
+        if len(_URL_HOSTS_CACHE) > 16:
+            _URL_HOSTS_CACHE.clear()
+        _URL_HOSTS_CACHE[key] = (sig, list(hosts))
+    return hosts
 
 
 def _iso_to_epoch_ms(raw: str | None) -> int:
@@ -164,13 +211,10 @@ def _collect_loopback_tokens(
             accepted.append(cand)
     if manager is not None:
         tok_file = manager.store.state_dir / "internal_token"
-        if tok_file.is_file():
-            try:
-                file_tok = tok_file.read_text(encoding="utf-8", errors="replace").strip()
-                if file_tok and file_tok not in accepted:
-                    accepted.append(file_tok)
-            except OSError:
-                pass
+        raw_tok, _ = _read_cached_text(tok_file)
+        file_tok = (raw_tok or "").strip()
+        if file_tok and file_tok not in accepted:
+            accepted.append(file_tok)
     return accepted
 
 
@@ -309,20 +353,25 @@ def _extract_scope_hints(
 
 def _allowed_app_data_brain_roots() -> list[Path]:
     roots: list[Path] = []
+    app_data = os.environ.get("ANTIGRAVITY_APP_DATA_DIR", "").strip()
+    if app_data:
+        app_brain = Path(store.normalize_local_path(app_data)) / "brain"
+        if app_brain.is_dir():
+            roots.append(app_brain)
     data_dir = os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR", "").strip()
     if data_dir:
         cur = Path(store.normalize_local_path(data_dir))
         for parent in [cur, *cur.parents]:
             if parent.name == "sidecar_data":
                 brain = parent.parent / "brain"
-                if brain.is_dir():
+                if brain.is_dir() and brain not in roots:
                     roots.append(brain)
                 break
     if not roots:
         gemini_root = Path.home() / ".gemini"
         if gemini_root.is_dir():
             try:
-                for child in gemini_root.iterdir():
+                for child in sorted(gemini_root.iterdir()):
                     brain = child / "brain"
                     if brain.is_dir():
                         roots.append(brain)
@@ -331,12 +380,29 @@ def _allowed_app_data_brain_roots() -> list[Path]:
     return roots
 
 
+def _narrator_view_candidate_dirs(narrator_conv_id: str | None) -> tuple[Path, ...]:
+    clean_cid = str(narrator_conv_id or "").strip()
+    if not clean_cid or clean_cid == "." or "/" in clean_cid or "\\" in clean_cid or ".." in clean_cid:
+        return ()
+    dirs: list[Path] = []
+    seen: set[str] = set()
+    for root in _allowed_app_data_brain_roots():
+        fb_dir = root / clean_cid / "swarm_view"
+        if not store.is_path_within(fb_dir, [root]):
+            continue
+        key = os.path.normcase(str(fb_dir))
+        if key not in seen:
+            seen.add(key)
+            dirs.append(fb_dir)
+    return tuple(dirs)
+
+
 def _read_cached_text(path: Path) -> tuple[str | None, os.stat_result | None]:
     try:
         st = path.stat()
     except OSError:
         return None, None
-    sig = (st.st_mtime_ns, st.st_size)
+    sig = (st.st_mtime_ns, st.st_size, int(getattr(st, "st_ino", 0)))
     key = str(path)
     with _FILE_CACHE_LOCK:
         cached = _FILE_CACHE.get(key)
@@ -361,18 +427,13 @@ def _read_narrator_view(swarm_dir: Path, narrator_conv_id: str | None = None) ->
     vjson = view_dir / "view.json"
     vhtml = view_dir / "view.html"
     if not vjson.is_file() and not vhtml.is_file() and narrator_conv_id:
-        clean_cid = str(narrator_conv_id).strip()
-        if clean_cid and clean_cid != "." and "/" not in clean_cid and "\\" not in clean_cid and ".." not in clean_cid:
-            for root in _allowed_app_data_brain_roots():
-                fb_dir = root / clean_cid / "swarm_view"
-                if not store.is_path_within(fb_dir, [root]):
-                    continue
-                if (fb_dir / "view.json").is_file() or (fb_dir / "view.html").is_file():
-                    view_dir = fb_dir
-                    source = "brain"
-                    vjson = view_dir / "view.json"
-                    vhtml = view_dir / "view.html"
-                    break
+        for fb_dir in _narrator_view_candidate_dirs(narrator_conv_id):
+            if (fb_dir / "view.json").is_file() or (fb_dir / "view.html").is_file():
+                view_dir = fb_dir
+                source = "brain"
+                vjson = view_dir / "view.json"
+                vhtml = view_dir / "view.html"
+                break
 
     cache_key = str(swarm_dir)
     out: dict[str, Any] = {
@@ -427,7 +488,7 @@ def _read_narrator_view(swarm_dir: Path, narrator_conv_id: str | None = None) ->
                     out["htmlError"] = "empty"
                 else:
                     out["html"] = html_txt
-                    out["htmlKey"] = f"{view_dir}|{st_h.st_mtime_ns}:{st_h.st_size}"
+                    out["htmlKey"] = f"{view_dir}|{st_h.st_mtime_ns}:{st_h.st_size}:{int(getattr(st_h, 'st_ino', 0))}"
         except Exception:
             out["htmlError"] = "invalid"
     return out
@@ -668,7 +729,12 @@ def _normalize_recent_tools(raw: Any, *, limit: int = 12) -> list[dict[str, Any]
     return out
 
 
-def _task_to_summary_row(task: dict[str, Any], members_map: dict[str, Any]) -> dict[str, Any]:
+def _task_to_summary_row(
+    task: dict[str, Any],
+    members_map: dict[str, Any],
+    *,
+    expiry_out: list[float] | None = None,
+) -> dict[str, Any]:
     st = str(((task.get("status") or {}).get("state")) or "")
     meta = task.get("metadata") or {}
     wcfg = meta.get("workerConfig") or {}
@@ -706,14 +772,44 @@ def _task_to_summary_row(task: dict[str, Any], members_map: dict[str, Any]) -> d
                         eff_provider = eff_provider or part["data"].get("provider")
     hermes_sid = act.get("hermesSessionId") or member_rec.get("sessionId")
     if (not eff_model or not eff_provider) and hermes_sid:
-        _, _, db_extra = runtime_mod._query_hermes_session_stats(
-            str(hermes_sid),
-            model=eff_model,
-            provider=eff_provider,
-            base_url=wcfg.get("base_url"),
-        )
-        eff_model = eff_model or db_extra.get("model")
-        eff_provider = eff_provider or db_extra.get("billingProvider")
+        task_id_str = str(task.get("id") or "")
+        sid_str = str(hermes_sid)
+        memo_key = (str(store.default_hermes_home()), task_id_str, sid_str)
+        now_m = time.monotonic()
+        db_model_hit: str | None = None
+        db_prov_hit: str | None = None
+        cache_hit = False
+        with _TASK_SESSION_META_LOCK:
+            cached_meta = _TASK_SESSION_META_CACHE.get(memo_key)
+            if cached_meta is not None and now_m < cached_meta[2]:
+                _TASK_SESSION_META_CACHE.move_to_end(memo_key)
+                db_model_hit, db_prov_hit, cached_exp_m = cached_meta
+                if expiry_out is not None and math.isfinite(cached_exp_m):
+                    expiry_out.append(cached_exp_m)
+                cache_hit = True
+        if not cache_hit:
+            _, _, db_extra = runtime_mod._query_hermes_session_stats(
+                sid_str,
+                model=eff_model,
+                provider=eff_provider,
+                base_url=wcfg.get("base_url"),
+            )
+            db_model_hit = db_extra.get("model")
+            db_prov_hit = db_extra.get("billingProvider")
+            is_terminal_task = st in models.TERMINAL_STATES
+            if is_terminal_task or (db_model_hit and db_prov_hit):
+                expires_m = float("inf")
+            else:
+                expires_m = now_m + _TASK_SESSION_META_ACTIVE_TTL_S
+                if expiry_out is not None:
+                    expiry_out.append(expires_m)
+            with _TASK_SESSION_META_LOCK:
+                _TASK_SESSION_META_CACHE[memo_key] = (db_model_hit, db_prov_hit, expires_m)
+                _TASK_SESSION_META_CACHE.move_to_end(memo_key)
+                while len(_TASK_SESSION_META_CACHE) > _TASK_SESSION_META_CACHE_MAX:
+                    _TASK_SESSION_META_CACHE.popitem(last=False)
+        eff_model = eff_model or db_model_hit
+        eff_provider = eff_provider or db_prov_hit
 
     ctx_limit = runtime_mod._resolve_context_limit(eff_model, eff_provider, wcfg.get("base_url"))
     tokens = runtime_mod._normalize_tokens_dict(meta.get("tokens"), context_limit=ctx_limit)
@@ -924,23 +1020,168 @@ def _pick_narrator(members_out: list[dict[str, Any]]) -> dict[str, Any] | None:
     return candidates[0]
 
 
+def _compute_observer_base_sig(
+    paths: store.SwarmPaths,
+    runtime: runtime_mod.SwarmRuntime,
+) -> tuple[Any, ...]:
+    """Capture base stat + env + runtime fingerprint before/after snapshot reads (C1 anti-TOCTOU)."""
+    return (
+        _stat_sig_triple(paths.meta_file),
+        _stat_sig_triple(paths.board_file),
+        _stat_sig_triple(paths.board_file.with_name("board_archive.jsonl")),
+        _stat_sig_triple(paths.swarm_dir / "view.json"),
+        _stat_sig_triple(paths.swarm_dir / "view.html"),
+        _url_hosts_sig(),
+        (
+            _env_flag("SWARM_OVERVIEW", True),
+            _env_flag("SWARM_GRAPH_TAB", True),
+            _env_flag("SWARM_RAW_TAB", True),
+            (os.environ.get("ANTIGRAVITY_APP_DATA_DIR") or "").strip(),
+            (os.environ.get("ANTIGRAVITY_EXECUTABLE_DATA_DIR") or "").strip(),
+        ),
+        runtime.get_observer_state_fingerprint(),
+    )
+
+
+def _compute_view_extras_sig(
+    swarm_dir: Path,
+    *,
+    view_dir: Path | None = None,
+    view_candidate_dirs: tuple[Path, ...] = (),
+) -> tuple[Any, ...]:
+    extra_dirs: list[Path] = []
+    seen: set[str] = {os.path.normcase(str(swarm_dir))}
+    for cand in (*view_candidate_dirs, view_dir):
+        if cand is None:
+            continue
+        ckey = os.path.normcase(str(cand))
+        if ckey not in seen:
+            seen.add(ckey)
+            extra_dirs.append(cand)
+    extra_dirs.sort(key=lambda d: os.path.normcase(str(d)))
+    return tuple(
+        (
+            str(d),
+            _stat_sig_triple(d),
+            _stat_sig_triple(d / "view.json"),
+            _stat_sig_triple(d / "view.html"),
+        )
+        for d in extra_dirs
+    )
+
+
+def _compute_observer_light_sig(
+    paths: store.SwarmPaths,
+    runtime: runtime_mod.SwarmRuntime,
+    *,
+    view_dir: Path | None = None,
+    view_candidate_dirs: tuple[Path, ...] = (),
+    coord_transcript_path: Path | None = None,
+) -> tuple[Any, ...]:
+    """Build a cheap stat + runtime-fingerprint signature to short-circuit unchanged observer ETag polls."""
+    return (
+        _compute_observer_base_sig(paths, runtime),
+        _compute_view_extras_sig(
+            paths.swarm_dir,
+            view_dir=view_dir,
+            view_candidate_dirs=view_candidate_dirs,
+        ),
+        (str(coord_transcript_path), _stat_sig_triple(coord_transcript_path)) if coord_transcript_path else None,
+    )
+
+
+def try_fast_unchanged_snapshot(
+    manager: runtime_mod.SwarmManager,
+    swarm_id: str,
+    *,
+    conv_id: str = "",
+    known_etag: str = "",
+    include_raw: bool = True,
+) -> dict[str, Any] | None:
+    """Short-circuit ETag-matching observer polls without parsing board.json, deep-copying tasks, or building raw_blob."""
+    known_clean = str(known_etag or "").strip().strip('"')
+    if not known_clean or "|" not in known_clean:
+        return None
+    sid = store.sanitize_swarm_id(swarm_id) or "default"
+    if not known_clean.startswith(f"{sid}|"):
+        return None
+    known_digest = known_clean.rsplit("|", 1)[-1]
+    paths = manager.store.paths(sid)
+    cache_key = (str(paths.swarm_dir), sid)
+    with _OBSERVER_ETAG_CACHE_LOCK:
+        cached = _OBSERVER_ETAG_CACHE.get(cache_key)
+        if cached is not None:
+            _OBSERVER_ETAG_CACHE.move_to_end(cache_key)
+    if cached is None:
+        return None
+    expected_digest = cached.get("etagDigestR1") if include_raw else cached.get("etagDigestR0")
+    if not expected_digest or expected_digest != known_digest:
+        return None
+    if time.monotonic() >= float(cached.get("nextExpiryMono") or 0.0):
+        return None
+
+    # If a coordinator existed without a transcript file, check whether one just appeared.
+    coord_path = cached.get("coordTranscriptPath")
+    if cached.get("hasCoordinator") and coord_path is None:
+        _, newly_found = runtime_mod._resolve_antigravity_transcript_file(
+            list(cached.get("coordLookupCids") or []),
+            primary_cid=cached.get("primaryConversationId"),
+        )
+        if newly_found is not None:
+            return None
+
+    runtime = manager.get_runtime(sid)
+    cur_sig = _compute_observer_light_sig(
+        paths,
+        runtime,
+        view_dir=cached.get("viewDir"),
+        view_candidate_dirs=tuple(cached.get("viewCandidateDirs") or ()),
+        coord_transcript_path=coord_path,
+    )
+    if cur_sig != cached.get("sig"):
+        return None
+
+    clean_conv = str(conv_id or "").strip()
+    member_map = cached.get("memberByConv") if isinstance(cached.get("memberByConv"), dict) else {}
+    member_obj = member_map.get(clean_conv) if clean_conv else None
+    member_name = str(member_obj or "")
+    expected_etag = f"{sid}|{member_name}|{known_digest}"
+    if known_clean != expected_etag:
+        return None
+
+    body: dict[str, Any] = {
+        "unchanged": True,
+        "swarm": sid,
+        "member": member_obj,
+        "etag": expected_etag,
+        "primaryConversationId": cached.get("primaryConversationId") or clean_conv or None,
+        "conversationIds": list(cached.get("conversationIds") or []),
+    }
+    if cached.get("coordinatorConversationId"):
+        body["coordinatorConversationId"] = cached["coordinatorConversationId"]
+    return body
+
+
 def build_observer_snapshot(
     manager: runtime_mod.SwarmManager,
     swarm_id: str,
     *,
     member: str = "",
     known_etag: str = "",
+    include_raw: bool = True,
 ) -> dict[str, Any]:
     """Build a read-only v2 observer snapshot aligned with `board_ui` and `wakeup_bridge.mjs`."""
     sid = store.sanitize_swarm_id(swarm_id) or "default"
     paths = manager.store.paths(sid)
+    runtime = manager.get_runtime(sid)
+    base_sig_before = _compute_observer_base_sig(paths, runtime)
     meta = manager.store.read_meta(sid) or models.default_swarm_meta(sid)
     board = manager.board_service.read_board(sid)
-    runtime = manager.get_runtime(sid)
     raw_tasks = runtime.get_task_snapshots()
 
     members_map = board.get("members") if isinstance(board.get("members"), dict) else {}
-    task_rows = [_task_to_summary_row(t, members_map) for t in raw_tasks]
+    task_meta_expiries: list[float] = []
+    task_rows = [_task_to_summary_row(t, members_map, expiry_out=task_meta_expiries) for t in raw_tasks]
     latest_task_by_worker: dict[str, dict[str, Any]] = {}
     for row in task_rows:
         wn = str(row.get("workerName") or "")
@@ -1070,6 +1311,12 @@ def build_observer_snapshot(
 
     # Members list for hive.js & app.js
     now_ms = int(time.time() * 1000)
+    now_mono = time.monotonic()
+    earliest_expiry_ms: int | None = None
+    has_coordinator = False
+    coord_lookup_cids: list[str] = []
+    coord_transcript_path: Path | None = None
+    coord_sig_before: tuple[str, tuple[int, int, int, int] | None] | None = None
     subagents_map = board.get("subagents") if isinstance(board.get("subagents"), dict) else {}
     members_out: list[dict[str, Any]] = []
     unseen_by: dict[str, list[int]] = {}
@@ -1157,6 +1404,10 @@ def build_observer_snapshot(
                     "detail": err_txt[:300],
                     "since": ended_ms,
                 })
+            else:
+                settle_at = ended_ms + STEP_ERROR_SETTLE_MS
+                if earliest_expiry_ms is None or settle_at < earliest_expiry_ms:
+                    earliest_expiry_ms = settle_at
 
         raw_subs = list(mem.get("subagents") or subagents_map.get(name) or [])
         if not killed and ui_status == "working" and trow:
@@ -1168,6 +1419,7 @@ def build_observer_snapshot(
                 trow.get("createdAt"),
             ]
             has_fresh_working_sub = False
+            fresh_sub_expiry_ms: int | None = None
             for s in raw_subs:
                 if not isinstance(s, dict):
                     continue
@@ -1175,8 +1427,12 @@ def build_observer_snapshot(
                     sub_ts = s.get("updatedAt")
                     if sub_ts:
                         cand_ts.append(sub_ts)
-                        if (now_ms - _iso_to_epoch_ms(sub_ts)) < STUCK_MS:
+                        sub_updated_ms = _iso_to_epoch_ms(sub_ts)
+                        if (now_ms - sub_updated_ms) < STUCK_MS:
                             has_fresh_working_sub = True
+                            sub_exp_ms = sub_updated_ms + STUCK_MS
+                            if fresh_sub_expiry_ms is None or sub_exp_ms < fresh_sub_expiry_ms:
+                                fresh_sub_expiry_ms = sub_exp_ms
                     else:
                         has_fresh_working_sub = True
             act_ms_list = [_iso_to_epoch_ms(ts_v) for ts_v in cand_ts if ts_v]
@@ -1192,6 +1448,14 @@ def build_observer_snapshot(
                     "detail": activity or "",
                     "since": act_ms,
                 })
+            elif has_fresh_working_sub:
+                sub_deadline = fresh_sub_expiry_ms if fresh_sub_expiry_ms is not None else (now_ms + STUCK_MS)
+                if earliest_expiry_ms is None or sub_deadline < earliest_expiry_ms:
+                    earliest_expiry_ms = sub_deadline
+            else:
+                stuck_at = act_ms + STUCK_MS
+                if earliest_expiry_ms is None or stuck_at < earliest_expiry_ms:
+                    earliest_expiry_ms = stuck_at
         member_subs: list[dict[str, Any]] = []
         for s in raw_subs:
             if not isinstance(s, dict):
@@ -1256,8 +1520,17 @@ def build_observer_snapshot(
         member_elapsed_ms = int((trow or {}).get("elapsedMs") or 0)
         member_llm_active_ms = int((trow or {}).get("llmActiveMs") or 0)
         if is_coord:
+            has_coordinator = True
+            coord_lookup_cids = [conv_id] if conv_id else []
+            _, coord_tpath = runtime_mod._resolve_antigravity_transcript_file(
+                coord_lookup_cids,
+                primary_cid=meta.get("primaryConversationId"),
+            )
+            if coord_tpath is not None:
+                coord_transcript_path = coord_tpath
+                coord_sig_before = (str(coord_tpath), _stat_sig_triple(coord_tpath))
             coord_stats = runtime_mod.extract_antigravity_transcript_summary(
-                [conv_id] if conv_id else [],
+                coord_lookup_cids,
                 primary_cid=meta.get("primaryConversationId"),
             )
             if coord_stats:
@@ -1279,6 +1552,22 @@ def build_observer_snapshot(
                     member_llm_active_ms = int(coord_stats["llmActiveMs"])
                 if not conv_id and coord_stats.get("conversationId"):
                     conv_id = str(coord_stats["conversationId"])
+            coord_updated_ms = runtime_mod._compute_coordinator_updated_ms(
+                mem,
+                meta,
+                last_post_ts_ms=int((lp or {}).get("ts") or 0),
+                coord_name=name,
+            )
+            ui_status, coord_expiry_ms = runtime_mod.reconcile_coordinator_state(
+                ui_status,
+                killed=killed,
+                coord_stats=coord_stats or None,
+                active_worker_count=len(active_tasks),
+                member_updated_ms=coord_updated_ms,
+                now_ms=now_ms,
+            )
+            if coord_expiry_ms is not None and (earliest_expiry_ms is None or coord_expiry_ms < earliest_expiry_ms):
+                earliest_expiry_ms = coord_expiry_ms
         m_pure, m_cached, m_cw, m_out, m_proc, _ = _extract_token_economy(member_tokens)
         member_tokens.setdefault("pureInput", m_pure)
         member_tokens.setdefault("cachedInput", m_cached)
@@ -1351,6 +1640,11 @@ def build_observer_snapshot(
 
     narrator_member = _pick_narrator(members_out)
     narrator_conv_id = str((narrator_member or {}).get("conversationId") or "").strip() or None
+    view_candidate_dirs = _narrator_view_candidate_dirs(narrator_conv_id)
+    view_sig_before = _compute_view_extras_sig(
+        paths.swarm_dir,
+        view_candidate_dirs=view_candidate_dirs,
+    )
     view_info = _read_narrator_view(paths.swarm_dir, narrator_conv_id=narrator_conv_id)
     frames = board_mod.extract_screenshots(
         board,
@@ -1440,6 +1734,7 @@ def build_observer_snapshot(
 
     title = str(meta.get("title") or board.get("title") or sid)
     req_member = str(member or "").strip()
+    etag_telemetry = {k: v for k, v in telemetry_rollup.items() if k not in ("avgTps", "liveTps")}
     etag_src = json.dumps(
         {
             "sid": sid,
@@ -1461,11 +1756,26 @@ def build_observer_snapshot(
                     m.get("provider"),
                     m["steps"],
                     m["toolCalls"],
+                    m.get("activity") or "",
                     (m.get("currentTool") or {}).get("name"),
+                    (m.get("currentTool") or {}).get("preview"),
                     (m.get("currentTool") or {}).get("startedAt"),
+                    [
+                        (
+                            rt_item.get("name"),
+                            rt_item.get("preview"),
+                            rt_item.get("status"),
+                            rt_item.get("at"),
+                        )
+                        for rt_item in (m.get("recentTools") or [])
+                    ],
+                    m.get("worktreePath"),
+                    m.get("worktreeBranch"),
+                    (m.get("tokens") or {}).get("pureInput"),
+                    (m.get("tokens") or {}).get("cachedInput"),
+                    (m.get("tokens") or {}).get("cacheWrite"),
                     (m.get("tokens") or {}).get("total"),
                     (m.get("tokens") or {}).get("contextUsed"),
-                    m.get("tps"),
                     len(m.get("subagents") or []),
                     [
                         (
@@ -1487,11 +1797,19 @@ def build_observer_snapshot(
                     r["steps"],
                     r["toolCalls"],
                     r["lastTool"],
+                    r.get("lastEventAt"),
+                    r.get("hermesSessionId"),
+                    r.get("lastTextPreview"),
+                    r.get("worktreePath"),
+                    r.get("worktreeBranch"),
+                    (r.get("tokens") or {}).get("pureInput"),
+                    (r.get("tokens") or {}).get("cachedInput"),
+                    (r.get("tokens") or {}).get("cacheWrite"),
                     (r.get("tokens") or {}).get("total"),
                 )
                 for r in task_rows[:30]
             ],
-            "telemetry": telemetry_rollup,
+            "telemetry": etag_telemetry,
             "viewExists": view_info.get("exists"),
             "viewMtime": view_info.get("jsonMtime"),
             "viewJsonErr": view_info.get("jsonError"),
@@ -1502,11 +1820,14 @@ def build_observer_snapshot(
         },
         sort_keys=True,
     )
-    etag_digest = hashlib.sha1(etag_src.encode("utf-8")).hexdigest()[:16]
+    etag_src_bytes = etag_src.encode("utf-8")
+    etag_digest_r1 = hashlib.sha1(etag_src_bytes + b"|r1").hexdigest()[:16]
+    etag_digest_r0 = hashlib.sha1(etag_src_bytes + b"|r0").hexdigest()[:16]
+    etag_digest = etag_digest_r1 if include_raw else etag_digest_r0
     etag = f"{sid}|{req_member}|{etag_digest}"
     known_clean = str(known_etag or "").strip().strip('"')
     known_digest = known_clean.rsplit("|", 1)[-1] if "|" in known_clean else ""
-    if known_clean.startswith(f"{sid}|") and known_digest == etag_digest:
+    if (not include_raw) or (known_clean.startswith(f"{sid}|") and known_digest == etag_digest):
         raw_blob: dict[str, Any] = {}
     else:
         archived_tail = board_mod.read_archived_messages(paths.board_file)[-200:] if archive_count else []
@@ -1517,6 +1838,69 @@ def build_observer_snapshot(
             "view": json.dumps(view_info["json"], indent=2, ensure_ascii=False) if view_info.get("json") else "",
             "archive": json.dumps(archived_tail, indent=2, ensure_ascii=False) if archive_count else "",
         }
+
+    conv_ids_list: list[str] = []
+    for cid_item in [
+        *(meta.get("conversationIds") or []),
+        meta.get("primaryConversationId"),
+        meta.get("coordinatorConversationId"),
+    ]:
+        clean_c = str(cid_item or "").strip()
+        if clean_c and clean_c not in conv_ids_list:
+            conv_ids_list.append(clean_c)
+
+    # Record lightweight ETag signature only when state did not mutate between T0 (before reads) and T1 (after reads).
+    if not req_member:
+        member_by_conv: dict[str, str] = {}
+        coord_cid_meta = str(meta.get("coordinatorConversationId") or "").strip()
+        if coord_cid_meta:
+            member_by_conv[coord_cid_meta] = models.Role.COORDINATOR.value
+        for m_item in members_out:
+            mcid = str(m_item.get("conversationId") or "").strip()
+            mname = str(m_item.get("name") or "").strip()
+            if mcid and mname and mcid not in member_by_conv:
+                member_by_conv[mcid] = mname
+        if earliest_expiry_ms is not None:
+            delta_s = max(0.0, (earliest_expiry_ms - now_ms) / 1000.0)
+            next_expiry_mono = now_mono + delta_s
+        else:
+            next_expiry_mono = float("inf")
+        for meta_exp_m in task_meta_expiries:
+            if meta_exp_m < next_expiry_mono:
+                next_expiry_mono = meta_exp_m
+        view_dir_path = Path(str(view_info.get("dir") or paths.swarm_dir))
+        light_sig_before = (base_sig_before, view_sig_before, coord_sig_before)
+        light_sig_after = _compute_observer_light_sig(
+            paths,
+            runtime,
+            view_dir=view_dir_path,
+            view_candidate_dirs=view_candidate_dirs,
+            coord_transcript_path=coord_transcript_path,
+        )
+        etag_cache_key = (str(paths.swarm_dir), sid)
+        with _OBSERVER_ETAG_CACHE_LOCK:
+            if light_sig_before == light_sig_after:
+                _OBSERVER_ETAG_CACHE[etag_cache_key] = {
+                    "sig": light_sig_before,
+                    "etagDigest": etag_digest,
+                    "etagDigestR1": etag_digest_r1,
+                    "etagDigestR0": etag_digest_r0,
+                    "primaryConversationId": meta.get("primaryConversationId"),
+                    "coordinatorConversationId": meta.get("coordinatorConversationId"),
+                    "conversationIds": conv_ids_list,
+                    "memberByConv": member_by_conv,
+                    "nextExpiryMono": next_expiry_mono,
+                    "viewDir": view_dir_path,
+                    "viewCandidateDirs": view_candidate_dirs,
+                    "hasCoordinator": has_coordinator,
+                    "coordLookupCids": list(coord_lookup_cids),
+                    "coordTranscriptPath": coord_transcript_path,
+                }
+                _OBSERVER_ETAG_CACHE.move_to_end(etag_cache_key)
+                while len(_OBSERVER_ETAG_CACHE) > _OBSERVER_ETAG_CACHE_MAX:
+                    _OBSERVER_ETAG_CACHE.popitem(last=False)
+            else:
+                _OBSERVER_ETAG_CACHE.pop(etag_cache_key, None)
 
     return {
         "schemaVersion": models.SCHEMA_VERSION,
@@ -1533,7 +1917,7 @@ def build_observer_snapshot(
         "primaryConversationId": meta.get("primaryConversationId"),
         "coordinatorConversationId": meta.get("coordinatorConversationId"),
         "conversationId": meta.get("primaryConversationId"),
-        "conversationIds": list(meta.get("conversationIds") or []),
+        "conversationIds": conv_ids_list,
         "projectId": meta.get("projectId"),
         "head": head,
         "etag": etag,
@@ -1725,6 +2109,7 @@ async def _sse_board_events_stream(
     swarm_id: str | None = None,
     conversation_id: str | None = None,
     since_seq: int = 0,
+    include_raw: bool = True,
 ) -> AsyncIterator[str]:
     sid: str | None = store.sanitize_swarm_id(swarm_id) or None if swarm_id else None
     clean_conv = str(conversation_id or "").strip() or None
@@ -1752,9 +2137,13 @@ async def _sse_board_events_stream(
     with _SSE_SUBSCRIBERS_LOCK:
         _ACTIVE_SSE_QUEUES.add(q)
     try:
-        snap = await asyncio.to_thread(build_observer_snapshot, manager, sid)
+        snap = await asyncio.to_thread(build_observer_snapshot, manager, sid, include_raw=include_raw)
         if clean_conv:
-            snap["member"] = _resolve_member_for_conversation(snap, clean_conv)
+            member_obj = _resolve_member_for_conversation(snap, clean_conv)
+            snap["member"] = member_obj
+            if member_obj and "|" in str(snap.get("etag") or ""):
+                digest_part = str(snap["etag"]).rsplit("|", 1)[-1]
+                snap["etag"] = f"{sid}|{member_obj}|{digest_part}"
         last_etag = snap.get("etag") or ""
         yield f"id: {snap.get('head', 0)}\nevent: snapshot\ndata: {json.dumps(snap, ensure_ascii=False)}\n\n"
 
@@ -1797,9 +2186,31 @@ async def _sse_board_events_stream(
             if shutting_down:
                 break
 
-            snap = await asyncio.to_thread(build_observer_snapshot, manager, sid)
+            if last_etag:
+                fast_unchanged = await asyncio.to_thread(
+                    try_fast_unchanged_snapshot,
+                    manager,
+                    sid,
+                    conv_id=clean_conv or "",
+                    known_etag=last_etag,
+                    include_raw=include_raw,
+                )
+                if fast_unchanged is not None:
+                    continue
+
+            snap = await asyncio.to_thread(
+                build_observer_snapshot,
+                manager,
+                sid,
+                known_etag=last_etag,
+                include_raw=include_raw,
+            )
             if clean_conv:
-                snap["member"] = _resolve_member_for_conversation(snap, clean_conv)
+                member_obj = _resolve_member_for_conversation(snap, clean_conv)
+                snap["member"] = member_obj
+                if member_obj and "|" in str(snap.get("etag") or ""):
+                    digest_part = str(snap["etag"]).rsplit("|", 1)[-1]
+                    snap["etag"] = f"{sid}|{member_obj}|{digest_part}"
             cur_etag = snap.get("etag") or ""
             if cur_etag != last_etag:
                 last_etag = cur_etag
@@ -2165,9 +2576,44 @@ def create_a2a_app(
                 "member": None,
             })
 
-        q_etag = (request.query_params.get("etag") or "").strip().strip('"')
+        qp = request.query_params
+        q_etag = (qp.get("etag") or "").strip().strip('"')
         hdr_etag = (request.headers.get("if-none-match") or "").strip().strip('"')
-        snap = await asyncio.to_thread(build_observer_snapshot, manager, sid, known_etag=(q_etag or hdr_etag))
+        compact_q = str(qp.get("compact") or "").strip().lower() in ("1", "true", "yes")
+        inc_raw_q = qp.get("include_raw")
+        if inc_raw_q is None:
+            inc_raw_q = qp.get("includeRaw")
+        if inc_raw_q is not None and str(inc_raw_q).strip() != "":
+            include_raw = str(inc_raw_q).strip().lower() not in ("0", "false", "no", "off")
+        else:
+            include_raw = not compact_q
+
+        known_tok = q_etag or hdr_etag
+        if known_tok:
+            fast_unchanged = await asyncio.to_thread(
+                try_fast_unchanged_snapshot,
+                manager,
+                sid,
+                conv_id=conv_id,
+                known_etag=known_tok,
+                include_raw=include_raw,
+            )
+            if fast_unchanged is not None:
+                if q_etag and q_etag == fast_unchanged.get("etag"):
+                    return JSONResponse(fast_unchanged, headers={"ETag": str(fast_unchanged.get("etag") or "")})
+                if hdr_etag and hdr_etag == fast_unchanged.get("etag"):
+                    hdrs_304: dict[str, str] = {"ETag": str(fast_unchanged.get("etag") or "")}
+                    if fast_unchanged.get("member"):
+                        hdrs_304["X-Swarm-Member"] = str(fast_unchanged["member"])
+                    return Response(status_code=304, headers=hdrs_304)
+
+        snap = await asyncio.to_thread(
+            build_observer_snapshot,
+            manager,
+            sid,
+            known_etag=known_tok,
+            include_raw=include_raw,
+        )
         member_obj = _resolve_member_for_conversation(snap, conv_id)
         snap["member"] = member_obj
         member_name = str(member_obj or "")
@@ -2178,14 +2624,19 @@ def create_a2a_app(
             unchanged_body: dict[str, Any] = {
                 "unchanged": True,
                 "swarm": sid,
+                "member": member_obj,
                 "etag": snap["etag"],
                 "primaryConversationId": snap.get("primaryConversationId") or conv_id,
+                "conversationIds": list(snap.get("conversationIds") or []),
             }
             if snap.get("coordinatorConversationId"):
                 unchanged_body["coordinatorConversationId"] = snap["coordinatorConversationId"]
-            return JSONResponse(unchanged_body)
+            return JSONResponse(unchanged_body, headers={"ETag": str(snap.get("etag") or "")})
         if hdr_etag and hdr_etag == snap.get("etag"):
-            return Response(status_code=304, headers={"ETag": str(snap.get("etag") or "")})
+            hdrs_304 = {"ETag": str(snap.get("etag") or "")}
+            if member_obj:
+                hdrs_304["X-Swarm-Member"] = str(member_obj)
+            return Response(status_code=304, headers=hdrs_304)
         return JSONResponse(snap, headers={"ETag": str(snap.get("etag") or "")})
 
     async def board_events(request: Request) -> Response:
@@ -2198,17 +2649,27 @@ def create_a2a_app(
         s_hint, c_hint, _ = _extract_scope_hints(request)
         if not s_hint and not c_hint:
             return JSONResponse({"error": "conversationId or swarm is required"}, status_code=400)
-        raw_since = request.query_params.get("since") or request.headers.get("last-event-id") or "0"
+        qp = request.query_params
+        raw_since = qp.get("since") or request.headers.get("last-event-id") or "0"
         try:
             since_seq = max(0, int(raw_since))
         except ValueError:
             since_seq = 0
+        compact_q = str(qp.get("compact") or "").strip().lower() in ("1", "true", "yes")
+        inc_raw_q = qp.get("include_raw")
+        if inc_raw_q is None:
+            inc_raw_q = qp.get("includeRaw")
+        if inc_raw_q is not None and str(inc_raw_q).strip() != "":
+            include_raw = str(inc_raw_q).strip().lower() not in ("0", "false", "no", "off")
+        else:
+            include_raw = not compact_q
         return StreamingResponse(
             _sse_board_events_stream(
                 manager,
                 swarm_id=s_hint,
                 conversation_id=c_hint,
                 since_seq=since_seq,
+                include_raw=include_raw,
             ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},

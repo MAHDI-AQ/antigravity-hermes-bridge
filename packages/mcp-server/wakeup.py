@@ -7,6 +7,7 @@ from collections import OrderedDict
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Awaitable, Callable
 
@@ -290,9 +291,10 @@ class MentionRouter:
         self._debounce_seconds = max(0.0, float(debounce_seconds))
 
         self._last_processed_seq: dict[str, int] = {}
-        self._last_file_sigs: dict[str, tuple[int, int] | None] = {}
-        self._last_view_sigs: dict[str, tuple[int, int] | None] = {}
+        self._last_file_sigs: dict[str, tuple[int, int, int] | None] = {}
+        self._last_view_sigs: dict[str, tuple[int, int, int] | None] = {}
         self._dispatched: OrderedDict[tuple[str, int, str], float] = OrderedDict()
+        self._pending_swarms_lock = threading.Lock()
         self._swarms_with_pending: set[str] = set()
         self._seeded = False
         self._watcher_task: asyncio.Task[None] | None = None
@@ -352,13 +354,13 @@ class MentionRouter:
             _, bfile, _ = board_mod.resolve_board_location(sid, state_dir=self._board.state_dir)
             try:
                 st = bfile.stat()
-                self._last_file_sigs[sid] = (st.st_mtime_ns, st.st_size)
+                self._last_file_sigs[sid] = (st.st_mtime_ns, st.st_size, int(getattr(st, "st_ino", 0)))
             except OSError:
                 self._last_file_sigs[sid] = None
             vfile = bfile.parent / "view.json"
             try:
                 vst = vfile.stat()
-                self._last_view_sigs[sid] = (vst.st_mtime_ns, vst.st_size)
+                self._last_view_sigs[sid] = (vst.st_mtime_ns, vst.st_size, int(getattr(vst, "st_ino", 0)))
             except OSError:
                 self._last_view_sigs[sid] = None
             board = self._board.read_board(sid)
@@ -366,7 +368,8 @@ class MentionRouter:
             self._last_processed_seq[sid] = max(self._last_processed_seq.get(sid, 0), head)
             pending_map = board.get("pendingMentions")
             if isinstance(pending_map, dict) and any(v for v in pending_map.values()):
-                self._swarms_with_pending.add(sid)
+                with self._pending_swarms_lock:
+                    self._swarms_with_pending.add(sid)
 
     def _emit_wake_if_needed(self, swarm_id: str, msg: dict[str, Any]) -> str | None:
         wake_kind = classify_wake_event(msg)
@@ -407,7 +410,8 @@ class MentionRouter:
                 if ok and d_target not in res["woken"]:
                     res["woken"].append(d_target)
             except Exception as exc:
-                store.append_swarm_log(
+                await asyncio.to_thread(
+                    store.append_swarm_log,
                     d_sid,
                     "wakeup",
                     {"event": "wake_dispatch_exception", "target": d_target, "error": str(exc)},
@@ -432,7 +436,7 @@ class MentionRouter:
             self._last_processed_seq[sid] = max(self._last_processed_seq.get(sid, 0), seq)
 
         wake_event = self._emit_wake_if_needed(sid, msg)
-        cur_board = board if isinstance(board, dict) else self._board.read_board(sid)
+        cur_board = board if isinstance(board, dict) else await asyncio.to_thread(self._board.read_board, sid)
         targets = resolve_worker_targets(msg, cur_board)
         if not targets:
             return {"wakeEvent": wake_event, "woken": [], "queued": []}
@@ -454,7 +458,8 @@ class MentionRouter:
 
             busy = bool(self._is_worker_busy and self._is_worker_busy(sid, target))
             if busy:
-                self._board.enqueue_pending_mention(
+                await asyncio.to_thread(
+                    self._board.enqueue_pending_mention,
                     target,
                     {
                         "seq": seq,
@@ -468,7 +473,8 @@ class MentionRouter:
                     },
                     swarm_id=sid,
                 )
-                self._swarms_with_pending.add(sid)
+                with self._pending_swarms_lock:
+                    self._swarms_with_pending.add(sid)
                 if seq > 0:
                     self._mark_dispatched(sid, seq, tlow)
                 queued.append(target)
@@ -506,7 +512,8 @@ class MentionRouter:
             except Exception:
                 pass
         if batch:
-            self._swarms_with_pending.add(swarm_id)
+            with self._pending_swarms_lock:
+                self._swarms_with_pending.add(swarm_id)
 
     async def _schedule_debounced_wake(self, swarm_id: str, target: str, msg: dict[str, Any]) -> None:
         key = (swarm_id, target.lower())
@@ -535,7 +542,7 @@ class MentionRouter:
                 return
             except Exception:
                 if batch and not dispatched:
-                    self._enqueue_batch_on_failure(swarm_id, target, batch)
+                    await asyncio.to_thread(self._enqueue_batch_on_failure, swarm_id, target, batch)
             finally:
                 if self._debounce_tasks.get(key) is asyncio.current_task():
                     self._debounce_tasks.pop(key, None)
@@ -551,35 +558,42 @@ class MentionRouter:
         if self._wake_worker is None:
             return False
 
-        board = self._board.read_board(swarm_id)
+        board = await asyncio.to_thread(self._board.read_board, swarm_id)
         if _is_member_killed(_find_member_record(board, target)):
-            self._board.drain_pending_mentions(target, swarm_id=swarm_id)
+            await asyncio.to_thread(self._board.drain_pending_mentions, target, swarm_id=swarm_id)
             return False
 
         # Re-check busy right before dispatch in case worker started between enqueue & flush.
         if self._is_worker_busy and self._is_worker_busy(swarm_id, target):
-            for m in _filter_unread_for_member(new_messages, board, target):
-                seq = int(m.get("seq") or 0)
-                self._board.enqueue_pending_mention(
-                    target,
-                    {
-                        "seq": seq,
-                        "sender": m.get("sender"),
-                        "channel": m.get("channel"),
-                        "type": m.get("type"),
-                        "summary": m.get("summary"),
-                        "details": m.get("details"),
-                        "files": list(m.get("files") or []),
-                        "createdAt": m.get("createdAt"),
-                    },
-                    swarm_id=swarm_id,
-                )
-                self._swarms_with_pending.add(swarm_id)
-                if seq > 0:
-                    self._mark_dispatched(swarm_id, seq, target.lower())
+            unread_new = _filter_unread_for_member(new_messages, board, target)
+            if unread_new:
+                def _enqueue_busy_sync() -> None:
+                    for m in unread_new:
+                        seq = int(m.get("seq") or 0)
+                        self._board.enqueue_pending_mention(
+                            target,
+                            {
+                                "seq": seq,
+                                "sender": m.get("sender"),
+                                "channel": m.get("channel"),
+                                "type": m.get("type"),
+                                "summary": m.get("summary"),
+                                "details": m.get("details"),
+                                "files": list(m.get("files") or []),
+                                "createdAt": m.get("createdAt"),
+                            },
+                            swarm_id=swarm_id,
+                        )
+                await asyncio.to_thread(_enqueue_busy_sync)
+                with self._pending_swarms_lock:
+                    self._swarms_with_pending.add(swarm_id)
+                for m in unread_new:
+                    seq = int(m.get("seq") or 0)
+                    if seq > 0:
+                        self._mark_dispatched(swarm_id, seq, target.lower())
             return False
 
-        pending = self._board.drain_pending_mentions(target, swarm_id=swarm_id)
+        pending = await asyncio.to_thread(self._board.drain_pending_mentions, target, swarm_id=swarm_id)
         combined: list[dict[str, Any]] = []
         seen_seqs: set[int] = set()
         for m in [*pending, *new_messages]:
@@ -602,16 +616,18 @@ class MentionRouter:
             self._enqueue_batch_on_failure(swarm_id, target, combined)
             raise
         except Exception as exc:
-            store.append_swarm_log(
+            await asyncio.to_thread(
+                store.append_swarm_log,
                 swarm_id,
                 "wakeup",
                 {"event": "wake_dispatch_error", "target": target, "seqs": seqs, "error": str(exc)},
                 state_dir=self._board.state_dir,
             )
-            self._enqueue_batch_on_failure(swarm_id, target, combined)
+            await asyncio.to_thread(self._enqueue_batch_on_failure, swarm_id, target, combined)
             return False
         if ok:
-            store.append_swarm_log(
+            await asyncio.to_thread(
+                store.append_swarm_log,
                 swarm_id,
                 "wakeup",
                 {"event": "wake_dispatch_ok", "target": target, "seqs": seqs},
@@ -625,29 +641,31 @@ class MentionRouter:
                     if seq > max_seq:
                         max_seq = seq
             if max_seq > 0:
-                self._board.mark_member_read(target, max_seq, swarm_id=swarm_id)
+                await asyncio.to_thread(self._board.mark_member_read, target, max_seq, swarm_id=swarm_id)
         else:
-            store.append_swarm_log(
+            await asyncio.to_thread(
+                store.append_swarm_log,
                 swarm_id,
                 "wakeup",
                 {"event": "wake_dispatch_failed", "target": target, "seqs": seqs},
                 state_dir=self._board.state_dir,
             )
             # Re-queue on failure so no mention is lost silently.
-            self._enqueue_batch_on_failure(swarm_id, target, combined)
+            await asyncio.to_thread(self._enqueue_batch_on_failure, swarm_id, target, combined)
         return ok
 
     async def _flush_pending_locked(self, sid: str, worker_name: str, *, board: dict[str, Any] | None = None) -> bool:
         if self._wake_worker is None:
             return False
         if self._is_worker_busy and self._is_worker_busy(sid, worker_name):
-            self._swarms_with_pending.add(sid)
+            with self._pending_swarms_lock:
+                self._swarms_with_pending.add(sid)
             return False
-        cur_board = board if isinstance(board, dict) else self._board.read_board(sid)
+        cur_board = board if isinstance(board, dict) else await asyncio.to_thread(self._board.read_board, sid)
         if _is_member_killed(_find_member_record(cur_board, worker_name)):
-            self._board.drain_pending_mentions(worker_name, swarm_id=sid)
+            await asyncio.to_thread(self._board.drain_pending_mentions, worker_name, swarm_id=sid)
             return False
-        pending = self._board.drain_pending_mentions(worker_name, swarm_id=sid)
+        pending = await asyncio.to_thread(self._board.drain_pending_mentions, worker_name, swarm_id=sid)
         if not pending:
             return False
         pending = _filter_unread_for_member(pending, cur_board, worker_name)
@@ -662,16 +680,18 @@ class MentionRouter:
             self._enqueue_batch_on_failure(sid, worker_name, pending)
             raise
         except Exception as exc:
-            store.append_swarm_log(
+            await asyncio.to_thread(
+                store.append_swarm_log,
                 sid,
                 "wakeup",
                 {"event": "wake_flush_error", "target": worker_name, "seqs": seqs, "error": str(exc)},
                 state_dir=self._board.state_dir,
             )
-            self._enqueue_batch_on_failure(sid, worker_name, pending)
+            await asyncio.to_thread(self._enqueue_batch_on_failure, sid, worker_name, pending)
             return False
         if ok:
-            store.append_swarm_log(
+            await asyncio.to_thread(
+                store.append_swarm_log,
                 sid,
                 "wakeup",
                 {"event": "wake_flush_ok", "target": worker_name, "seqs": seqs},
@@ -685,15 +705,16 @@ class MentionRouter:
                     if seq > max_seq:
                         max_seq = seq
             if max_seq > 0:
-                self._board.mark_member_read(worker_name, max_seq, swarm_id=sid)
+                await asyncio.to_thread(self._board.mark_member_read, worker_name, max_seq, swarm_id=sid)
         else:
-            store.append_swarm_log(
+            await asyncio.to_thread(
+                store.append_swarm_log,
                 sid,
                 "wakeup",
                 {"event": "wake_flush_failed", "target": worker_name, "seqs": seqs},
                 state_dir=self._board.state_dir,
             )
-            self._enqueue_batch_on_failure(sid, worker_name, pending)
+            await asyncio.to_thread(self._enqueue_batch_on_failure, sid, worker_name, pending)
         return ok
 
     async def flush_pending_for_worker(self, swarm_id: str, worker_name: str) -> bool:
@@ -701,8 +722,105 @@ class MentionRouter:
         sid = store.sanitize_swarm_id(swarm_id) or "default"
         return await self._flush_pending_locked(sid, worker_name)
 
+    def _scan_disk_sync(
+        self,
+        swarms_dir: Path,
+        known_sids: set[str],
+        prev_file_sigs: dict[str, tuple[int, int, int] | None],
+        prev_view_sigs: dict[str, tuple[int, int, int] | None],
+        pending_sids: set[str],
+    ) -> list[dict[str, Any]]:
+        """Run blocking directory scan, stat checks, board reads, and narrator read-cursor updates off the event loop."""
+        candidates = set(known_sids)
+        if swarms_dir.is_dir():
+            try:
+                for entry in swarms_dir.iterdir():
+                    if entry.is_dir():
+                        candidates.add(entry.name)
+            except OSError:
+                pass
+
+        scanned: list[dict[str, Any]] = []
+        for sid in sorted(candidates):
+            _, bfile, _ = board_mod.resolve_board_location(sid, state_dir=self._board.state_dir)
+            try:
+                st = bfile.stat()
+                sig: tuple[int, int, int] | None = (st.st_mtime_ns, st.st_size, int(getattr(st, "st_ino", 0)))
+            except OSError:
+                sig = None
+
+            prev_sig = prev_file_sigs.get(sid)
+            sig_changed = sig is not None and sig != prev_sig
+            vfile = bfile.parent / "view.json"
+            try:
+                vst = vfile.stat()
+                view_sig: tuple[int, int, int] | None = (vst.st_mtime_ns, vst.st_size, int(getattr(vst, "st_ino", 0)))
+            except OSError:
+                view_sig = None
+            prev_view_sig = prev_view_sigs.get(sid)
+            view_changed = view_sig is not None and view_sig != prev_view_sig
+
+            if not sig_changed and not view_changed and sid not in pending_sids:
+                continue
+
+            board = self._board.read_board(sid)
+            head_now = self._board.head_seq(board)
+            next_seq_before = int(board.get("nextSeq") or 1)
+            if view_changed and head_now > 0:
+                marked_any = False
+                for mname, mrec in (board.get("members") or {}).items():
+                    if not isinstance(mrec, dict) or _is_member_killed(mrec):
+                        continue
+                    mrole = str(mrec.get("role") or "").strip().lower()
+                    if mrole == models.Role.NARRATOR.value or mname.lower().startswith("narrator"):
+                        if int(mrec.get("lastReadSeq") or 0) < head_now:
+                            self._board.mark_member_read(mname, head_now, swarm_id=sid)
+                            marked_any = True
+                if marked_any:
+                    try:
+                        st_pre = bfile.stat()
+                        sig_pre: tuple[int, int, int] | None = (
+                            st_pre.st_mtime_ns,
+                            st_pre.st_size,
+                            int(getattr(st_pre, "st_ino", 0)),
+                        )
+                    except OSError:
+                        sig_pre = None
+                    board_after = self._board.read_board(sid)
+                    head_after = self._board.head_seq(board_after)
+                    next_seq_after = int(board_after.get("nextSeq") or 1)
+                    try:
+                        st_post = bfile.stat()
+                        sig_post: tuple[int, int, int] | None = (
+                            st_post.st_mtime_ns,
+                            st_post.st_size,
+                            int(getattr(st_post, "st_ino", 0)),
+                        )
+                    except OSError:
+                        sig_post = None
+                    board_advanced = head_after > head_now or next_seq_after > next_seq_before
+                    if board_advanced:
+                        board = board_after
+                        head_now = head_after
+                        sig_changed = True
+                    else:
+                        board = board_after
+                    if sig_pre is not None and sig_pre == sig_post:
+                        sig = sig_post
+
+            scanned.append({
+                "sid": sid,
+                "sig": sig,
+                "sigChanged": sig_changed,
+                "viewSig": view_sig,
+                "viewChanged": view_changed,
+                "board": board,
+                "head": head_now,
+            })
+        return scanned
+
     async def poll_disk_once(self, swarm_ids: list[str] | None = None) -> list[dict[str, Any]]:
-        """Check `board.json` mtime/size for changes, route unseen messages, and replay orphaned mentions."""
+        """Check `board.json` mtime/size for changes off-loop, route unseen messages, and replay orphaned mentions."""
         results: list[dict[str, Any]] = []
         direct_dispatches: list[tuple[str, str, list[dict[str, Any]]]] = []
         pending_flushes: list[tuple[str, str, dict[str, Any]]] = []
@@ -710,102 +828,88 @@ class MentionRouter:
 
         async with self._ensure_lock():
             swarms_dir = self._board.state_dir / "swarms"
-            candidates: set[str] = set(swarm_ids or [])
-            candidates.update(self._last_processed_seq.keys())
-            candidates.update(self._swarms_with_pending)
-            if swarms_dir.is_dir():
-                try:
-                    for entry in swarms_dir.iterdir():
-                        if entry.is_dir():
-                            candidates.add(entry.name)
-                except OSError:
-                    pass
+            known_sids: set[str] = set(swarm_ids or [])
+            known_sids.update(self._last_processed_seq.keys())
+            with self._pending_swarms_lock:
+                pending_sids = set(self._swarms_with_pending)
+            known_sids.update(pending_sids)
+            prev_file_sigs = dict(self._last_file_sigs)
+            prev_view_sigs = dict(self._last_view_sigs)
 
-            for sid in sorted(candidates):
-                _, bfile, _ = board_mod.resolve_board_location(sid, state_dir=self._board.state_dir)
-                try:
-                    st = bfile.stat()
-                    sig: tuple[int, int] | None = (st.st_mtime_ns, st.st_size)
-                except OSError:
-                    sig = None
+        scanned = await asyncio.to_thread(
+            self._scan_disk_sync,
+            swarms_dir,
+            known_sids,
+            prev_file_sigs,
+            prev_view_sigs,
+            pending_sids,
+        )
 
-                prev_sig = self._last_file_sigs.get(sid)
-                sig_changed = sig is not None and sig != prev_sig
-                vfile = bfile.parent / "view.json"
-                try:
-                    vst = vfile.stat()
-                    view_sig: tuple[int, int] | None = (vst.st_mtime_ns, vst.st_size)
-                except OSError:
-                    view_sig = None
-                prev_view_sig = self._last_view_sigs.get(sid)
-                view_changed = view_sig is not None and view_sig != prev_view_sig
+        if scanned:
+            async with self._ensure_lock():
+                for item in scanned:
+                    sid = str(item["sid"])
+                    sig = item["sig"]
+                    sig_changed = bool(item["sigChanged"])
+                    view_sig = item["viewSig"]
+                    view_changed = bool(item["viewChanged"])
+                    board = item["board"]
+                    head_now = int(item["head"] or 0)
 
-                if not sig_changed and not view_changed and sid not in self._swarms_with_pending:
-                    continue
-                if sig is not None:
-                    self._last_file_sigs[sid] = sig
-                if view_sig is not None:
-                    self._last_view_sigs[sid] = view_sig
+                    if sig is not None:
+                        self._last_file_sigs[sid] = sig
+                    if view_sig is not None:
+                        self._last_view_sigs[sid] = view_sig
 
-                board = self._board.read_board(sid)
-                if view_changed:
-                    head_now = self._board.head_seq(board)
-                    if head_now > 0:
-                        for mname, mrec in (board.get("members") or {}).items():
-                            if not isinstance(mrec, dict) or _is_member_killed(mrec):
-                                continue
-                            mrole = str(mrec.get("role") or "").strip().lower()
-                            if mrole == models.Role.NARRATOR.value or mname.lower().startswith("narrator"):
-                                if int(mrec.get("lastReadSeq") or 0) < head_now:
-                                    self._board.mark_member_read(mname, head_now, swarm_id=sid)
-                    if self._emit_event is not None:
+                    if view_changed and self._emit_event is not None:
                         self._emit_event(
                             sid,
                             "board_update",
                             {"swarmId": sid, "head": head_now, "viewUpdated": True},
                         )
 
-                if sig_changed:
-                    last_seq = self._last_processed_seq.get(sid, 0)
-                    unseen = [
-                        m for m in (board.get("messages") or [])
-                        if isinstance(m, dict) and int(m.get("seq") or 0) > last_seq
-                    ]
-                    unseen.sort(key=lambda m: int(m.get("seq") or 0))
-                    if unseen:
-                        if self._emit_event is not None:
-                            self._emit_event(
-                                sid,
-                                "board_update",
-                                {"swarmId": sid, "head": self._board.head_seq(board)},
-                            )
-                        for msg in unseen:
-                            res = await self._process_message_locked(
-                                sid,
-                                msg,
-                                board=board,
-                                _defer_direct=direct_dispatches,
-                            )
-                            results.append({"swarmId": sid, "seq": msg.get("seq"), **res})
+                    if sig_changed:
+                        last_seq = self._last_processed_seq.get(sid, 0)
+                        unseen = [
+                            m for m in (board.get("messages") or [])
+                            if isinstance(m, dict) and int(m.get("seq") or 0) > last_seq
+                        ]
+                        unseen.sort(key=lambda m: int(m.get("seq") or 0))
+                        if unseen:
+                            if self._emit_event is not None:
+                                self._emit_event(
+                                    sid,
+                                    "board_update",
+                                    {"swarmId": sid, "head": head_now},
+                                )
+                            for msg in unseen:
+                                res = await self._process_message_locked(
+                                    sid,
+                                    msg,
+                                    board=board,
+                                    _defer_direct=direct_dispatches,
+                                )
+                                results.append({"swarmId": sid, "seq": msg.get("seq"), **res})
 
-                # Close TOCTOU race between enqueue_pending_mention and turn completion:
-                # replay any queued mentions for idle, non-killed workers.
-                pending_map = board.get("pendingMentions") if isinstance(board.get("pendingMentions"), dict) else {}
-                non_empty_targets = [
-                    str(wkey) for wkey, items in pending_map.items()
-                    if isinstance(items, list) and len(items) > 0
-                ]
-                if not non_empty_targets:
-                    self._swarms_with_pending.discard(sid)
-                elif self._wake_worker is not None:
-                    still_busy = False
-                    for wkey in non_empty_targets:
-                        if self._is_worker_busy and self._is_worker_busy(sid, wkey):
-                            still_busy = True
-                            continue
-                        pending_flushes.append((sid, wkey, board))
-                    if not still_busy:
-                        check_empty_swarms.append(sid)
+                    # Close TOCTOU race between enqueue_pending_mention and turn completion:
+                    # replay any queued mentions for idle, non-killed workers.
+                    pending_map = board.get("pendingMentions") if isinstance(board.get("pendingMentions"), dict) else {}
+                    non_empty_targets = [
+                        str(wkey) for wkey, items in pending_map.items()
+                        if isinstance(items, list) and len(items) > 0
+                    ]
+                    if not non_empty_targets:
+                        with self._pending_swarms_lock:
+                            self._swarms_with_pending.discard(sid)
+                    elif self._wake_worker is not None:
+                        still_busy = False
+                        for wkey in non_empty_targets:
+                            if self._is_worker_busy and self._is_worker_busy(sid, wkey):
+                                still_busy = True
+                                continue
+                            pending_flushes.append((sid, wkey, board))
+                        if not still_busy:
+                            check_empty_swarms.append(sid)
 
         for d_sid, d_target, d_msgs in direct_dispatches:
             try:
@@ -819,10 +923,11 @@ class MentionRouter:
                 pass
         for sid in check_empty_swarms:
             try:
-                refreshed = self._board.read_board(sid)
+                refreshed = await asyncio.to_thread(self._board.read_board, sid)
                 ref_pending = refreshed.get("pendingMentions") if isinstance(refreshed.get("pendingMentions"), dict) else {}
                 if not any(isinstance(v, list) and len(v) > 0 for v in ref_pending.values()):
-                    self._swarms_with_pending.discard(sid)
+                    with self._pending_swarms_lock:
+                        self._swarms_with_pending.discard(sid)
             except Exception:
                 pass
         return results
@@ -901,6 +1006,6 @@ class MentionRouter:
                 task.cancel()
         for (sid, target_key), pending_batch in list(self._debounce_buffers.items()):
             if pending_batch:
-                self._enqueue_batch_on_failure(sid, target_key, pending_batch)
+                await asyncio.to_thread(self._enqueue_batch_on_failure, sid, target_key, pending_batch)
         self._debounce_tasks.clear()
         self._debounce_buffers.clear()

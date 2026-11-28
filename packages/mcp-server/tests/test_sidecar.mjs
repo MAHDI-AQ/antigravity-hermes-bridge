@@ -911,7 +911,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     );
     const parsedEmpty = await parseSseResponse(emptyRes);
     assert.equal(parsedEmpty.event, 'empty');
-    assert.equal(parsedEmpty.retry, 3000);
+    assert.equal(parsedEmpty.retry, 10000);
     assert.equal(parsedEmpty.id, '0');
     assert.deepEqual(parsedEmpty.data, { conversationId: null, swarm: null, member: null });
     assert.equal('swarms' in parsedEmpty.data, false);
@@ -939,7 +939,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     await fetch(`${sidecarProc.baseUrl}/api/events?swarm=foreign&workspace=C%3A%2Fevil`),
   );
   assert.equal(snapParsed.event, 'snapshot');
-  assert.equal(snapParsed.retry, 1000);
+  assert.equal(snapParsed.retry, 5000);
   assert.equal(snapParsed.id, '12');
   assert.equal(snapParsed.data.online, true);
   assert.equal(snapParsed.data.swarm, 'alpha');
@@ -957,7 +957,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     await fetch(`${sidecarProc.baseUrl}/api/events?etag=ev-v1`),
   );
   assert.equal(unchanged304.event, 'unchanged');
-  assert.equal(unchanged304.retry, 1000);
+  assert.equal(unchanged304.retry, 5000);
   assert.equal(unchanged304.data.unchanged, true);
   assert.equal(unchanged304.data.swarm, 'alpha');
   assert.equal('swarms' in unchanged304.data, false);
@@ -969,7 +969,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     await fetch(`${sidecarProc.baseUrl}/api/events?etag=ev-v1`),
   );
   assert.equal(unchangedJson.event, 'unchanged');
-  assert.equal(unchangedJson.retry, 1000);
+  assert.equal(unchangedJson.retry, 5000);
   assert.equal(unchangedJson.data.unchanged, true);
   assert.equal('swarms' in unchangedJson.data, false);
 
@@ -979,7 +979,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     await fetch(`${sidecarProc.baseUrl}/api/events?etag=ev-v1`),
   );
   assert.equal(updateParsed.event, 'update');
-  assert.equal(updateParsed.retry, 1000);
+  assert.equal(updateParsed.retry, 5000);
   assert.equal(updateParsed.id, '15');
   assert.equal(updateParsed.data.etag, 'ev-v2');
   assert.equal(updateParsed.data.head, 15);
@@ -991,7 +991,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     await fetch(`${sidecarProc.baseUrl}/api/events`),
   );
   assert.equal(mismatchParsed.event, 'empty');
-  assert.equal(mismatchParsed.retry, 3000);
+  assert.equal(mismatchParsed.retry, 10000);
   assert.equal(mismatchParsed.id, '0');
   assert.equal(mismatchParsed.data.swarm, null);
   assert.equal('swarms' in mismatchParsed.data, false);
@@ -1002,7 +1002,7 @@ test('GET /api/events returns strictly 1:1 conversationId-scoped buffered SSE re
     await fetch(`${sidecarProc.baseUrl}/api/events?conversationId=conv-other`),
   );
   assert.equal(foreignConvParsed.event, 'empty');
-  assert.equal(foreignConvParsed.retry, 3000);
+  assert.equal(foreignConvParsed.retry, 10000);
   assert.equal(foreignConvParsed.data.conversationId, 'conv-other');
   assert.equal(foreignConvParsed.data.swarm, null);
   assert.equal('swarms' in foreignConvParsed.data, false);
@@ -4177,4 +4177,622 @@ test('wakeup_bridge regressions: waitSince == 0 ignores lastReadSeq suppression,
     infoLogs.some((l) => l.includes('dispatched coordinator wakeup') && l.includes('sw-reg')),
     `Expected wakeup dispatch info log, got: ${JSON.stringify(infoLogs)}`,
   );
+});
+
+test('P0/P1 sidecar freeze & deadlock regressions: non-deadlocking empty snapshot, compact ETag reconcile, compact cachedMeta, member preserved on unchanged/304, in-flight coalescing, readHtmlPage try/catch, and zero Atomics.wait', async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'hermes-freeze-fix-'));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+
+  // 0. Static check: zero Atomics.wait in wakeup_bridge.mjs
+  const wakeSrc = readFileSync(WAKEUP_BRIDGE_PATH, 'utf-8');
+  assert.equal(/Atomics\.wait/.test(wakeSrc), false, 'wakeup_bridge.mjs must not block main thread with Atomics.wait');
+
+  // 1. Compact metadata stripping (extractCompactSwarmMeta drops raw, raw_blob, messages, tasks, members)
+  const bulkyDash = {
+    swarmId: 'sw-compact-1',
+    primaryConversationId: 'conv-compact-p',
+    coordinatorConversationId: 'conv-compact-c',
+    etag: 'etag-c1',
+    head: 42,
+    wakeSeq: 7,
+    updatedAt: '2026-11-28T16:00:00Z',
+    activeWorkerCount: 1,
+    raw: { huge: 'A'.repeat(200_000) },
+    raw_blob: 'B'.repeat(200_000),
+    messages: [{ seq: 42, summary: 'big msg' }],
+    tasks: [{ taskId: 't-1', state: 'TASK_STATE_WORKING', artifacts: ['C'.repeat(50_000)] }],
+    activeTasks: [{ taskId: 't-1', state: 'TASK_STATE_WORKING' }],
+    members: [{ name: 'coordinator', role: 'coordinator', waiting: true, waitSince: 40 }],
+  };
+  const compactMeta = wakeup.extractCompactSwarmMeta({}, bulkyDash);
+  assert.equal(compactMeta.swarmId, 'sw-compact-1');
+  assert.equal(compactMeta.etag, 'etag-c1');
+  assert.equal(compactMeta.head, 42);
+  assert.equal(compactMeta.wakeSeq, 7);
+  assert.equal(compactMeta.coordinatorWaiting, true);
+  assert.equal(compactMeta.waitSince, 40);
+  assert.equal('raw' in compactMeta, false);
+  assert.equal('raw_blob' in compactMeta, false);
+  assert.equal('messages' in compactMeta, false);
+  assert.equal('tasks' in compactMeta, false);
+  assert.equal('activeTasks' in compactMeta, false);
+  assert.equal('members' in compactMeta, false);
+  assert.ok(JSON.stringify(compactMeta).length < 1024, 'Compact meta must stay tiny (<1KB)');
+
+  // 2. Non-deadlocking handleSseEvent empty snapshot + compact ETag reconcile + 0 /board fetches when SSE healthy & summary unchanged
+  const appData = join(tempDir, 'appData');
+  mkdirSync(join(appData, 'brain', 'conv-p0-prim'), { recursive: true });
+  mkdirSync(join(appData, 'brain', 'conv-p0-coord'), { recursive: true });
+
+  const boardRequests = [];
+  const openSseRes = [];
+  let swarmHead = 1;
+  let swarmEtag = 'e-p0-1';
+  let boardMessages = [
+    {
+      seq: 1,
+      id: 'm-1',
+      sender: 'coder',
+      senderRole: 'worker',
+      kind: 'handoff',
+      status: 'open',
+      mentions: ['coordinator'],
+      summary: '@coordinator [done] initial batch',
+    },
+  ];
+
+  const mockSrv = createServer((req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    if (reqUrl.pathname === '/internal/wake/events') {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8' });
+      res.write(`event: ready\ndata: ${JSON.stringify({ ok: true, swarms: [] })}\n\n`);
+      openSseRes.push(res);
+      return;
+    }
+    if (reqUrl.pathname === '/internal/wake/swarms') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        swarms: [
+          {
+            swarmId: 'sw-p0',
+            primaryConversationId: 'conv-p0-prim',
+            coordinatorConversationId: 'conv-p0-coord',
+            head: swarmHead,
+            updatedAt: `2026-11-28T16:00:0${swarmHead}Z`,
+            activeWorkerCount: 0,
+            etag: swarmEtag,
+          },
+        ],
+      }));
+      return;
+    }
+    if (reqUrl.pathname === '/board') {
+      boardRequests.push({
+        compact: reqUrl.searchParams.get('compact'),
+        etag: reqUrl.searchParams.get('etag') || '',
+        ifNoneMatch: req.headers['if-none-match'] || '',
+      });
+      const reqEtag = reqUrl.searchParams.get('etag') || req.headers['if-none-match'] || '';
+      if (reqEtag && reqEtag === swarmEtag) {
+        res.writeHead(304, { ETag: swarmEtag });
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: swarmEtag });
+      res.end(JSON.stringify({
+        swarmId: 'sw-p0',
+        primaryConversationId: 'conv-p0-prim',
+        coordinatorConversationId: 'conv-p0-coord',
+        etag: swarmEtag,
+        messages: boardMessages,
+        activeTasks: [],
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end();
+  });
+  const mockPort = await listenServer(mockSrv);
+  t.after(async () => {
+    for (const r of openSseRes) {
+      try { r.end(); } catch {}
+    }
+    await closeServer(mockSrv);
+  });
+
+  const wakes = [];
+  const bridge = wakeup.createWakeupBridge({
+    sendMessage: async (convId, message) => {
+      wakes.push({ convId, message });
+    },
+    hostLocalMode: true,
+    config: {
+      stateDir: tempDir,
+      fallbackBoardUrl: `http://127.0.0.1:${mockPort}`,
+    },
+    appDataDirs: [appData],
+    resolveAllUpstreams: () => [`http://127.0.0.1:${mockPort}`],
+    cursorStore: wakeup.createCursorStore(join(tempDir, 'p0-cursors.json')),
+    env: { ANTIGRAVITY_EXECUTABLE_DATA_DIR: appData },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+  });
+  t.after(() => bridge.stop());
+
+  // First reconcile connects SSE and fetches /board?compact=1
+  const r1 = await bridge.reconcileOnce();
+  assert.equal(r1.reconciled, true);
+  assert.equal(r1.wakeups, 1);
+  assert.equal(boardRequests.length, 1);
+  assert.equal(boardRequests[0].compact, '1', 'Reconcile must request compact=1');
+
+  // Wait briefly for SSE ready frame to mark SSE connected/healthy
+  await waitFor(() => openSseRes.length >= 1, 2000);
+  await new Promise((r) => setTimeout(r, 40));
+
+  // Unchanged summary with healthy SSE -> ZERO /board fetches!
+  const r2 = await bridge.reconcileOnce();
+  assert.equal(r2.reconciled, true);
+  assert.equal(r2.wakeups, 0);
+  assert.equal(boardRequests.length, 1, 'Healthy SSE + unchanged /internal/wake/swarms must perform 0 /board fetches');
+
+  // Empty snapshot frame in handleSseEvent MUST NOT deadlock eventLock (must resolve promptly and trigger deferred reconcile)
+  const beforeCount = boardRequests.length;
+  const emptySnapRes = await Promise.race([
+    bridge.handleSseEvent({ event: 'snapshot', data: JSON.stringify({ swarmId: 'sw-p0' }) }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('handleSseEvent deadlocked on empty snapshot')), 2000)),
+  ]);
+  assert.equal(emptySnapRes, 0);
+  await waitFor(() => boardRequests.length > beforeCount, 2000);
+  assert.equal(boardRequests.at(-1).compact, '1');
+
+  // Subsequent handleSseEvent must still acquire eventLock without hanging
+  const afterRes = await Promise.race([
+    bridge.handleSseEvent({ event: 'keepalive', data: '{}' }),
+    new Promise((_, rej) => setTimeout(() => rej(new Error('eventLock remained wedged')), 2000)),
+  ]);
+  assert.equal(afterRes, 0);
+
+  // Single-conversation mode passes etag + If-None-Match + compact=1 and handles 304 cleanly
+  const singleReqs = [];
+  const singleBridge = wakeup.createWakeupBridge({
+    sendMessage: async () => {},
+    hostLocalMode: false,
+    config: {
+      conversationId: 'conv-p0-prim',
+      fallbackBoardUrl: `http://127.0.0.1:${mockPort}`,
+    },
+    cursorStore: wakeup.createCursorStore(join(tempDir, 'single-cursors.json')),
+    fetchImpl: async (url, init) => {
+      const u = new URL(String(url));
+      if (u.pathname === '/board/events') {
+        return new Response('', { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      singleReqs.push({
+        compact: u.searchParams.get('compact'),
+        etag: u.searchParams.get('etag') || '',
+        ifNoneMatch: init?.headers?.['If-None-Match'] || '',
+      });
+      if (u.searchParams.get('etag') === 'etag-single-1') {
+        return new Response(null, { status: 304, headers: { ETag: 'etag-single-1' } });
+      }
+      return new Response(JSON.stringify({
+        swarmId: 'sw-single',
+        primaryConversationId: 'conv-p0-prim',
+        etag: 'etag-single-1',
+        messages: [],
+      }), { status: 200, headers: { 'Content-Type': 'application/json', ETag: 'etag-single-1' } });
+    },
+    logger: { info: () => {}, warn: () => {}, error: () => {} },
+  });
+  t.after(() => singleBridge.stop());
+  await singleBridge.reconcileOnce();
+  await singleBridge.reconcileOnce();
+  assert.equal(singleReqs.length, 2);
+  assert.equal(singleReqs[0].compact, '1');
+  assert.equal(singleReqs[1].compact, '1');
+  assert.equal(singleReqs[1].etag, 'etag-single-1');
+  assert.equal(singleReqs[1].ifNoneMatch, 'etag-single-1');
+
+  // 3. consumeSseStream invokes onAbort before cancelling reader on idle timeout / buffer cap
+  let abortCalled = 0;
+  const hangingStream = new ReadableStream({
+    start() {},
+  });
+  await assert.rejects(
+    () => wakeup.consumeSseStream(hangingStream, async () => {}, undefined, {
+      idleTimeoutMs: 40,
+      onAbort: () => { abortCalled += 1; },
+    }),
+    /idle timeout/i,
+  );
+  assert.ok(abortCalled >= 1, 'consumeSseStream must invoke onAbort on idle timeout');
+
+  // 4. main.mjs: member preserved on unchanged:true & 304, raw stripped from lastGoodSwarmByConv, in-flight coalescing, readHtmlPage 500 guard
+  const mainCfg = sidecar.createSidecarConfig({
+    HERMES_A2A_STATE_DIR: tempDir,
+    HERMES_A2A_BOARD_URL: 'http://127.0.0.1:19988',
+    HERMES_A2A_HTTP_TOKEN: 'tok-coalesce',
+  });
+
+  // 4a. Member preserved across unchanged:true and HTTP 304, and raw stripped from lastGoodSwarmByConv on 503
+  const memConv = 'conv-member-preserve';
+  const primeSnap = await sidecar.handleGetSwarm(
+    { conversationId: memConv },
+    mainCfg,
+    {},
+    async () => new Response(JSON.stringify({
+      swarm: 'sw-mem',
+      primaryConversationId: memConv,
+      member: 'coordinator',
+      etag: 'e-mem-1',
+      raw: { hugeBlob: 'Z'.repeat(50_000) },
+      raw_blob: 'Y'.repeat(50_000),
+      members: [{ name: 'coordinator', role: 'coordinator', status: 'waiting' }],
+      messages: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json', ETag: 'e-mem-1' } }),
+  );
+  assert.equal(primeSnap.member, 'coordinator');
+
+  const jsonUnchangedNoMember = await sidecar.handleGetSwarm(
+    { conversationId: memConv, etag: 'e-mem-1' },
+    mainCfg,
+    {},
+    async () => new Response(JSON.stringify({
+      unchanged: true,
+      swarm: 'sw-mem',
+      primaryConversationId: memConv,
+      etag: 'e-mem-1',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  );
+  assert.equal(jsonUnchangedNoMember.unchanged, true);
+  assert.equal(jsonUnchangedNoMember.member, 'coordinator', 'unchanged:true must preserve cached member');
+
+  const http304NoMember = await sidecar.handleGetSwarm(
+    { conversationId: memConv, etag: 'e-mem-1' },
+    mainCfg,
+    {},
+    async () => new Response(null, { status: 304, headers: { ETag: 'e-mem-1' } }),
+  );
+  assert.equal(http304NoMember.unchanged, true);
+  assert.equal(http304NoMember.member, 'coordinator', 'HTTP 304 must preserve cached member');
+
+  const origWarn = console.warn;
+  const capturedWarns = [];
+  console.warn = (...args) => capturedWarns.push(args.map(String).join(' '));
+  try {
+    const fallback503 = await sidecar.handleGetSwarm(
+      { conversationId: memConv },
+      mainCfg,
+      {},
+      async () => new Response('Busy', { status: 503 }),
+    );
+    assert.equal(fallback503.swarm, 'sw-mem');
+    assert.equal('raw' in fallback503, false, 'lastGoodSwarmByConv must strip raw');
+    assert.equal('raw_blob' in fallback503, false, 'lastGoodSwarmByConv must strip raw_blob');
+
+    // Throttled /board/frame 404 warnings (5 identical 404s -> 1 warning)
+    const fakeResp = class {
+      constructor(body, init) {
+        this.body = body;
+        this.status = init.status;
+        this.contentType = init.contentType;
+      }
+    };
+    const frameWarnsBefore = capturedWarns.filter((w) => w.includes('/board/frame')).length;
+    for (let i = 0; i < 5; i += 1) {
+      const fRes = await sidecar.handleGetFrame(
+        { conversationId: memConv, path: 'shots/missing.png' },
+        mainCfg,
+        {},
+        fakeResp,
+        async () => new Response('Not found', { status: 404 }),
+      );
+      assert.equal(fRes.status, 404);
+    }
+    const frameWarnsAfter = capturedWarns.filter((w) => w.includes('/board/frame')).length;
+    assert.equal(frameWarnsAfter - frameWarnsBefore, 1, 'Repeated /board/frame 404 warnings must be throttled');
+  } finally {
+    console.warn = origWarn;
+  }
+
+  // 4b. In-flight coalescing: 5 overlapping handleGetSwarm calls issue 1 upstream fetch
+  let upstreamCalls = 0;
+  let releaseUpstream = null;
+  const upstreamGate = new Promise((r) => { releaseUpstream = r; });
+  const coalConv = 'conv-coalesce-1';
+  const slowFetch = async () => {
+    upstreamCalls += 1;
+    await upstreamGate;
+    return new Response(JSON.stringify({
+      swarm: 'sw-coal',
+      primaryConversationId: coalConv,
+      member: 'coder',
+      etag: 'e-coal',
+      members: [],
+      messages: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json', ETag: 'e-coal' } });
+  };
+  const pending5 = Array.from({ length: 5 }, () =>
+    sidecar.handleGetSwarm({ conversationId: coalConv, etag: 'e-0' }, mainCfg, {}, slowFetch),
+  );
+  releaseUpstream();
+  const results5 = await Promise.all(pending5);
+  assert.equal(upstreamCalls, 1, `Expected 1 coalesced upstream fetch, got ${upstreamCalls}`);
+  for (const r of results5) {
+    assert.equal(r.swarm, 'sw-coal');
+    assert.equal(r.member, 'coder');
+  }
+
+  // 4c. readHtmlPage catches local readFileSync errors (e.g. index.html is a directory) and returns 500 instead of throwing
+  const badUiDir = join(tempDir, 'bad_ui');
+  mkdirSync(join(badUiDir, 'index.html'), { recursive: true });
+  const htmlErr = await sidecar.readHtmlPage({ ...mainCfg, uiDir: badUiDir });
+  assert.equal(htmlErr.status, 500);
+  assert.match(htmlErr.body, /Hermes Swarm UI error/);
+});
+
+test('H3 & M5 regressions: 3rd/worker conversationId preserved across unchanged/304 and bridge.stop() during off-lock fetch prevents trailing sendMessage', async (t) => {
+  const tempDir = mkdtempSync(join(tmpdir(), 'hermes-h3-m5-'));
+  t.after(() => rmSync(tempDir, { recursive: true, force: true }));
+
+  const mainCfg = sidecar.createSidecarConfig({
+    HERMES_A2A_STATE_DIR: tempDir,
+    HERMES_A2A_BOARD_URL: 'http://127.0.0.1:19989',
+    HERMES_A2A_HTTP_TOKEN: 'tok-h3-m5',
+  });
+
+  // --- H3: 3rd/worker conversationId preserved across fast-path unchanged:true & HTTP 304 ---
+  const primConv = 'conv-h3-primary';
+  const coordConv = 'conv-h3-coord';
+  const workerConv = 'conv-h3-worker3';
+  const allConvs = [primConv, coordConv, workerConv];
+
+  const primeWorker = await sidecar.handleGetSwarm(
+    { conversationId: workerConv },
+    mainCfg,
+    {},
+    async () => new Response(JSON.stringify({
+      swarm: 'sw-h3',
+      primaryConversationId: primConv,
+      coordinatorConversationId: coordConv,
+      conversationIds: allConvs,
+      member: 'worker-3',
+      etag: 'sw-h3|worker-3|v1',
+      members: [{ name: 'worker-3', role: 'worker', status: 'working', conversationId: workerConv }],
+      messages: [],
+    }), { status: 200, headers: { 'Content-Type': 'application/json', ETag: 'sw-h3|worker-3|v1' } }),
+  );
+  assert.equal(primeWorker.swarm, 'sw-h3');
+  assert.equal(primeWorker.member, 'worker-3');
+  assert.deepEqual(primeWorker.conversationIds, allConvs);
+
+  // Fast-path JSON { unchanged: true } omitting conversationIds & member must NOT fail scope check or wipe caches
+  const fastUnchanged = await sidecar.handleGetSwarm(
+    { conversationId: workerConv, etag: 'sw-h3|worker-3|v1' },
+    mainCfg,
+    {},
+    async () => new Response(JSON.stringify({
+      unchanged: true,
+      swarm: 'sw-h3',
+      etag: 'sw-h3|worker-3|v1',
+      primaryConversationId: primConv,
+      coordinatorConversationId: coordConv,
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  );
+  assert.equal(fastUnchanged.unchanged, true);
+  assert.equal(fastUnchanged.swarm, 'sw-h3');
+  assert.equal(fastUnchanged.member, 'worker-3');
+  assert.equal(Array.isArray(fastUnchanged.conversationIds), true);
+  for (const cid of allConvs) {
+    assert.equal(fastUnchanged.conversationIds.includes(cid), true, `Expected ${cid} in restored conversationIds`);
+  }
+  assert.equal(sidecar.isSwarmScopedToRequest(fastUnchanged, { conversationId: workerConv }), true);
+
+  // HTTP 304 must also restore conversationIds alongside member
+  const res304 = await sidecar.handleGetSwarm(
+    { conversationId: workerConv, etag: 'sw-h3|worker-3|v1' },
+    mainCfg,
+    {},
+    async () => new Response(null, { status: 304, headers: { ETag: 'sw-h3|worker-3|v1' } }),
+  );
+  assert.equal(res304.unchanged, true);
+  assert.equal(res304.swarm, 'sw-h3');
+  assert.equal(res304.member, 'worker-3');
+  assert.equal(Array.isArray(res304.conversationIds), true);
+  assert.equal(res304.conversationIds.includes(workerConv), true);
+  assert.equal(sidecar.isSwarmScopedToRequest(res304, { conversationId: workerConv }), true);
+
+  // Cold 4th worker conv with explicit conversationIds on unchanged:true passes scope validation directly
+  const coldWorkerConv = 'conv-h3-worker4-cold';
+  const coldUnchanged = await sidecar.handleGetSwarm(
+    { conversationId: coldWorkerConv, etag: 'sw-h3|worker-4|v1' },
+    mainCfg,
+    {},
+    async () => new Response(JSON.stringify({
+      unchanged: true,
+      swarm: 'sw-h3',
+      etag: 'sw-h3|worker-4|v1',
+      primaryConversationId: primConv,
+      coordinatorConversationId: coordConv,
+      conversationIds: [...allConvs, coldWorkerConv],
+      member: 'worker-4',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  );
+  assert.equal(coldUnchanged.unchanged, true);
+  assert.equal(coldUnchanged.swarm, 'sw-h3');
+  assert.equal(coldUnchanged.member, 'worker-4');
+  assert.equal(coldUnchanged.conversationIds.includes(coldWorkerConv), true);
+  assert.equal(sidecar.isSwarmScopedToRequest(coldUnchanged, { conversationId: coldWorkerConv }), true);
+
+  // Negative security check: explicit conversationIds excluding workerConv or foreign primary must still be rejected
+  const foreignSameName = await sidecar.handleGetSwarm(
+    { conversationId: workerConv, etag: 'sw-h3|worker-3|v1' },
+    mainCfg,
+    {},
+    async () => new Response(JSON.stringify({
+      unchanged: true,
+      swarm: 'sw-h3',
+      etag: 'sw-h3|worker-3|v1',
+      primaryConversationId: 'conv-h3-foreign',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+  );
+  assert.equal(foreignSameName.swarm, null, 'Foreign primaryConversationId must be rejected even with same swarm name');
+
+  // --- M5: bridge.stop() during off-lock HTTP fetches must never dispatch sendMessage() ---
+  const appData = join(tempDir, 'appData-m5');
+  mkdirSync(join(appData, 'brain', 'conv-m5-prim'), { recursive: true });
+  mkdirSync(join(appData, 'brain', 'conv-m5-coord'), { recursive: true });
+
+  const makeGate = () => {
+    let enteredResolve;
+    let releaseResolve;
+    const entered = new Promise((r) => { enteredResolve = r; });
+    const release = new Promise((r) => { releaseResolve = r; });
+    return { entered, enteredResolve, release, releaseResolve };
+  };
+
+  // M5 Case 1: coordinator_wake Step 3 off-lock fetchFreshBoardForSuppression
+  {
+    const gate = makeGate();
+    const sent = [];
+    const bridge = wakeup.createWakeupBridge({
+      sendMessage: async (convId, message) => { sent.push({ convId, message }); },
+      hostLocalMode: true,
+      config: { fallbackBoardUrl: 'http://127.0.0.1:19989' },
+      appDataDirs: [appData],
+      cursorStore: wakeup.createCursorStore(join(tempDir, 'm5-step3-cursors.json')),
+      env: { ANTIGRAVITY_EXECUTABLE_DATA_DIR: appData },
+      fetchImpl: async () => {
+        gate.enteredResolve();
+        await gate.release;
+        return new Response(JSON.stringify({
+          swarmId: 'sw-m5-step3',
+          primaryConversationId: 'conv-m5-prim',
+          coordinatorConversationId: 'conv-m5-coord',
+          coordinatorWaiting: false,
+          members: [{ name: 'coordinator', role: 'coordinator', waiting: false }],
+          messages: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    t.after(() => bridge.stop());
+
+    const pending = bridge.handleSseEvent({
+      event: 'coordinator_wake',
+      data: JSON.stringify({
+        swarmId: 'sw-m5-step3',
+        primaryConversationId: 'conv-m5-prim',
+        coordinatorConversationId: 'conv-m5-coord',
+        seq: 10,
+        sender: 'coder',
+        senderRole: 'worker',
+        kind: 'handoff',
+        summary: '@coordinator [done] step3 stop guard',
+      }),
+    });
+    await gate.entered;
+    bridge.stop();
+    gate.releaseResolve();
+    assert.equal(await pending, 0);
+    assert.equal(sent.length, 0, 'bridge.stop() during Step 3 fetchFreshBoardForSuppression must not call sendMessage');
+  }
+
+  // M5 Case 2: update event dashboard_fresh_check off-lock fetchFreshBoardForSuppression
+  {
+    const gate = makeGate();
+    const sent = [];
+    const bridge = wakeup.createWakeupBridge({
+      sendMessage: async (convId, message) => { sent.push({ convId, message }); },
+      hostLocalMode: true,
+      config: { fallbackBoardUrl: 'http://127.0.0.1:19989' },
+      appDataDirs: [appData],
+      cursorStore: wakeup.createCursorStore(join(tempDir, 'm5-dash-cursors.json')),
+      env: { ANTIGRAVITY_EXECUTABLE_DATA_DIR: appData },
+      fetchImpl: async () => {
+        gate.enteredResolve();
+        await gate.release;
+        return new Response(JSON.stringify({
+          swarmId: 'sw-m5-dash',
+          primaryConversationId: 'conv-m5-prim',
+          coordinatorConversationId: 'conv-m5-coord',
+          coordinatorWaiting: false,
+          members: [{ name: 'coordinator', role: 'coordinator', waiting: false }],
+          messages: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    t.after(() => bridge.stop());
+
+    const pending = bridge.handleSseEvent({
+      event: 'update',
+      data: JSON.stringify({
+        swarmId: 'sw-m5-dash',
+        primaryConversationId: 'conv-m5-prim',
+        coordinatorConversationId: 'conv-m5-coord',
+        messages: [
+          {
+            seq: 11,
+            id: 'm-11',
+            sender: 'coder',
+            senderRole: 'worker',
+            kind: 'handoff',
+            status: 'open',
+            mentions: ['coordinator'],
+            summary: '@coordinator [done] dashboard_fresh_check stop guard',
+          },
+        ],
+      }),
+    });
+    await gate.entered;
+    bridge.stop();
+    gate.releaseResolve();
+    assert.equal(await pending, 0);
+    assert.equal(sent.length, 0, 'bridge.stop() during dashboard_fresh_check must not call sendMessage');
+  }
+
+  // M5 Case 3: single-conversation fetch_targets_then_wake off-lock fetchBoardForConversation
+  {
+    const gate = makeGate();
+    const sent = [];
+    const bridge = wakeup.createWakeupBridge({
+      sendMessage: async (convId, message) => { sent.push({ convId, message }); },
+      hostLocalMode: false,
+      config: { conversationId: 'conv-m5-prim', fallbackBoardUrl: 'http://127.0.0.1:19989' },
+      cursorStore: wakeup.createCursorStore(join(tempDir, 'm5-single-cursors.json')),
+      fetchImpl: async () => {
+        gate.enteredResolve();
+        await gate.release;
+        return new Response(JSON.stringify({
+          swarmId: 'sw-m5-single',
+          primaryConversationId: 'conv-m5-prim',
+          coordinatorConversationId: 'conv-m5-coord',
+          coordinatorWaiting: false,
+          members: [{ name: 'coordinator', role: 'coordinator', waiting: false }],
+          messages: [],
+        }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+      },
+      logger: { info: () => {}, warn: () => {}, error: () => {} },
+    });
+    t.after(() => bridge.stop());
+
+    const pending = bridge.handleSseEvent({
+      event: 'coordinator_wake',
+      data: JSON.stringify({
+        swarmId: 'sw-m5-single',
+        primaryConversationId: 'conv-m5-prim',
+        seq: 12,
+        sender: 'coder',
+        senderRole: 'worker',
+        kind: 'handoff',
+        summary: '@coordinator [done] fetch_targets_then_wake stop guard',
+      }),
+    });
+    await gate.entered;
+    bridge.stop();
+    gate.releaseResolve();
+    assert.equal(await pending, 0);
+    assert.equal(sent.length, 0, 'bridge.stop() during fetch_targets_then_wake must not call sendMessage');
+  }
 });

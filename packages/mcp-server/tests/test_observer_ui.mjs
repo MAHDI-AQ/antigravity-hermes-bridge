@@ -75,14 +75,21 @@ function findBrowserExecutable() {
   return undefined;
 }
 
+const CHROMIUM_UNSAFE_PORTS = new Set([1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080]);
+
 async function listenServer(server) {
-  return new Promise((resolveListen, rejectListen) => {
-    server.once('error', rejectListen);
-    server.listen(0, '127.0.0.1', () => {
-      server.removeListener('error', rejectListen);
-      resolveListen(server.address().port);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const port = await new Promise((resolveListen, rejectListen) => {
+      server.once('error', rejectListen);
+      server.listen(0, '127.0.0.1', () => {
+        server.removeListener('error', rejectListen);
+        resolveListen(server.address().port);
+      });
     });
-  });
+    if (!CHROMIUM_UNSAFE_PORTS.has(port)) return port;
+    await closeServer(server);
+  }
+  throw new Error('Failed to bind a Chromium-safe ephemeral port');
 }
 
 function closeServer(server) {
@@ -3269,6 +3276,8 @@ test('#189 regressions: hive.js __proto__ safety, 0 of 0 for 0 workstreams, md()
 
     await page.goto(pageUrl, { waitUntil: 'networkidle' });
     await page.waitForSelector('#board:not(.hidden)', { timeout: 10000 });
+    await page.click('#tabbtn-feed');
+    await page.waitForSelector('#tab-feed.active', { timeout: 5000 });
 
     // 1) md() XSS / attribute breakout immunity: @coder mention title="coder · working #1 @coordinator" must NOT contain injected <button>/<span>
     const mdSafety = await page.evaluate(() => {
@@ -5036,6 +5045,805 @@ test('Regression #11a/#11b/#11c & coordinator live tail: stripSwarmPreamble, non
   assert.equal(coordAfterDone.tailHidden, true);
   assert.equal(coordAfterDone.footHidden, true);
   assert.match(coordAfterDone.committedText, /Coordinator live streaming line/);
+
+  await context.close();
+  const realFailed = obs.failedRequests.filter(
+    (r) => !(r.reason === 'net::ERR_ABORTED' && /fonts\.g(?:static|oogleapis)\.com/.test(r.url))
+      && !r.url.includes('/_sidecar/get-conversation-metadata')
+      && !(r.reason === 'net::ERR_ABORTED' && r.url.includes('/api/member/history')),
+  );
+  assert.deepEqual(realFailed, [], `Failed network requests: ${JSON.stringify(realFailed)}`);
+  const realConsoleErrors = obs.consoleErrors.filter(
+    (c) => !c.url.includes('/_sidecar/get-conversation-metadata') && !/Failed to resolve project ID/i.test(c.text),
+  );
+  assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
+  assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
+});
+
+test('Fluid layout (>760px wide), zero unwanted scrollbars (360/700/1280px), visible-tab-only rendering, and #agent-header DOM stability', async (t) => {
+  const pw = await loadPlaywright();
+  const executablePath = findBrowserExecutable();
+  const browser = await pw.chromium.launch({
+    headless: true,
+    args: ['--no-proxy-server', '--proxy-bypass-list=<-loopback>'],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  t.after(() => browser.close());
+
+  const tempState = mkdtempSync(join(tmpdir(), 'hermes-ui-fluid-'));
+  t.after(() => rmSync(tempState, { recursive: true, force: true }));
+
+  const baseMs = 1796000000000;
+  let boardRev = 1;
+  let agentHistoryPolls = 0;
+
+  const makeSnap = (rev) => {
+    const msgs = [
+      {
+        seq: 1,
+        id: 'fl-1',
+        agent: 'coordinator',
+        sender: 'coordinator',
+        type: 'post',
+        channel: 'main',
+        text: '@ultra-long-worker-identifier-alpha Check `C:/sandbox/Projects/very/deep/unbreakable/path/to/board_ui/styles.css` and table:\n\n| ColumnOneLongHeader | ColumnTwoLongHeader | ColumnThreeLongHeader | ColumnFourLongHeader |\n| --- | --- | --- | --- |\n| super_long_unbroken_token_value_12345678901234567890 | value_two | value_three | value_four |',
+        mentions: ['ultra-long-worker-identifier-alpha'],
+        ts: baseMs,
+      },
+      {
+        seq: 2,
+        id: 'fl-2',
+        agent: 'ultra-long-worker-identifier-alpha',
+        sender: 'ultra-long-worker-identifier-alpha',
+        type: 'handoff',
+        channel: 'layout-fixes',
+        text: '@coordinator Done with #1:\n```js\nconst veryLongCodeLineWithoutAnyBreaksAtAll = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_extra_long_tail";\n```',
+        mentions: ['coordinator'],
+        replyTo: 1,
+        ts: baseMs + 5000,
+      },
+    ];
+    if (rev >= 2) {
+      msgs.push({
+        seq: 3,
+        id: 'fl-3',
+        agent: 'beta-worker',
+        sender: 'beta-worker',
+        type: 'decision',
+        channel: 'main',
+        text: `@coordinator Background poll message rev=${rev} referencing #2`,
+        mentions: ['coordinator'],
+        ts: baseMs + 10000 + rev * 1000,
+      });
+    }
+    return {
+      swarm: 'swarm-fluid-layout',
+      id: 'swarm-fluid-layout',
+      etag: `fluid-etag-${rev}`,
+      head: msgs.length,
+      title: 'Fluid Layout & Zero Scrollbar Verification Swarm',
+      dir: 'C:/sandbox/Projects/example-org/sample-repo',
+      primaryConversationId: 'conv-fluid-primary',
+      coordinatorConversationId: 'conv-fluid-coord',
+      builtinOverview: true,
+      telemetry: {
+        activeWorkers: 2,
+        waitingWorkers: 1,
+        subagentCount: 2,
+        totalSteps: 12 + rev,
+        totalToolCalls: 25 + rev,
+        totalProcessedTokens: 433000,
+        pureInputTokens: 85000,
+        cachedInputTokens: 342000,
+        outputTokens: 5800,
+        cacheHitRate: 0.80,
+        liveTps: 44,
+      },
+      plan: {
+        goal: {
+          title: 'Eliminate scrollbars and make every tab 100% fluid',
+          line: 'Verify 360px, 700px, and 1280px viewports with wide codeblocks, tables, and live polls',
+        },
+        threads: [
+          { id: 't-layout', title: 'Fluid Layout & Scrollbars', goal: 'Zero unwanted scrollbars', workstreams: ['ultra-long-worker-identifier-alpha', 'beta-worker'], state: 'running' },
+        ],
+        tasks: {
+          'ultra-long-worker-identifier-alpha': { title: 'Remove negative margins and rigid 760px cap', status: 'active', assignee: 'ultra-long-worker-identifier-alpha' },
+          'beta-worker': { title: 'Verify visible-tab-only rendering and header stability', status: 'done', assignee: 'beta-worker' },
+        },
+      },
+      channels: [
+        { name: 'main', topic: 'Main channel' },
+        { name: 'layout-fixes', topic: 'CSS and JS layout fixes' },
+      ],
+      members: [
+        {
+          name: 'coordinator',
+          role: 'coordinator',
+          status: 'working',
+          model: 'google/gemini-4-hydrogen-medium',
+          workspace: 'C:/sandbox/Projects/example-org/sample-repo',
+          steps: 6,
+          toolCalls: 14,
+          posts: 1,
+          tokens: { totalProcessed: 433000, pureInput: 85000, cachedInput: 342000, output: 5800, contextUsed: 85200, contextLimit: 1000000 },
+          tps: 44,
+          channels: ['*'],
+          replied: true,
+          now: 'Coordinating fluid layout pass',
+          subagents: [],
+        },
+        {
+          name: 'ultra-long-worker-identifier-alpha',
+          role: 'worker',
+          status: 'working',
+          model: 'anthropic/claude-sonnet-4-medium',
+          workspace: 'C:/sandbox/Projects/example-org/sample-repo',
+          steps: 6,
+          toolCalls: 11,
+          posts: 1,
+          tokens: { totalProcessed: 180000, pureInput: 40000, cachedInput: 130000, output: 10000, contextUsed: 90000, contextLimit: 200000 },
+          tps: 52,
+          now: 'Testing wide tables and code blocks',
+          subagents: [
+            {
+              id: 'sub-long-id-alpha-1',
+              sessionId: 'sub-long-id-alpha-1',
+              name: 'super-long-subagent-name-for-ellipsis-verification-check',
+              task: 'Audit deeply nested flex column min-width zero rules across narrow panes',
+              status: 'working',
+              model: 'google/gemini-2.5-flash-high',
+              steps: 4,
+              tokens: { totalProcessed: 15200, pureInput: 12000, output: 3200 },
+              tps: 92,
+            },
+            {
+              id: 'sub-long-id-alpha-2',
+              sessionId: 'sub-long-id-alpha-2',
+              name: 'second-subagent-pill-verification',
+              task: 'Verify zero overflow',
+              status: 'done',
+              steps: 2,
+            },
+          ],
+        },
+        {
+          name: 'beta-worker',
+          role: 'worker',
+          status: 'waiting',
+          model: 'openai/gpt-5.4-codex-high',
+          workspace: 'C:/sandbox/Projects/example-org/sample-repo',
+          steps: 3,
+          posts: rev >= 2 ? 1 : 0,
+          now: 'Ready for verification',
+          subagents: [],
+        },
+      ],
+      messages: msgs,
+      raw: {
+        board: JSON.stringify({ swarm: 'swarm-fluid-layout', rev, head: msgs.length }, null, 2),
+        meta: JSON.stringify({ title: 'Fluid Layout & Zero Scrollbar Verification Swarm', rev }, null, 2),
+        members: JSON.stringify([{ name: 'coordinator', rev }], null, 2),
+        view: JSON.stringify({ rev }, null, 2),
+        archive: JSON.stringify({ archived: rev }),
+      },
+    };
+  };
+
+  const agentHistoryPayload = {
+    ok: true,
+    swarm: 'swarm-fluid-layout',
+    primaryConversationId: 'conv-fluid-primary',
+    member: 'ultra-long-worker-identifier-alpha',
+    workspace: 'C:/sandbox/Projects/example-org/sample-repo',
+    state: 'working',
+    model: 'anthropic/claude-sonnet-4-medium',
+    tps: 52,
+    tokens: { totalProcessed: 180000, pureInput: 40000, cachedInput: 130000, output: 10000, contextUsed: 90000, contextLimit: 200000 },
+    subagents: [
+      { id: 'sub-long-id-alpha-1', sessionId: 'sub-long-id-alpha-1', name: 'super-long-subagent-name-for-ellipsis-verification-check', status: 'working', steps: 4, tokens: { totalProcessed: 15200 }, tps: 92 },
+      { id: 'sub-long-id-alpha-2', sessionId: 'sub-long-id-alpha-2', name: 'second-subagent-pill-verification', status: 'done', steps: 2 },
+    ],
+    live: {
+      active: true,
+      elapsedMs: 4200,
+      currentTool: { name: 'edit_file', preview: 'board_ui/styles.css' },
+      reasoning: 'Ensuring zero horizontal overflow on wide code and tables.',
+      transcript: 'Working cleanly with cached markdown rendering.',
+      toolTrace: [],
+    },
+    messages: [
+      { id: 1, role: 'user', content: 'Fix scrollbars and fluid layout across all tabs.', timestamp: baseMs },
+      {
+        id: 2,
+        role: 'assistant',
+        content: 'Here is a wide table and wide code block:\n\n| MetricColumnAlpha | MetricColumnBeta | MetricColumnGamma | MetricColumnDelta | MetricColumnEpsilon |\n| --- | --- | --- | --- | --- |\n| very_long_cell_value_without_spaces_01234567890123456789 | 123456 | 789012 | 345678 | 901234 |\n\n```css\n.example-wide-code-line { background: linear-gradient(90deg, rgba(255,255,255,0.1) 0%, rgba(56,152,236,0.3) 50%, rgba(122,174,102,0.2) 100%); }\n```',
+        timestamp: baseMs + 3000,
+      },
+    ],
+    lastId: 2,
+    hasMore: true,
+  };
+
+  const upstreamServer = createServer((req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    if (reqUrl.pathname === '/board') {
+      const snap = makeSnap(boardRev);
+      const etag = reqUrl.searchParams.get('etag');
+      if (etag && etag === snap.etag) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ unchanged: true, swarm: snap.swarm, etag: snap.etag, primaryConversationId: snap.primaryConversationId }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: snap.etag });
+      res.end(JSON.stringify(snap));
+      return;
+    }
+    if (reqUrl.pathname === '/board/member/history') {
+      agentHistoryPolls += 1;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(agentHistoryPayload));
+      return;
+    }
+    res.writeHead(404);
+    res.end('Not found');
+  });
+  const upstreamPort = await listenServer(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const sidecarProc = await spawnSidecarProcess({
+    HERMES_A2A_STATE_DIR: tempState,
+    HERMES_A2A_BOARD_URL: `http://127.0.0.1:${upstreamPort}`,
+    HERMES_SWARM_DISABLE_WAKEUP: '1',
+    ANTIGRAVITY_CONVERSATION_ID: 'conv-fluid-primary',
+    SWARM_OVERVIEW: 'true',
+  });
+  t.after(() => sidecarProc.stop());
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 860 }, colorScheme: 'dark' });
+  const page = await context.newPage();
+  const obs = attachPageObservers(page, sidecarProc.baseUrl);
+
+  await page.goto(`${sidecarProc.baseUrl}/?conversationId=conv-fluid-primary`, { waitUntil: 'networkidle' });
+  await page.waitForSelector('#board:not(.hidden)', { timeout: 10000 });
+  await page.waitForSelector('#tab-overview.active', { timeout: 5000 });
+
+  // 1) Visible-tab-only rendering: hidden #feed, #raw, and #graph must NOT thrash DOM during background polls!
+  await page.evaluate(() => {
+    window.__hiddenMutations = { feed: 0, raw: 0, graph: 0 };
+    for (const [k, id] of [['feed', 'feed'], ['raw', 'raw'], ['graph', 'graph']]) {
+      const el = document.getElementById(id);
+      if (!el) continue;
+      const mo = new MutationObserver((recs) => { window.__hiddenMutations[k] += recs.length; });
+      mo.observe(el, { childList: true, subtree: true, characterData: true, attributes: true });
+      window[`__mo_${k}`] = mo;
+    }
+  });
+
+  boardRev = 2;
+  await page.waitForFunction(
+    () => (document.getElementById('tab-count-feed')?.textContent || '').trim() === '3',
+    null,
+    { timeout: 6000 },
+  );
+  const hiddenCounts = await page.evaluate(() => {
+    for (const k of ['feed', 'raw', 'graph']) window[`__mo_${k}`]?.disconnect();
+    return window.__hiddenMutations;
+  });
+  assert.deepEqual(hiddenCounts, { feed: 0, raw: 0, graph: 0 }, `Hidden tabs must skip DOM thrashing on background polls: ${JSON.stringify(hiddenCounts)}`);
+
+  // Switching to each dirty tab must immediately render the rev=2 content
+  await page.click('#tabbtn-feed');
+  await page.waitForSelector('#tab-feed.active');
+  assert.match(await page.textContent('#feed'), /Background poll message rev=2/);
+
+  await page.click('#tabbtn-raw');
+  await page.waitForSelector('#tab-raw.active');
+  assert.match(await page.textContent('#raw'), /"rev": 2/);
+
+  await page.click('#tabbtn-graph');
+  await page.waitForSelector('#tab-graph.active');
+  await page.click('#gview-mentions');
+  await page.waitForFunction(() => document.querySelectorAll('#graph .node').length >= 3, null, { timeout: 3000 });
+  await page.click('#gview-hive');
+
+  // Open an active working agent tab to test #agent-header node stability + layout checks
+  await page.click('#tabbtn-members');
+  await page.waitForSelector('#tab-members.active');
+  await page.click('.o2-mrow[data-open-member="ultra-long-worker-identifier-alpha"]');
+  await page.waitForSelector('.tab-agent[data-agent-tab="ultra-long-worker-identifier-alpha"].active', { timeout: 4000 });
+  await page.waitForSelector('#agent-header button[data-ag-close]', { timeout: 4000 });
+  await page.waitForSelector('#agent-committed .ag-codeblock', { timeout: 4000 });
+
+  // 2) #agent-header DOM node identity stays intact across identical 750ms polls (no innerHTML !== mismatch!)
+  const pollsBeforeHeaderCheck = agentHistoryPolls;
+  await page.evaluate(() => {
+    window.__hdrCloseBtn = document.querySelector('#agent-header button[data-ag-close]');
+    window.__hdrSubPill = document.querySelector('#agent-header .agent-sub-pill[data-sub-id="sub-long-id-alpha-1"]');
+    window.__hdrCtxFill = document.querySelector('#agent-header .agent-ctx-fill');
+  });
+  await page.waitForTimeout(1900);
+  const headerStability = await page.evaluate(() => ({
+    closeSame: window.__hdrCloseBtn?.isConnected && document.querySelector('#agent-header button[data-ag-close]') === window.__hdrCloseBtn,
+    pillSame: window.__hdrSubPill?.isConnected && document.querySelector('#agent-header .agent-sub-pill[data-sub-id="sub-long-id-alpha-1"]') === window.__hdrSubPill,
+    ctxSame: window.__hdrCtxFill?.isConnected && document.querySelector('#agent-header .agent-ctx-fill') === window.__hdrCtxFill,
+  }));
+  assert.ok(agentHistoryPolls >= pollsBeforeHeaderCheck + 2, `Expected >=2 live 750ms polls during check, got delta=${agentHistoryPolls - pollsBeforeHeaderCheck}`);
+  assert.equal(headerStability.closeSame, true, '#agent-header Close button DOM node must NOT be replaced on identical polls');
+  assert.equal(headerStability.pillSame, true, '#agent-header subagent pill DOM node must NOT be replaced on identical polls');
+  assert.equal(headerStability.ctxSame, true, '#agent-header CTX bar fill DOM node must NOT be replaced on identical polls');
+
+  // 3) Zero horizontal overflow + zero .tabs vertical scrollbar across 360px, 700px, and 1280px across ALL views!
+  const viewports = [
+    { name: 'narrow-360', width: 360, height: 780 },
+    { name: 'medium-700', width: 700, height: 820 },
+    { name: 'wide-1280', width: 1280, height: 860 },
+  ];
+  const viewsToCheck = [
+    { name: 'overview', click: '#tabbtn-overview', body: '#tab-overview' },
+    { name: 'feed', click: '#tabbtn-feed', body: '#tab-feed' },
+    { name: 'members', click: '#tabbtn-members', body: '#tab-members' },
+    { name: 'graph-hive', click: '#tabbtn-graph', subClick: '#gview-hive', body: '#tab-graph' },
+    { name: 'graph-mentions', click: '#tabbtn-graph', subClick: '#gview-mentions', body: '#tab-graph' },
+    { name: 'raw', click: '#tabbtn-raw', body: '#tab-raw' },
+    { name: 'agent-tab', click: '.tab-agent[data-agent-tab="ultra-long-worker-identifier-alpha"]', body: '#tab-agent' },
+  ];
+
+  for (const vp of viewports) {
+    await page.setViewportSize({ width: vp.width, height: vp.height });
+    await page.waitForTimeout(120);
+    for (const v of viewsToCheck) {
+      await page.click(v.click);
+      await page.waitForSelector(`${v.body}.active`, { timeout: 3000 });
+      if (v.subClick) await page.click(v.subClick);
+      await page.waitForTimeout(80);
+      const metrics = await page.evaluate((bodySel) => {
+        const doc = document.documentElement;
+        const tabs = document.querySelector('.tabs');
+        const body = document.querySelector(bodySel);
+        const o2 = body?.querySelector('.o2');
+        const main = document.querySelector('.main');
+        const raw = document.getElementById('raw');
+        const feed = document.getElementById('feed');
+        const graph = document.getElementById('graph');
+        const agentPane = document.getElementById('agent-pane');
+        const chanTabs = document.getElementById('channel-tabs');
+        return {
+          docScrollW: doc.scrollWidth,
+          docClientW: doc.clientWidth,
+          tabsScrollH: tabs ? tabs.scrollHeight : 0,
+          tabsClientH: tabs ? tabs.clientHeight : 0,
+          chanScrollH: chanTabs && !chanTabs.classList.contains('hidden') ? chanTabs.scrollHeight : 0,
+          chanClientH: chanTabs && !chanTabs.classList.contains('hidden') ? chanTabs.clientHeight : 0,
+          bodyScrollW: body ? body.scrollWidth : 0,
+          bodyClientW: body ? body.clientWidth : 0,
+          o2ScrollW: o2 ? o2.scrollWidth : 0,
+          o2ClientW: o2 ? o2.clientWidth : 0,
+          mainRectW: main ? main.getBoundingClientRect().width : 0,
+          bodyRectW: body ? body.getBoundingClientRect().width : 0,
+          rawRectW: raw ? raw.getBoundingClientRect().width : 0,
+          feedRectW: feed ? feed.getBoundingClientRect().width : 0,
+          graphRectW: graph ? graph.getBoundingClientRect().width : 0,
+          agentPaneRectW: agentPane ? agentPane.getBoundingClientRect().width : 0,
+        };
+      }, v.body);
+
+      assert.ok(
+        metrics.docScrollW <= metrics.docClientW,
+        `[${vp.name}/${v.name}] Horizontal overflow on documentElement: scrollW=${metrics.docScrollW} > clientW=${metrics.docClientW}`,
+      );
+      assert.ok(
+        metrics.tabsScrollH <= metrics.tabsClientH,
+        `[${vp.name}/${v.name}] Vertical scrollbar on .tabs: scrollH=${metrics.tabsScrollH} > clientH=${metrics.tabsClientH}`,
+      );
+      if (metrics.chanClientH > 0) {
+        assert.ok(
+          metrics.chanScrollH <= metrics.chanClientH,
+          `[${vp.name}/${v.name}] Vertical scrollbar on .channel-tabs: scrollH=${metrics.chanScrollH} > clientH=${metrics.chanClientH}`,
+        );
+      }
+      assert.ok(
+        metrics.bodyScrollW <= metrics.bodyClientW,
+        `[${vp.name}/${v.name}] Horizontal scrollbar inside ${v.body}: scrollW=${metrics.bodyScrollW} > clientW=${metrics.bodyClientW}`,
+      );
+      if (metrics.o2ClientW > 0) {
+        assert.ok(
+          metrics.o2ScrollW <= metrics.o2ClientW,
+          `[${vp.name}/${v.name}] Horizontal overflow inside .o2: scrollW=${metrics.o2ScrollW} > clientW=${metrics.o2ClientW}`,
+        );
+      }
+      if (vp.width === 1280) {
+        assert.ok(
+          metrics.bodyRectW > 1000,
+          `[wide-1280/${v.name}] Must scale fluidly beyond 760px cap (got ${metrics.bodyRectW}px)`,
+        );
+      }
+    }
+  }
+
+  await context.close();
+  const realFailed = obs.failedRequests.filter(
+    (r) => !(r.reason === 'net::ERR_ABORTED' && /fonts\.g(?:static|oogleapis)\.com/.test(r.url))
+      && !r.url.includes('/_sidecar/get-conversation-metadata')
+      && !(r.reason === 'net::ERR_ABORTED' && r.url.includes('/api/member/history')),
+  );
+  assert.deepEqual(realFailed, [], `Failed network requests: ${JSON.stringify(realFailed)}`);
+  const realConsoleErrors = obs.consoleErrors.filter(
+    (c) => !c.url.includes('/_sidecar/get-conversation-metadata') && !/Failed to resolve project ID/i.test(c.text),
+  );
+  assert.deepEqual(realConsoleErrors, [], `Console errors: ${JSON.stringify(realConsoleErrors)}`);
+  assert.deepEqual(obs.pageErrors, [], `Page errors: ${JSON.stringify(obs.pageErrors)}`);
+});
+
+test('Regression M1/M2/M8: #f-channel select sync, .tabs wheel scroll + overflow affordance + zero vertical scrollbar, hive.js .o2-src fast-path, and single renderFeed on autoSelectTab', async (t) => {
+  const pw = await loadPlaywright();
+  const executablePath = findBrowserExecutable();
+  const browser = await pw.chromium.launch({
+    headless: true,
+    args: ['--no-proxy-server', '--proxy-bypass-list=<-loopback>'],
+    ...(executablePath ? { executablePath } : {}),
+  });
+  t.after(() => browser.close());
+
+  const tempState = mkdtempSync(join(tmpdir(), 'hermes-ui-m1m2m8-'));
+  t.after(() => rmSync(tempState, { recursive: true, force: true }));
+
+  const baseMs = 1796100000000;
+  let rev = 1;
+  let builtinOverview = true;
+  let sourceObj = { state: 'live', label: 'Postgres', hosts: [{ label: 'host-a' }] };
+  let includeSeq3 = false;
+
+  const extraWorkers = Array.from({ length: 8 }, (_, idx) => ({
+    name: `worker-${idx + 1}`,
+    role: 'worker',
+    status: idx % 2 === 0 ? 'working' : 'waiting',
+    model: 'anthropic/claude-sonnet-4',
+    steps: 2 + idx,
+    posts: idx === 0 ? 1 : 0,
+    now: `Handling slice ${idx + 1}`,
+    subagents: [],
+  }));
+
+  const makeSnap = () => {
+    const messages = [
+      {
+        seq: 1,
+        id: 'm128-1',
+        agent: 'coordinator',
+        sender: 'coordinator',
+        type: 'post',
+        channel: 'main',
+        text: '@worker-1 Initial task on main channel',
+        mentions: ['worker-1'],
+        ts: baseMs,
+      },
+      {
+        seq: 2,
+        id: 'm128-2',
+        agent: 'worker-1',
+        sender: 'worker-1',
+        type: 'handoff',
+        channel: 'backend',
+        text: '@coordinator Backend patch ready on #1',
+        mentions: ['coordinator'],
+        replyTo: 1,
+        ts: baseMs + 2000,
+      },
+    ];
+    if (includeSeq3) {
+      messages.push({
+        seq: 3,
+        id: 'm128-3',
+        agent: 'worker-2',
+        sender: 'worker-2',
+        type: 'decision',
+        channel: 'main',
+        text: '@coordinator Switched to feed automatically on rev=' + rev,
+        mentions: ['coordinator'],
+        ts: baseMs + 4000,
+      });
+    }
+    return {
+      swarm: 'swarm-m1m2m8',
+      id: 'swarm-m1m2m8',
+      etag: `m128-etag-${rev}`,
+      head: messages.length,
+      title: 'M1 M2 M8 Verification Swarm',
+      dir: 'C:/Projects/demo',
+      primaryConversationId: 'conv-m1m2m8-primary',
+      coordinatorConversationId: 'conv-m1m2m8-coord',
+      builtinOverview,
+      source: sourceObj,
+      channels: [
+        { name: 'main', topic: 'Main channel' },
+        { name: 'backend', topic: 'Backend channel' },
+      ],
+      members: [
+        {
+          name: 'coordinator',
+          role: 'coordinator',
+          status: 'working',
+          conversationId: 'conv-m1m2m8-coord',
+          steps: 3,
+          posts: 1,
+          now: 'Coordinating checks',
+          subagents: [],
+        },
+        ...extraWorkers,
+      ],
+      messages,
+      raw: {
+        board: JSON.stringify({ rev }, null, 2),
+      },
+    };
+  };
+
+  const upstreamServer = createServer((req, res) => {
+    const reqUrl = new URL(req.url, 'http://127.0.0.1');
+    if (reqUrl.pathname === '/board') {
+      const snap = makeSnap();
+      const etag = reqUrl.searchParams.get('etag');
+      if (etag && etag === snap.etag) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          unchanged: true,
+          swarm: snap.swarm,
+          etag: snap.etag,
+          primaryConversationId: snap.primaryConversationId,
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json', ETag: snap.etag });
+      res.end(JSON.stringify(snap));
+      return;
+    }
+    if (reqUrl.pathname === '/board/member/history') {
+      const member = reqUrl.searchParams.get('member') || 'worker-1';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        swarm: 'swarm-m1m2m8',
+        primaryConversationId: 'conv-m1m2m8-primary',
+        member,
+        state: 'waiting',
+        messages: [{ id: 1, role: 'assistant', content: `Transcript for ${member}`, timestamp: baseMs }],
+        lastId: 1,
+        hasMore: false,
+      }));
+      return;
+    }
+    res.writeHead(404);
+    res.end('Not found');
+  });
+  const upstreamPort = await listenServer(upstreamServer);
+  t.after(() => closeServer(upstreamServer));
+
+  const sidecarProc = await spawnSidecarProcess({
+    HERMES_A2A_STATE_DIR: tempState,
+    HERMES_A2A_BOARD_URL: `http://127.0.0.1:${upstreamPort}`,
+    HERMES_SWARM_DISABLE_WAKEUP: '1',
+    ANTIGRAVITY_CONVERSATION_ID: 'conv-m1m2m8-primary',
+    SWARM_OVERVIEW: '',
+  });
+  t.after(() => sidecarProc.stop());
+
+  const context = await browser.newContext({ viewport: { width: 1280, height: 820 }, colorScheme: 'dark' });
+  const page = await context.newPage();
+  const obs = attachPageObservers(page, sidecarProc.baseUrl);
+
+  await page.goto(`${sidecarProc.baseUrl}/?conversationId=conv-m1m2m8-primary`, { waitUntil: 'networkidle' });
+  await page.waitForSelector('#board:not(.hidden)', { timeout: 10000 });
+  await page.waitForSelector('#tab-overview.active', { timeout: 5000 });
+
+  // --- M8 part 2: autoSelectTab() switching overview -> feed in ingest() must render #feed ONCE (not twice) ---
+  await page.evaluate(() => {
+    const feedEl = document.getElementById('feed');
+    window.__seq3QueryCount = 0;
+    const origQS = feedEl.querySelector.bind(feedEl);
+    feedEl.querySelector = (sel) => {
+      if (sel === '.msg[data-seq="3"]') window.__seq3QueryCount += 1;
+      return origQS(sel);
+    };
+  });
+  builtinOverview = false;
+  includeSeq3 = true;
+  rev += 1;
+  await page.waitForSelector('#tab-feed.active', { timeout: 5000 });
+  await page.waitForSelector('#feed .msg[data-seq="3"]', { timeout: 5000 });
+  const m8FeedCheck = await page.evaluate(() => ({
+    seq3QueryCount: window.__seq3QueryCount,
+    hasNewClass: document.querySelector('#feed .msg[data-seq="3"]')?.classList.contains('new') ?? false,
+    msgCount: document.querySelectorAll('#feed [data-testid="swarm-message"]').length,
+  }));
+  assert.equal(m8FeedCheck.seq3QueryCount, 1, `ingest() must NOT double-render #feed when autoSelectTab() switches to feed (got ${m8FeedCheck.seq3QueryCount})`);
+  assert.equal(m8FeedCheck.hasNewClass, true, 'New message #3 must still be highlighted with .new after single renderFeed');
+  assert.equal(m8FeedCheck.msgCount, 3);
+
+  // --- M1: #f-channel <select> stays synced on channel chip click, channel tab click, and Clear filters ---
+  await page.click('#f-toggle');
+  await page.waitForSelector('#filters:not(.hidden)', { timeout: 3000 });
+  assert.equal(await page.$eval('#f-channel', (el) => el.value), '', 'Initial #f-channel value must be empty');
+
+  // Click inline channel chip on message #2 (#backend)
+  await page.click('#feed .msg-channel[data-channel="backend"]');
+  const afterChip = await page.$eval('#f-channel', (el) => ({ value: el.value, isSet: el.classList.contains('set') }));
+  assert.deepEqual(afterChip, { value: 'backend', isSet: true }, '#f-channel must sync to backend on channel chip click');
+  assert.equal(await page.locator('#feed [data-testid="swarm-message"]').count(), 1);
+
+  // Click #main channel tab (option markup unchanged)
+  await page.click('#channel-tabs [data-channel="main"]');
+  const afterMainTab = await page.$eval('#f-channel', (el) => ({ value: el.value, isSet: el.classList.contains('set') }));
+  assert.deepEqual(afterMainTab, { value: 'main', isSet: true }, '#f-channel must sync to main on channel tab click');
+
+  // Switch back to #backend and trigger "No posts match" -> Clear filters
+  await page.click('#channel-tabs [data-channel="backend"]');
+  assert.equal(await page.$eval('#f-channel', (el) => el.value), 'backend');
+  await page.fill('#f-search', 'no-matching-post-xyz');
+  await page.waitForSelector('[data-clear-filters]', { timeout: 3000 });
+  await page.click('[data-clear-filters]');
+  const afterClear = await page.$eval('#f-channel', (el) => ({ value: el.value, isSet: el.classList.contains('set') }));
+  assert.deepEqual(afterClear, { value: '', isSet: false }, '#f-channel must reset to "" on Clear filters');
+  assert.equal(await page.locator('#feed [data-testid="swarm-message"]').count(), 3);
+
+  // --- M8 part 1: hive.js LAST_RENDER.bodyHtml fast-path must still update .o2-src while preserving .o2-msin ---
+  await page.click('#tabbtn-members');
+  await page.waitForSelector('#tab-members.active', { timeout: 3000 });
+  await page.waitForSelector('#members [data-testid="swarm-source"].live', { timeout: 3000 });
+  assert.match(await page.textContent('#members [data-testid="swarm-source"]'), /Postgres · 1 machine/);
+
+  await page.focus('#members .o2-msin');
+  await page.fill('#members .o2-msin', 'worker-1');
+  await page.evaluate(() => {
+    window.__msinNode = document.querySelector('#members .o2-msin');
+    window.__mbodyNode = document.querySelector('#members .o2-mbody');
+  });
+
+  // Change ONLY snap.source (bodyHtml identical!) -> live -> stale
+  sourceObj = { state: 'stale', label: 'Postgres', hosts: [{ label: 'host-a' }, { label: 'host-b' }] };
+  rev += 1;
+  await page.waitForSelector('#members [data-testid="swarm-source"].stale', { timeout: 5000 });
+  const afterStale = await page.evaluate(() => ({
+    srcText: document.querySelector('#members [data-testid="swarm-source"]')?.textContent?.trim() || '',
+    sameInput: document.querySelector('#members .o2-msin') === window.__msinNode && window.__msinNode.isConnected,
+    inputVal: document.querySelector('#members .o2-msin')?.value || '',
+    sameBody: document.querySelector('#members .o2-mbody') === window.__mbodyNode,
+    visibleRows: [...document.querySelectorAll('#members .o2-mrow')].filter((r) => r.style.display !== 'none').length,
+  }));
+  assert.match(afterStale.srcText, /Postgres · reconnecting/);
+  assert.equal(afterStale.sameInput, true, '.o2-msin input must stay mounted when .o2-src updates');
+  assert.equal(afterStale.inputVal, 'worker-1', '.o2-msin search value must be preserved');
+  assert.equal(afterStale.sameBody, true, '.o2-mbody must not be rebuilt when bodyHtml is unchanged');
+  assert.equal(afterStale.visibleRows, 1, 'Search filter must remain active');
+
+  // Change ONLY snap.source -> null (chip removed)
+  sourceObj = null;
+  rev += 1;
+  await page.waitForFunction(
+    () => document.querySelectorAll('#members [data-testid="swarm-source"]').length === 0,
+    null,
+    { timeout: 5000 },
+  );
+  assert.equal(
+    await page.evaluate(() => document.querySelector('#members .o2-msin') === window.__msinNode),
+    true,
+    '.o2-msin must stay mounted when .o2-src is removed',
+  );
+
+  // Change ONLY snap.source -> error (chip re-inserted before .o2-mtop)
+  sourceObj = { state: 'error', label: 'Postgres', error: 'connection refused' };
+  rev += 1;
+  await page.waitForSelector('#members [data-testid="swarm-source"].error', { timeout: 5000 });
+  const afterError = await page.evaluate(() => {
+    const src = document.querySelector('#members [data-testid="swarm-source"]');
+    const mtop = document.querySelector('#members .o2-mtop');
+    return {
+      srcText: src?.textContent?.trim() || '',
+      beforeMtop: Boolean(src && mtop && src.nextElementSibling === mtop),
+      sameInput: document.querySelector('#members .o2-msin') === window.__msinNode,
+    };
+  });
+  assert.match(afterError.srcText, /Postgres · unavailable/);
+  assert.equal(afterError.beforeMtop, true, '.o2-src must be inserted immediately before .o2-mtop');
+  assert.equal(afterError.sameInput, true, '.o2-msin must stay mounted when .o2-src re-appears');
+
+  // Clear member search so all 8 workers are clickable for M2
+  await page.fill('#members .o2-msin', '');
+
+  // --- M2: .tabs with 8+ open agent tabs at 360px has wheel horizontal scrolling, edge affordance, and ZERO vertical scrollbar ---
+  // First verify non-overflow state at 1280px has zero scrollbar height and no overflow classes
+  const wideTabs = await page.evaluate(() => {
+    const tabs = document.querySelector('.tabs');
+    return {
+      scrollW: tabs.scrollWidth,
+      clientW: tabs.clientWidth,
+      scrollH: tabs.scrollHeight,
+      clientH: tabs.clientHeight,
+      offsetH: tabs.offsetHeight,
+      ovLeft: tabs.classList.contains('overflow-left'),
+      ovRight: tabs.classList.contains('overflow-right'),
+    };
+  });
+  assert.ok(wideTabs.scrollW <= wideTabs.clientW, 'At 1280px with base tabs, .tabs should not overflow');
+  assert.ok(wideTabs.scrollH <= wideTabs.clientH, 'At 1280px, .tabs must have zero vertical overflow');
+  assert.equal(wideTabs.offsetH, wideTabs.clientH, 'When not overflowed, .tabs must have 0px horizontal scrollbar');
+  assert.equal(wideTabs.ovLeft, false);
+  assert.equal(wideTabs.ovRight, false);
+
+  // Open 8 agent tabs
+  for (let i = 1; i <= 8; i++) {
+    await page.click('#tabbtn-members');
+    await page.waitForSelector('#tab-members.active', { timeout: 3000 });
+    await page.click(`.o2-mrow[data-open-member="worker-${i}"]`);
+    await page.waitForSelector(`.tab-agent[data-agent-tab="worker-${i}"].active`, { timeout: 3000 });
+  }
+
+  // Narrow pane to 360px
+  await page.setViewportSize({ width: 360, height: 780 });
+  await page.waitForTimeout(150);
+
+  // Reset scrollLeft to 0 and check overflow metrics + right affordance + zero vertical scrollbar
+  const atStart = await page.evaluate(() => {
+    const tabs = document.querySelector('.tabs');
+    tabs.scrollTo({ left: 0, behavior: 'instant' });
+    tabs.dispatchEvent(new Event('scroll'));
+    return {
+      tabCount: tabs.querySelectorAll('.tab-agent').length,
+      scrollW: tabs.scrollWidth,
+      clientW: tabs.clientWidth,
+      scrollH: tabs.scrollHeight,
+      clientH: tabs.clientHeight,
+      offsetH: tabs.offsetHeight,
+      scrollLeft: tabs.scrollLeft,
+      ovLeft: tabs.classList.contains('overflow-left'),
+      ovRight: tabs.classList.contains('overflow-right'),
+    };
+  });
+  assert.equal(atStart.tabCount, 8);
+  assert.ok(atStart.scrollW > atStart.clientW + 100, `Expected 8 agent tabs to overflow at 360px (scrollW=${atStart.scrollW}, clientW=${atStart.clientW})`);
+  assert.ok(atStart.scrollH <= atStart.clientH, `Zero vertical scrollbar allowed on .tabs (scrollH=${atStart.scrollH}, clientH=${atStart.clientH})`);
+  assert.ok(atStart.offsetH - atStart.clientH <= 4, `Horizontal scrollbar must stay unobtrusive <=4px (offsetH=${atStart.offsetH}, clientH=${atStart.clientH})`);
+  assert.equal(atStart.ovLeft, false, 'At scrollLeft=0, overflow-left must be false');
+  assert.equal(atStart.ovRight, true, 'At scrollLeft=0 with overflow, overflow-right must be true');
+
+  // Scroll horizontally via standard vertical mouse wheel over .tabs
+  const tabsBox = await page.locator('.tabs').boundingBox();
+  assert.ok(tabsBox && tabsBox.width > 0 && tabsBox.height > 0);
+  await page.mouse.move(tabsBox.x + tabsBox.width / 2, tabsBox.y + tabsBox.height / 2);
+  await page.mouse.wheel(0, 140);
+  await page.waitForFunction(() => document.querySelector('.tabs').scrollLeft > 0, null, { timeout: 3000 });
+
+  const afterWheel = await page.evaluate(() => {
+    const tabs = document.querySelector('.tabs');
+    return {
+      scrollLeft: tabs.scrollLeft,
+      scrollH: tabs.scrollHeight,
+      clientH: tabs.clientHeight,
+      ovLeft: tabs.classList.contains('overflow-left'),
+      ovRight: tabs.classList.contains('overflow-right'),
+    };
+  });
+  assert.ok(afterWheel.scrollLeft >= 100, `Vertical mouse wheel over .tabs must scroll horizontally (scrollLeft=${afterWheel.scrollLeft})`);
+  assert.ok(afterWheel.scrollH <= afterWheel.clientH, `Zero vertical scrollbar after wheel scroll (scrollH=${afterWheel.scrollH}, clientH=${afterWheel.clientH})`);
+  assert.equal(afterWheel.ovLeft, true, 'After wheel scrolling right, overflow-left must be true');
+
+  // Scroll all the way to the right edge -> overflow-right clears, overflow-left stays true
+  const atEnd = await page.evaluate(() => {
+    const tabs = document.querySelector('.tabs');
+    tabs.scrollTo({ left: tabs.scrollWidth, behavior: 'instant' });
+    tabs.dispatchEvent(new Event('scroll'));
+    return {
+      scrollLeft: tabs.scrollLeft,
+      scrollH: tabs.scrollHeight,
+      clientH: tabs.clientHeight,
+      ovLeft: tabs.classList.contains('overflow-left'),
+      ovRight: tabs.classList.contains('overflow-right'),
+    };
+  });
+  assert.ok(atEnd.scrollLeft > 0);
+  assert.ok(atEnd.scrollH <= atEnd.clientH);
+  assert.equal(atEnd.ovLeft, true);
+  assert.equal(atEnd.ovRight, false, 'At far right edge, overflow-right must clear');
 
   await context.close();
   const realFailed = obs.failedRequests.filter(

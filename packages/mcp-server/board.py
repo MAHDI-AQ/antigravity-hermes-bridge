@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import fnmatch
@@ -11,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any, Callable, Iterator
 import uuid
@@ -370,11 +372,27 @@ def read_archived_messages(board_file: Path) -> list[dict[str, Any]]:
     return out
 
 
+_ARCHIVE_COUNT_LOCK = threading.Lock()
+_ARCHIVE_COUNT_CACHE: OrderedDict[str, tuple[tuple[int, int, int], int]] = OrderedDict()
+_ARCHIVE_COUNT_CACHE_MAX = 64
+
+
 def count_archived_messages(board_file: Path) -> int:
-    """Count non-empty lines in `board_archive.jsonl` without loading full payloads."""
+    """Count non-empty lines in `board_archive.jsonl` without loading full payloads (cached by mtime/size/ino)."""
     archive_file = board_file.with_name("board_archive.jsonl")
-    if not archive_file.is_file():
+    key = str(archive_file)
+    try:
+        st = archive_file.stat()
+        sig = (int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0)))
+    except OSError:
+        with _ARCHIVE_COUNT_LOCK:
+            _ARCHIVE_COUNT_CACHE.pop(key, None)
         return 0
+    with _ARCHIVE_COUNT_LOCK:
+        cached = _ARCHIVE_COUNT_CACHE.get(key)
+        if cached is not None and cached[0] == sig:
+            _ARCHIVE_COUNT_CACHE.move_to_end(key)
+            return cached[1]
     count = 0
     try:
         with archive_file.open("r", encoding="utf-8", errors="replace") as fh:
@@ -383,6 +401,11 @@ def count_archived_messages(board_file: Path) -> int:
                     count += 1
     except OSError:
         return 0
+    with _ARCHIVE_COUNT_LOCK:
+        _ARCHIVE_COUNT_CACHE[key] = (sig, count)
+        _ARCHIVE_COUNT_CACHE.move_to_end(key)
+        while len(_ARCHIVE_COUNT_CACHE) > _ARCHIVE_COUNT_CACHE_MAX:
+            _ARCHIVE_COUNT_CACHE.popitem(last=False)
     return count
 
 
@@ -1802,10 +1825,10 @@ class BoardService:
             except Exception:
                 pass
 
-        def _stat_sig() -> tuple[int, int] | None:
+        def _stat_sig() -> tuple[int, int, int] | None:
             try:
                 st = bfile.stat()
-                return (st.st_mtime_ns, st.st_size)
+                return (st.st_mtime_ns, st.st_size, int(getattr(st, "st_ino", 0)))
             except OSError:
                 return None
 

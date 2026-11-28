@@ -38,8 +38,27 @@
     polling: false,
     pollGen: 0,
     pollAbort: null,
+    dirtyTabs: new Set(),
+    pendingNewSeqs: new Set(),
+    memberByName: new Map(),
+    memberByLower: new Map(),
+    memberGroupByLower: new Map(),
+    msgBySeq: new Map(),
+    msgById: new Map(),
+    channelByNorm: new Map(),
   };
   if ('scrollRestoration' in history) history.scrollRestoration = 'manual';
+
+  const LAST_HTML = new WeakMap();
+  function setHtmlIfChanged(el, html) {
+    if (!el) return false;
+    const strHtml = String(html ?? '');
+    if (LAST_HTML.get(el) === strHtml) return false;
+    LAST_HTML.set(el, strHtml);
+    el.dataset.lastRenderSig = `${strHtml.length}`;
+    el.innerHTML = strHtml;
+    return true;
+  }
 
   const params = new URLSearchParams(location.search);
   const initialTab = params.get('tab');
@@ -49,17 +68,32 @@
   async function getJson(path, { signal, timeoutMs = 8000 } = {}) {
     const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
     const ac = new AbortController();
-    const onAbort = () => ac.abort(signal.reason);
+    let rejectRace = null;
+    const raceGuard = new Promise((_, reject) => { rejectRace = reject; });
+    const onAbort = () => {
+      const err = signal?.reason instanceof Error ? signal.reason : new Error(`${path}: aborted`);
+      ac.abort(err);
+      rejectRace?.(err);
+    };
     if (signal) {
-      if (signal.aborted) ac.abort(signal.reason);
-      else signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        throw (signal.reason instanceof Error ? signal.reason : new Error(`${path}: aborted`));
+      }
+      signal.addEventListener('abort', onAbort, { once: true });
     }
-    const timer = setTimeout(() => ac.abort(new Error(`${path}: timeout`)), timeoutMs);
+    const timer = setTimeout(() => {
+      const err = new Error(`${path}: timeout`);
+      ac.abort(err);
+      rejectRace?.(err);
+    }, timeoutMs);
     try {
-      const res = await f(path, { method: 'GET', signal: ac.signal });
+      const res = await Promise.race([
+        f(path, { method: 'GET', signal: ac.signal }),
+        raceGuard,
+      ]);
       if (res.status === 304) return { unchanged: true, etag: state.etag, swarm: state.swarm };
       if (!res.ok) throw new Error(`${path}: ${res.status}`);
-      return res.json();
+      return await Promise.race([res.json(), raceGuard]);
     } finally {
       clearTimeout(timer);
       if (signal) signal.removeEventListener('abort', onAbort);
@@ -70,21 +104,49 @@
   // preload.js writes the host's tokens onto :root. Mark the root light/dark
   // from --background's luminance when injected, or prefers-color-scheme standalone.
   const lightMq = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-color-scheme: light)') : null;
+  let lastHostBg = null;
+  let schemeProbe = null;
+  function parseColorRgb(raw) {
+    const s = String(raw || '').trim();
+    const hex3 = /^#([0-9a-f]{3})$/i.exec(s);
+    if (hex3) {
+      const h = hex3[1];
+      return [parseInt(h[0] + h[0], 16) / 255, parseInt(h[1] + h[1], 16) / 255, parseInt(h[2] + h[2], 16) / 255];
+    }
+    const hex6 = /^#([0-9a-f]{6})(?:[0-9a-f]{2})?$/i.exec(s);
+    if (hex6) {
+      const h = hex6[1];
+      return [parseInt(h.slice(0, 2), 16) / 255, parseInt(h.slice(2, 4), 16) / 255, parseInt(h.slice(4, 6), 16) / 255];
+    }
+    const rgb = /^rgba?\(\s*([\d.]+)\s*[,\s]\s*([\d.]+)\s*[,\s]\s*([\d.]+)/i.exec(s);
+    if (rgb) {
+      return [Number(rgb[1]) / 255, Number(rgb[2]) / 255, Number(rgb[3]) / 255];
+    }
+    return null;
+  }
   function syncScheme() {
     const hostBg = getComputedStyle(document.documentElement).getPropertyValue('--background').trim();
+    if (hostBg && hostBg === lastHostBg && document.documentElement.dataset.theme) return;
+    lastHostBg = hostBg || null;
     let theme;
     if (!hostBg) {
       theme = lightMq?.matches ? 'light' : 'dark';
     } else {
-      const probe = document.createElement('span');
-      probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background, #0e0e10)';
-      document.documentElement.appendChild(probe);
-      const c = getComputedStyle(probe).color;
-      probe.remove();
-      const nums = (c.match(/[\d.]+/g) || []).map(Number);
-      if (nums.length < 3) return;
-      const scale = c.startsWith('color(') ? 1 : 255;
-      const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+      let rgb = parseColorRgb(hostBg);
+      if (!rgb) {
+        if (!schemeProbe) {
+          schemeProbe = document.createElement('span');
+          schemeProbe.style.cssText = 'position:absolute;visibility:hidden;pointer-events:none;color:var(--background, #0e0e10)';
+        }
+        if (!schemeProbe.isConnected) document.documentElement.appendChild(schemeProbe);
+        const c = getComputedStyle(schemeProbe).color;
+        schemeProbe.remove();
+        const nums = (c.match(/[\d.]+/g) || []).map(Number);
+        if (nums.length < 3) return;
+        const scale = c.startsWith('color(') ? 1 : 255;
+        rgb = nums.slice(0, 3).map((v) => v / scale);
+      }
+      const [r, g, b] = rgb;
       const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
       theme = lum < 0.5 ? 'dark' : 'light';
     }
@@ -112,7 +174,7 @@
   }
   syncScheme();
   if (lightMq) {
-    const onMq = () => applyTheme();
+    const onMq = () => { lastHostBg = null; applyTheme(); };
     if (typeof lightMq.addEventListener === 'function') lightMq.addEventListener('change', onMq);
     else if (typeof lightMq.addListener === 'function') lightMq.addListener(onMq);
   }
@@ -125,7 +187,6 @@
     if (event.source !== window && event.source !== window.parent) return;
     if (event.data?.type === 'theme-change') {
       applyTheme(event.data?.payload?.cssVariables);
-      requestAnimationFrame(() => applyTheme());
     }
   });
 
@@ -134,8 +195,39 @@
   const STATUS_LABEL = { working: 'Active', waiting: 'Waiting', idle: 'Waiting', parked: 'Waiting', killed: 'Killed', failed: 'Failed' };
   const statusLabel = (st) => STATUS_LABEL[st] || st || '';
   const members = () => state.snap?.members || [];
-  const memberOf = (name) => members().find((m) => m.name === name);
-  const memberByLower = (lower) => members().find((m) => m.name.toLowerCase() === lower);
+  function rebuildIndexes(snap) {
+    state.memberByName.clear();
+    state.memberByLower.clear();
+    state.memberGroupByLower.clear();
+    state.msgBySeq.clear();
+    state.msgById.clear();
+    state.channelByNorm.clear();
+    for (const m of snap?.members || []) {
+      if (!m || !m.name) continue;
+      state.memberByName.set(m.name, m);
+      const low = m.name.toLowerCase();
+      if (!state.memberByLower.has(low)) state.memberByLower.set(low, m);
+      const match = low.match(/^(.+)-\d+$/);
+      if (match) {
+        const pfx = match[1];
+        let grp = state.memberGroupByLower.get(pfx);
+        if (!grp) { grp = []; state.memberGroupByLower.set(pfx, grp); }
+        grp.push(m);
+      }
+    }
+    for (const msg of snap?.messages || []) {
+      if (!msg) continue;
+      if (msg.seq != null) state.msgBySeq.set(Number(msg.seq), msg);
+      const mid = msg.id ?? msg.messageId ?? msg.message_id;
+      if (mid != null && mid !== '') state.msgById.set(String(mid), msg);
+    }
+    for (const c of Array.isArray(snap?.channels) ? snap.channels : []) {
+      if (!c || !c.name) continue;
+      state.channelByNorm.set(String(c.name).replace(/^#/, '').trim().toLowerCase(), c);
+    }
+  }
+  const memberOf = (name) => state.memberByName.get(name) || members().find((m) => m.name === name);
+  const memberByLower = (lower) => state.memberByLower.get(lower);
   const convIdOf = (m) => m?.conversationId || m?.conversation_id || '';
   const senderOf = (m) => m?.agent || m?.sender || '';
   const textOf = (m) => m?.text || m?.summary || '';
@@ -152,7 +244,7 @@
       const n = Number(s.startsWith('#') ? s.slice(1) : s);
       return Number.isInteger(n) && n > 0 ? n : null;
     }
-    const hit = (state.snap?.messages || []).find((m) => m && (m.id === s || m.messageId === s || m.message_id === s));
+    const hit = state.msgById.get(s);
     const seq = Number(hit?.seq);
     return Number.isInteger(seq) && seq > 0 ? seq : null;
   }
@@ -261,11 +353,9 @@
     const roster = members();
     const names = collapseRecipientGroups((m.mentions || []).filter((n) => n !== sender), roster);
     const parts = names.map((n) => {
-      const hit = roster.find((mem) => mem.name === n)
-        || roster.find((mem) => {
-          const match = mem.name.match(/^(.+)-\d+$/);
-          return Boolean(match && match[1] === n);
-        });
+      const hit = state.memberByName.get(n)
+        || (state.memberGroupByLower.get(n.toLowerCase()) || [])[0]
+        || null;
       return hit
         ? `<button type="button" class="msg-mention-btn" data-feed-member="${esc(hit.name)}" title="Open @${esc(hit.name)}">@${esc(n)}</button>`
         : `<span>@${esc(n)}</span>`;
@@ -299,7 +389,7 @@
   function highlightChannelMentions(html) {
     if (!hasChannels()) return html;
     return transformTextNodes(html, (seg) => seg.replace(CHANNEL_MENTION_RE, (all, pre, name) => {
-      const c = swarmChannels().find((x) => normChan(x.name) === name.toLowerCase());
+      const c = state.channelByNorm.get(name.toLowerCase());
       if (!c) return all;
       const tip = c.archived ? `#${normChan(c.name)} is archived: this addresses nobody` : `Everyone in #${normChan(c.name)}`;
       return `${pre}<button type="button" class="mention mention-btn channel${c.archived ? ' archived' : ''}" data-channel="${esc(normChan(c.name))}" title="${esc(tip)}">@#${name}</button>`;
@@ -314,11 +404,8 @@
       if (m) {
         return `${pre}<button type="button" class="mention mention-btn" data-feed-member="${esc(m.name)}" title="${esc(m.name)} · ${esc(statusLabel(m.status))}">@${name}</button>`;
       }
-      const group = members().filter((mem) => {
-        const match = mem.name.toLowerCase().match(/^(.+)-\d+$/);
-        return match && match[1] === lower;
-      });
-      if (group.length) {
+      const group = state.memberGroupByLower.get(lower);
+      if (group && group.length) {
         const tip = group.map((mem) => mem.name).join(', ');
         return `${pre}<button type="button" class="mention mention-btn" data-feed-member="${esc(group[0].name)}" title="${esc(tip)}">@${name}</button>`;
       }
@@ -331,7 +418,7 @@
     return transformTextNodes(html, (seg) => seg.replace(CITATION_RE, (all, pre, digits) => {
       const seq = Number(digits);
       if (!Number.isInteger(seq) || seq <= 0) return all;
-      const target = state.snap?.messages?.find((m) => m.seq === seq);
+      const target = state.msgBySeq.get(seq);
       const tip = target ? `Go to #${seq} (${senderOf(target)})` : `Go to #${seq}`;
       return `${pre}<button type="button" class="ref seq-ref" data-seq-ref="${seq}" data-ov-seq="${seq}" data-testid="swarm-seq-ref" title="${esc(tip)}">#${seq}</button>`;
     }))
@@ -559,14 +646,14 @@
     state.agentTabData = {};
     state.agentDetailsOpen.clear();
     renderAgentTabs();
-    if ($('agent-header')) $('agent-header').innerHTML = '';
+    setHtmlIfChanged($('agent-header'), '');
     if ($('agent-committed')) $('agent-committed').innerHTML = '';
     if ($('agent-live-tail')) {
       $('agent-live-tail').innerHTML = '';
       $('agent-live-tail').classList.add('hidden');
     }
     if ($('agent-live-foot')) {
-      $('agent-live-foot').innerHTML = '';
+      setHtmlIfChanged($('agent-live-foot'), '');
       $('agent-live-foot').classList.add('hidden');
     }
     $('agent-pane')?.classList.remove('has-live-foot');
@@ -580,9 +667,22 @@
     state.hiddenAgents.clear();
     state.channel = '';
     state.expanded.clear();
+    state.dirtyTabs.clear();
+    state.pendingNewSeqs.clear();
+    rebuildIndexes(null);
     feedMarkup = '';
     agentsMarkup = '';
     filterMarkup.clear();
+    setHtmlIfChanged($('channel-tabs'), '');
+    setHtmlIfChanged($('f-channel'), '');
+    setHtmlIfChanged($('telemetry-strip'), '');
+    setHtmlIfChanged($('ov-status'), '');
+    setHtmlIfChanged($('ov-system'), '');
+    setHtmlIfChanged($('ov-notice'), '');
+    setHtmlIfChanged($('ov-ack'), '');
+    setHtmlIfChanged($('raw-meta'), '');
+    setHtmlIfChanged($('replay-label'), '');
+    setHtmlIfChanged($('replay-caption'), '');
     if (typeof graphCache !== 'undefined') graphCache.acc = null;
     state.firstLoad = true;
     state.stick = true;
@@ -597,19 +697,31 @@
     state.tabChosen = urlTabChosen;
   }
 
+  function syncTabsOverflow() {
+    const nav = document.querySelector('.tabs');
+    if (!nav) return;
+    const maxScroll = Math.max(0, nav.scrollWidth - nav.clientWidth);
+    const hasOverflow = maxScroll > 1;
+    nav.classList.toggle('overflow-left', hasOverflow && nav.scrollLeft > 1);
+    nav.classList.toggle('overflow-right', hasOverflow && nav.scrollLeft < maxScroll - 1);
+  }
+
   function showView(view) {
     if (view === state.view) return;
     state.view = view;
     $('loading').classList.toggle('hidden', view !== 'loading');
     $('board').classList.toggle('hidden', view !== 'board');
     $('empty').classList.toggle('hidden', view !== 'empty');
-    if (view === 'board' && state.snap && state.tab === 'graph') renderGraph();
     if (view !== 'board') frameTeardown();
     syncWatchdog();
-    if (view === 'board' && state.snap && state.tab === 'feed') {
-      measureClamps();
-      if ($('f-autoscroll').checked && state.stick) scrollToLatest();
-      updateJump();
+    if (view === 'board' && state.snap) {
+      const flushed = flushActiveTab();
+      syncTabsOverflow();
+      if (state.tab === 'feed' && !flushed) {
+        measureClamps();
+        if ($('f-autoscroll').checked && state.stick) scrollToLatest();
+        updateJump();
+      }
     }
   }
 
@@ -628,7 +740,7 @@
     const strip = $('telemetry-strip');
     if (strip) {
       strip.classList.add('hidden');
-      strip.innerHTML = '';
+      setHtmlIfChanged(strip, '');
     }
     $('empty-body').innerHTML = conv ?
         'Swarms started in this conversation appear here automatically, with their board, ' +
@@ -690,10 +802,12 @@
         return;
       }
       if (swarmId !== state.swarm) resetSwarm(swarmId, { keepPoll: true });
-      state.me = r.member || null;
       if (!r.unchanged) {
-        state.etag = r.etag || '';
+        state.me = r.member || null;
         ingest({ ...r, swarm: swarmId, id: swarmId });
+        state.etag = r.etag || '';
+      } else if (r.member) {
+        state.me = r.member;
       }
       delay = isSwarmActive(state.snap) ? ACTIVE_POLL_MS : IDLE_POLL_MS;
       showView('board');
@@ -716,14 +830,60 @@
     if (document.hidden) {
       clearTimeout(state.pollTimer);
       clearTimeout(state.agentPollTimer);
+      clearTimeout(bootstrapTimer);
+      bootstrapTimer = 0;
     } else {
       poll();
+      if (ov.bootstrapPending && !ov.bootstrap && !ov.bootstrapLoading) {
+        ov.bootstrapPending = false;
+        loadBootstrap();
+      }
       if (typeof state.tab === 'string' && state.tab.startsWith('agent:')) {
         const aName = state.tab.slice(6);
         if (state.openAgentTabs.includes(aName)) fetchAgentHistory(aName, { incremental: true });
       }
     }
   });
+
+  function flushActiveTab(newSet = null) {
+    if (newSet && newSet.size) {
+      for (const seq of newSet) state.pendingNewSeqs.add(seq);
+    }
+    if (!state.snap || state.view !== 'board') return false;
+    const tab = state.tab;
+    if (tab === 'feed') {
+      if (!state.dirtyTabs.has('feed') && !state.pendingNewSeqs.size) return false;
+      const mergedNew = new Set(state.pendingNewSeqs);
+      state.pendingNewSeqs.clear();
+      state.dirtyTabs.delete('feed');
+      renderAgents();
+      renderFilters();
+      renderChannels();
+      renderFeed(mergedNew);
+      return true;
+    } else if (tab === 'members') {
+      if (!state.dirtyTabs.has('members')) return false;
+      state.dirtyTabs.delete('members');
+      renderMembers();
+      return true;
+    } else if (tab === 'graph') {
+      if (!state.dirtyTabs.has('graph')) return false;
+      state.dirtyTabs.delete('graph');
+      renderGraph();
+      return true;
+    } else if (tab === 'raw') {
+      if (!state.dirtyTabs.has('raw')) return false;
+      state.dirtyTabs.delete('raw');
+      renderRaw();
+      return true;
+    } else if (tab === 'overview') {
+      if (!state.dirtyTabs.has('overview')) return false;
+      state.dirtyTabs.delete('overview');
+      renderOverview();
+      return true;
+    }
+    return false;
+  }
 
   function ingest(snap) {
     const newSeqs = [];
@@ -742,6 +902,7 @@
       if (!activeSeqs.has(seq)) state.expanded.delete(seq);
     }
     state.snap = snap;
+    rebuildIndexes(snap);
     const rawUnseen = Array.isArray(snap.unseen)
       ? snap.unseen
       : (state.me && snap.unseenBy && Array.isArray(snap.unseenBy[state.me]) ? snap.unseenBy[state.me] : null);
@@ -760,16 +921,13 @@
     if (snap.view?.html && !ov.bootstrap && !ov.bootstrapLoading) {
       loadBootstrap();
     }
+    ov.model = overviewOn() && snap.view?.json ? sanitizeView(snap.view.json, snap) : null;
+    for (const t of TABS) state.dirtyTabs.add(t);
+    for (const seq of newSet) state.pendingNewSeqs.add(seq);
     renderMeta();
-    renderAgents();
-    renderFilters();
-    renderChannels();
-    renderFeed(newSet);
-    renderMembers();
-    renderGraph();
-    renderRaw();
-    renderOverview();
+    renderOverviewBadge();
     autoSelectTab();
+    flushActiveTab();
     if (newSet.size) {
       const live = $('live');
       live.classList.add('flash');
@@ -817,7 +975,7 @@
     const t = s && s.telemetry && typeof s.telemetry === 'object' ? s.telemetry : null;
     if (!t) {
       strip.classList.add('hidden');
-      if (strip.innerHTML !== '') strip.innerHTML = '';
+      setHtmlIfChanged(strip, '');
       return;
     }
     const active = Number(t.activeWorkers) || 0;
@@ -839,7 +997,7 @@
     const compactionWarn = Number(t.compactionWarningCount) || 0;
     if (!active && !steps && !tools && !processed && !pure && !tps && !cost && !lowCacheAlert && !compactionWarn) {
       strip.classList.add('hidden');
-      if (strip.innerHTML !== '') strip.innerHTML = '';
+      setHtmlIfChanged(strip, '');
       return;
     }
     const items = [];
@@ -861,7 +1019,7 @@
     if (lowCacheAlert) items.push(`<span class="ts-item ts-warn" title="Prompt cache hit rate is below 25%">Low cache</span>`);
     if (compactionWarn > 0) items.push(`<span class="ts-item ts-danger" title="Workers approaching context compaction threshold">${compactionWarn} CTX warn</span>`);
     const html = items.join('');
-    if (strip.innerHTML !== html) strip.innerHTML = html;
+    setHtmlIfChanged(strip, html);
     strip.classList.toggle('hidden', !html);
   }
 
@@ -875,10 +1033,11 @@
     const head = Number.isFinite(s.head) ? s.head : ((s.messages || []).length ? s.messages[s.messages.length - 1].seq : 0);
     $('swarm-title').textContent = title;
     $('swarm-title').title = `${title}\nswarm ${s.id || s.swarm || ''}\n${dir}`;
-    if ($('swarm-meta').innerHTML !== '') $('swarm-meta').innerHTML = '';
+    setHtmlIfChanged($('swarm-meta'), '');
     $('tab-count-feed').textContent = head ? String(head) : '';
     $('tab-count-members').textContent = visibleTeam.length ? String(visibleTeam.length) : '';
     if (state.openAgentTabs.length) renderAgentTabs();
+    syncTabsOverflow();
     renderTelemetryStrip();
   }
 
@@ -953,7 +1112,12 @@
     wrap.classList.toggle('hidden', !on);
     if (!on) {
       state.channel = '';
-      strip.innerHTML = '';
+      setHtmlIfChanged(strip, '');
+      const sel = $('f-channel');
+      if (sel) {
+        if (sel.value !== '') sel.value = '';
+        sel.classList.remove('set');
+      }
       return;
     }
     const baseChan = swarmChannels().find((c) => normChan(c.name) === 'general') ? 'general' : 'main';
@@ -977,13 +1141,13 @@
         `${n}${c?.topic ? ` · ${c.topic}` : ''}${c?.created_by || c?.createdBy ? `\ncreated by ${c.created_by || c.createdBy}` : ''}${c?.archived ? '\narchived' : ''}`;
       return tab(n, `#${esc(n)}${count ? `<span class="chip-count">${count}</span>` : ''}`, tip, c?.archived ? 'archived' : '');
     }).join('');
-    if (strip.innerHTML !== html) strip.innerHTML = html;
+    setHtmlIfChanged(strip, html);
     const sel = $('f-channel');
     const opts = `<option value="">All channels</option>` +
         names.map((n) => `<option value="${esc(n)}">#${esc(n)}${byName.get(n)?.archived ? ' (archived)' : ''}</option>`).join('');
-    if (sel.innerHTML !== opts && document.activeElement !== sel) {
-      sel.innerHTML = opts;
-      sel.value = state.channel;
+    if (document.activeElement !== sel) {
+      setHtmlIfChanged(sel, opts);
+      if (sel.value !== state.channel) sel.value = state.channel;
     }
     sel.classList.toggle('set', !!state.channel);
   }
@@ -1133,11 +1297,14 @@
 
   let suppressScrollSync = false;
   function measureClamps() {
+    if (!feedShown()) return;
     const feed = $('feed');
-    const prevTop = feed ? feed.scrollTop : 0;
+    if (!feed) return;
+    const bodies = [...feed.querySelectorAll('.msg-body')];
+    if (!bodies.length) return;
+    const prevTop = feed.scrollTop;
     suppressScrollSync = true;
     try {
-      const bodies = [...feed.querySelectorAll('.msg-body')];
       const open = bodies.map((body) => body.classList.contains('open'));
       for (const body of bodies) {
         body.classList.add('clamped');
@@ -1147,9 +1314,9 @@
       bodies.forEach((body, i) => {
         body.classList.toggle('open', open[i]);
         body.classList.toggle('clamped', overflows[i]);
-        body.nextElementSibling.classList.toggle('hidden', !overflows[i]);
+        body.nextElementSibling?.classList.toggle('hidden', !overflows[i]);
       });
-      if (feed && feed.scrollTop !== prevTop) feed.scrollTop = prevTop;
+      if (feed.scrollTop !== prevTop) feed.scrollTop = prevTop;
     } finally {
       requestAnimationFrame(() => { suppressScrollSync = false; });
     }
@@ -1226,23 +1393,26 @@
 
   const pillWidth = (id, maxW) => {
     const full = Math.max(72, 54 + Math.ceil(String(id).length * 6.8));
-    return id === 'coordinator' ? full : Math.min(maxW, full);
+    return id === 'coordinator' ? Math.min(Math.max(maxW, 136), full) : Math.min(maxW, full);
   };
 
   function layout(nodes, width) {
     const nodeH = 28;
+    const clampX = (x, w) => Math.max(w / 2 + 8, Math.min(width - w / 2 - 8, x));
     if (nodes.length <= 16) {
       const pos = new Map();
       const n = nodes.length;
-      const w = Math.min(162, Math.max(116, width / Math.max(4, Math.ceil(n / 2) + 1) - 10));
-      const rx = Math.max(60, width / 2 - w / 2 - 14);
-      const ry = n <= 2 ? 60 : Math.min(220, Math.max(110, n * 20));
+      const maxPillW = Math.max(76, Math.min(180, Math.floor(width * 0.44)));
+      const w = Math.min(maxPillW, Math.max(76, width / Math.max(4, Math.ceil(n / 2) + 1) - 10));
+      const rx = Math.max(24, Math.min(width * 0.42, width / 2 - w / 2 - 18));
+      const ry = n <= 2 ? Math.min(60, Math.max(36, rx * 0.6)) : Math.min(250, Math.max(96, Math.min(n * 20, rx * 0.78 + 44)));
       const cx = width / 2, cy = ry + nodeH / 2 + 20;
       nodes.forEach((node, i) => {
         const a = -Math.PI / 2 + (2 * Math.PI * i) / n;
-        pos.set(node.id, { x: cx + rx * Math.cos(a), y: cy + ry * Math.sin(a), w: pillWidth(node.id, w), h: nodeH });
+        const pw = pillWidth(node.id, w);
+        pos.set(node.id, { x: clampX(cx + rx * Math.cos(a), pw), y: cy + ry * Math.sin(a), w: pw, h: nodeH });
       });
-      return { pos, height: cy + ry + nodeH / 2 + 20 };
+      return { pos, height: Math.ceil(cy + ry + nodeH / 2 + 20) };
     }
     const rows = new Map();
     for (const n of nodes) {
@@ -1250,20 +1420,23 @@
       rows.get(n.row).push(n);
     }
     const pos = new Map();
-    const minNodeW = 114, lineH = 64, rowGap = 40;
-    const perLine = Math.max(1, Math.floor(width / (minNodeW + 12)));
+    const minNodeW = Math.min(114, Math.max(76, width - 24)), lineH = 64, rowGap = 40;
+    const perLine = Math.max(1, Math.floor((width - 16) / (minNodeW + 12)));
     let y = 32;
     for (const [, list] of [...rows.entries()].sort((a, b) => a[0] - b[0])) {
       for (let i = 0; i < list.length; i += perLine) {
         const line = list.slice(i, i + perLine);
         const gap = width / (line.length + 1);
-        const w = Math.min(158, Math.max(minNodeW, gap - 12));
-        line.forEach((n, j) => pos.set(n.id, { x: gap * (j + 1), y: y + (line.length > 3 && j % 2 ? 14 : 0), w: pillWidth(n.id, Math.min(w, gap - 8)), h: nodeH }));
+        const w = Math.min(168, Math.max(minNodeW, gap - 12));
+        line.forEach((n, j) => {
+          const pw = pillWidth(n.id, Math.max(72, Math.min(w, gap - 8)));
+          pos.set(n.id, { x: clampX(gap * (j + 1), pw), y: y + (line.length > 3 && j % 2 ? 14 : 0), w: pw, h: nodeH });
+        });
         y += lineH;
       }
       y += rowGap;
     }
-    return { pos, height: y - rowGap + 14 };
+    return { pos, height: Math.ceil(y - rowGap + 14) };
   }
 
   // ---------- graph + replay ----------
@@ -1421,14 +1594,16 @@
       return;
     }
     const svg = $('graph');
-    const width = Math.max(svg.clientWidth || 0, 320);
+    const measuredW = Math.floor(svg.clientWidth || $('tab-graph')?.clientWidth || 0);
+    const width = Math.max(180, measuredW || 480);
     const expandAll = $('g-all').checked;
     const hideInactive = $('g-hide-inactive')?.checked || false;
     const g = buildGraphState(s, all, { replaying, upto, expandAll, hideInactive, width });
     const { nodes, pos, height, edges, unaddressed, broadcasts, current, curTargets, max, isActive, isCur } = g;
 
     svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
-    svg.style.height = `${height}px`;
+    svg.style.height = 'auto';
+    svg.style.aspectRatio = `${width} / ${height}`;
 
     const animateCur = !!current && current.seq !== replay.animatedSeq;
     replay.animatedSeq = current ? current.seq : null;
@@ -1514,19 +1689,18 @@
     $('replay-fwd').disabled = replay.idx === null || upto >= all.length;
     const t0 = all.length ? msgMs(all[0]) : 0;
     const label = $('replay-label');
-    if (replay.idx === null) {
-      label.innerHTML = `<b>${plural(all.length, 'post')}</b>` + (all.length > 1 ? ` over ${esc(fmtDur(msgMs(all[all.length - 1]) - t0))}` : '');
-    } else {
-      label.innerHTML = `<b>${upto}</b> of ${all.length}` + (current ? ` · #${current.seq} at ${esc(fmtClock(msgMs(current)))} (+${esc(fmtDur(msgMs(current) - t0))})` : '');
-    }
+    const labelHtml = replay.idx === null
+      ? `<b>${plural(all.length, 'post')}</b>` + (all.length > 1 ? ` over ${esc(fmtDur(msgMs(all[all.length - 1]) - t0))}` : '')
+      : `<b>${upto}</b> of ${all.length}` + (current ? ` · #${current.seq} at ${esc(fmtClock(msgMs(current)))} (+${esc(fmtDur(msgMs(current) - t0))})` : '');
+    setHtmlIfChanged(label, labelHtml);
     const cap = $('replay-caption');
     if (!current) {
       cap.classList.add('hidden');
-      cap.innerHTML = '';
+      setHtmlIfChanged(cap, '');
       return;
     }
     cap.classList.remove('hidden');
-    cap.innerHTML = `<div class="msg-head">
+    const capHtml = `<div class="msg-head">
           <span class="msg-who">
             <span class="msg-author">${esc(senderOf(current))}</span>
             ${recipientsHtml(current)}
@@ -1534,17 +1708,19 @@
           <span class="ts" title="${esc(`#${current.seq} · ${fmtFull(msgMs(current))}`)}">${esc(fmtClock(msgMs(current)))}</span>
         </div>
         <div class="msg-body md open">${md(textOf(current))}</div>`;
+    setHtmlIfChanged(cap, capHtml);
     sizeReplayCaption();
   }
 
   function sizeReplayCaption() {
     const cap = $('replay-caption');
-    const body = cap.querySelector('.msg-body');
+    const body = cap?.querySelector('.msg-body');
     if (!body) return;
+    const tab = $('tab-graph');
     const capPad = parseFloat(getComputedStyle(cap).paddingBottom) || 0;
-    const mainPad = parseFloat(getComputedStyle(document.querySelector('.main')).paddingBottom) || 0;
-    const top = body.getBoundingClientRect().top + window.scrollY;
-    cap.style.setProperty('--caption-room', `${Math.floor(window.innerHeight - top - capPad - mainPad)}px`);
+    const tabBottom = tab ? tab.getBoundingClientRect().bottom : window.innerHeight;
+    const top = body.getBoundingClientRect().top;
+    cap.style.setProperty('--caption-room', `${Math.max(120, Math.floor(tabBottom - top - capPad - 16))}px`);
   }
 
   function replayDelay(all, idx) {
@@ -2373,8 +2549,8 @@
     const rawDir = String(state.rawKind === 'view' ? s.view?.dir || s.dir : (s.dir || s.meta?.workspace || '')).replace(/[\\/]+$/, '');
     const sep = rawDir.includes('\\') && !rawDir.includes('/') ? '\\' : '/';
     const path = rawDir ? `${rawDir}${sep}${file}` : file;
-    $('raw-meta').innerHTML = `<span class="path" title="${esc(path)}"><span dir="ltr">${esc(path)}</span></span>` +
-        `<span class="size">· ${esc(fmtBytes(text.length))}${lines ? ` · ${plural(lines, 'line')}` : ''}</span>`;
+    setHtmlIfChanged($('raw-meta'), `<span class="path" title="${esc(path)}"><span dir="ltr">${esc(path)}</span></span>` +
+        `<span class="size">· ${esc(fmtBytes(text.length))}${lines ? ` · ${plural(lines, 'line')}` : ''}</span>`);
     state.rawIsEmpty = !text;
     const shown = text || '(empty)';
     if ($('raw').textContent !== shown) $('raw').textContent = shown;
@@ -2625,7 +2801,9 @@
     model: null,
     bootstrap: null,
     bootstrapLoading: false,
+    bootstrapPending: false,
   };
+  let bootstrapTimer = 0;
   const narratorOf = () => state.snap?.narrator || null;
   const liveNarrator = () => !!narratorOf() && !['absent', 'killed'].includes(state.snap.narratorState);
   const viewExists = () => !!state.snap?.view?.exists;
@@ -2653,9 +2831,10 @@
     $('tabbtn-graph').classList.toggle('hidden', !graphOn());
     $('tabbtn-raw').classList.toggle('hidden', !rawOn());
     $('raw-btn-view')?.classList.toggle('hidden', !rawViewExists());
+    syncTabsOverflow();
     if (!rawViewExists() && state.rawKind === 'view') {
       state.rawKind = 'board';
-      renderRaw();
+      state.dirtyTabs.add('raw');
     }
     if ((!on && state.tab === 'overview') || (!graphOn() && state.tab === 'graph') ||
         (!rawOn() && state.tab === 'raw')) {
@@ -2700,6 +2879,25 @@
     killed: ['stopped', 'The narrator was stopped; the overview no longer updates'],
   };
 
+  function renderOverviewBadge() {
+    const s = state.snap;
+    if (!s) return;
+    const sys = s.systemAttention || [];
+    const coord = (s.members || []).find((m) => m.role === 'coordinator' && !m.killed);
+    const msgs = s.messages || [];
+    const lastMsg = msgs[msgs.length - 1];
+    const swarmDone = !!coord && senderOf(lastMsg) === coord.name && /^\[done\]/i.test(String(textOf(lastMsg) || '').trim());
+    const coordSys = coord ? sys.filter((it) => it.member === coord.name).length : 0;
+    const want = swarmDone ? 0 : coordSys + (coord?.status === 'waiting' && coord.replied && coord.replyAsk ? 1 : 0);
+    const badge = $('tab-badge-overview');
+    if (badge) {
+      const next = want ? String(want) : '';
+      if (badge.textContent !== next) badge.textContent = next;
+      badge.classList.toggle('hidden', !want);
+      syncTabsOverflow();
+    }
+  }
+
   function renderOverviewChrome() {
     const s = state.snap;
     if (!s || !overviewOn()) return;
@@ -2723,7 +2921,7 @@
           `<span class="ov-fresh" data-testid="swarm-overview-freshness" title="${esc(`Narrator read up to #${read} of ${s.head || 0}`)}">` +
           `read #${read}${updated ? ` · updated ${esc(updated)}` : ''}</span>`;
     }
-    if ($('ov-status').innerHTML !== status) $('ov-status').innerHTML = status;
+    setHtmlIfChanged($('ov-status'), status);
     $('ov-status').classList.toggle('hidden', !status);
 
     const sys = s.systemAttention || [];
@@ -2740,14 +2938,14 @@
           openBtn +
           `</div>`;
     }).join('');
-    if ($('ov-system').innerHTML !== sysHtml) $('ov-system').innerHTML = sysHtml;
+    setHtmlIfChanged($('ov-system'), sysHtml);
     $('ov-system').classList.toggle('hidden', !sysHtml);
 
     const notice = noticeHtml();
     const lastGood = ov.model && s.view?.jsonError ?
       'Showing the last good view.json; the current file is ' + (s.view.jsonError === 'too_large' ? 'over 64 KB.' : 'not valid JSON.') : '';
     const noticeText = notice || lastGood;
-    if ($('ov-notice').innerHTML !== noticeText) $('ov-notice').innerHTML = noticeText;
+    setHtmlIfChanged($('ov-notice'), noticeText);
     $('ov-notice').classList.toggle('hidden', !noticeText);
 
     const hasCoord = !!(s.members || []).find((m) => m.role === 'coordinator' || m.name === 'coordinator');
@@ -2755,17 +2953,10 @@
     $('ov-open-coord').classList.toggle('hidden', !hasCoord && !coordinatorConv());
     const ack = v?.feedback_ack;
     const ackHtml = ack ? `Last change: “${esc(ack.text)}”${ack.through_seq ? ` <button type="button" class="ref" data-ov-seq="${ack.through_seq}">#${ack.through_seq}</button>` : ''}` : '';
-    if ($('ov-ack').innerHTML !== ackHtml) $('ov-ack').innerHTML = ackHtml;
+    setHtmlIfChanged($('ov-ack'), ackHtml);
     $('ov-ack').classList.toggle('hidden', !ackHtml);
 
-    const coord = (s.members || []).find((m) => m.role === 'coordinator' && !m.killed);
-    const msgs = s.messages || [];
-    const lastMsg = msgs[msgs.length - 1];
-    const swarmDone = !!coord && senderOf(lastMsg) === coord.name && /^\[done\]/i.test(String(textOf(lastMsg) || '').trim());
-    const coordSys = coord ? sys.filter((it) => it.member === coord.name).length : 0;
-    const want = swarmDone ? 0 : coordSys + (coord?.status === 'waiting' && coord.replied && coord.replyAsk ? 1 : 0);
-    $('tab-badge-overview').textContent = want ? String(want) : '';
-    $('tab-badge-overview').classList.toggle('hidden', !want);
+    renderOverviewBadge();
   }
 
   function plainReason() {
@@ -2846,6 +3037,10 @@
     $('f-agent').value = '';
     $('f-mention').value = '';
     if ($('f-kind')) $('f-kind').value = '';
+    if ($('f-channel')) {
+      $('f-channel').value = '';
+      $('f-channel').classList.remove('set');
+    }
     $('f-search').value = '';
     $('f-agent').classList.remove('set');
     $('f-mention').classList.remove('set');
@@ -3147,16 +3342,30 @@
 
   async function loadBootstrap() {
     if (ov.bootstrapLoading || ov.bootstrap) return;
+    if (document.hidden) {
+      ov.bootstrapPending = true;
+      return;
+    }
     ov.bootstrapLoading = true;
+    ov.bootstrapPending = false;
+    clearTimeout(bootstrapTimer);
+    bootstrapTimer = 0;
     try {
       const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
       const res = await f('./narrator_bootstrap.js', { method: 'GET' });
       if (!res.ok) throw new Error(`narrator_bootstrap.js: ${res.status}`);
       ov.bootstrap = await res.text();
-      if (state.snap) renderOverview();
+      if (state.snap) {
+        if (state.tab === 'overview') renderOverview();
+        else state.dirtyTabs.add('overview');
+      }
     } catch (e) {
       console.warn(e);
-      setTimeout(loadBootstrap, IDLE_POLL_MS);
+      if (document.hidden) {
+        ov.bootstrapPending = true;
+      } else {
+        bootstrapTimer = setTimeout(loadBootstrap, IDLE_POLL_MS);
+      }
     } finally {
       ov.bootstrapLoading = false;
     }
@@ -3168,6 +3377,7 @@
     if (!state.agentTabData[name]) {
       state.agentTabData[name] = {
         messages: [],
+        messagesVersion: 0,
         subagents: [],
         selectedSubagent: '',
         telemetry: null,
@@ -3183,6 +3393,11 @@
         reqGen: 0,
         lastCommittedSig: '',
         lastLiveSig: '',
+        committedInputKey: '',
+        committedDeferred: false,
+        cachedCommittedToolIds: null,
+        cachedLiveReasoning: null,
+        cachedLiveTranscript: null,
         seenDKeys: new Set(),
         prevTab: state.tab && !state.tab.startsWith('agent:') ? state.tab : 'members',
       };
@@ -3253,6 +3468,7 @@
       btn.setAttribute('aria-selected', String(on));
       btn.tabIndex = on ? 0 : -1;
     }
+    syncTabsOverflow();
   }
 
   function stopAgentPoll() {
@@ -3290,7 +3506,11 @@
     if (older) {
       if (af) olderRestore = { prevTop: af.scrollTop, prevHeight: af.scrollHeight };
       if (data.messages.length) {
-        const minId = Math.min(...data.messages.map((x) => Number(x.id) || Infinity));
+        let minId = Infinity;
+        for (const x of data.messages) {
+          const nid = Number(x?.id);
+          if (Number.isFinite(nid) && nid > 0 && nid < minId) minId = nid;
+        }
         if (Number.isFinite(minId) && minId > 1) beforeId = minId;
       }
       if (!beforeId) data.limit = Math.min(300, (data.limit || 100) + 100);
@@ -3332,6 +3552,7 @@
           }
           if (addedNew) {
             data.messages.sort((a, b) => (Number(a.id) || 0) - (Number(b.id) || 0));
+            data.messagesVersion = (data.messagesVersion || 0) + 1;
           }
         }
       } else {
@@ -3344,10 +3565,15 @@
           }
         }
         data.messages = deduped;
+        data.messagesVersion = (data.messagesVersion || 0) + 1;
       }
       if (typeof res.hasMore === 'boolean') data.hasMore = res.hasMore;
       if (typeof res.totalCount === 'number') data.totalCount = res.totalCount;
-      const maxMsgId = data.messages.length ? Math.max(...data.messages.map((x) => Number(x.id) || 0)) : 0;
+      let maxMsgId = 0;
+      for (const x of data.messages) {
+        const nid = Number(x?.id) || 0;
+        if (nid > maxMsgId) maxMsgId = nid;
+      }
       const resLastId = (typeof res.lastId === 'number' && res.lastId > 0) ? res.lastId : 0;
       if (incremental || beforeId > 0) {
         data.lastId = Math.max(data.lastId || 0, resLastId, maxMsgId);
@@ -3417,6 +3643,7 @@
     if (idx === -1) return;
     const data = state.agentTabData[name];
     state.openAgentTabs.splice(idx, 1);
+    delete state.agentTabData[name];
     const wasActive = state.tab === `agent:${name}`;
     if (wasActive) stopAgentPoll();
     renderAgentTabs();
@@ -4132,14 +4359,23 @@
     if (dedupedReasoning) {
       const rKey = `live-think:${name}:${data.selectedSubagent || 'main'}`;
       const rOpen = state.agentDetailsOpen.has(rKey);
+      let reasoningHtml;
+      if (data.cachedLiveReasoning && data.cachedLiveReasoning.raw === dedupedReasoning) {
+        reasoningHtml = data.cachedLiveReasoning.html;
+      } else {
+        reasoningHtml = md(dedupedReasoning);
+        data.cachedLiveReasoning = { raw: dedupedReasoning, html: reasoningHtml };
+      }
       liveParts.push({
         key: rKey,
         sig: `${dedupedReasoning.length}|${dedupedReasoning.slice(-40)}`,
         html: `<details class="ag-think" data-ag-dkey="${esc(rKey)}"${rOpen ? ' open' : ''}>
           <summary>Thought process</summary>
-          <div class="ag-think-body md">${md(dedupedReasoning)}</div>
+          <div class="ag-think-body md">${reasoningHtml}</div>
         </details>`,
       });
+    } else {
+      data.cachedLiveReasoning = null;
     }
     for (let i = 0; i < liveTools.length; i++) {
       const tc = liveTools[i] || {};
@@ -4161,7 +4397,17 @@
 
     const wgKey = `live-wg:${name}:${data.selectedSubagent || 'main'}`;
     const wgOpen = state.agentDetailsOpen.has(wgKey);
-    const transcriptHtml = dedupedTranscript ? md(dedupedTranscript) : '';
+    let transcriptHtml = '';
+    if (dedupedTranscript) {
+      if (data.cachedLiveTranscript && data.cachedLiveTranscript.raw === dedupedTranscript) {
+        transcriptHtml = data.cachedLiveTranscript.html;
+      } else {
+        transcriptHtml = md(dedupedTranscript);
+        data.cachedLiveTranscript = { raw: dedupedTranscript, html: transcriptHtml };
+      }
+    } else {
+      data.cachedLiveTranscript = null;
+    }
     const transcriptSig = dedupedTranscript ? `${dedupedTranscript.length}|${dedupedTranscript.slice(-64)}` : '';
     return { wgKey, wgOpen, summaryText, liveParts, transcriptHtml, transcriptSig };
   }
@@ -4294,6 +4540,11 @@
       committed.dataset.agPaneOwner = paneKey;
       data.lastCommittedSig = '';
       data.lastLiveSig = '';
+      data.committedInputKey = '';
+      data.committedDeferred = false;
+      data.cachedCommittedToolIds = null;
+      data.cachedLiveReasoning = null;
+      data.cachedLiveTranscript = null;
     }
     const subList = (Array.isArray(data.subagents) && data.subagents.length ? data.subagents : m?.subagents) || [];
     const subObj = subId ? (subList.find((s) => s && String(s.sessionId || s.id || '') === subId) || null) : null;
@@ -4371,7 +4622,7 @@
         ${tps > 0 ? `<span>${tpsEst ? '~' : ''}${esc(fmtTpsCompact(tps))}</span>` : ''}
       </div>
       ${subPills}`;
-    if (header.innerHTML !== headHtml) header.innerHTML = headHtml;
+    setHtmlIfChanged(header, headHtml);
 
     const wasNearBottom = feed.scrollTop + feed.clientHeight >= feed.scrollHeight - 60;
     const prevTop = feed.scrollTop;
@@ -4382,6 +4633,8 @@
       const loadHtml = '<div class="ag-empty">Loading agent history…</div>';
       if (data.lastCommittedSig !== 'loading') {
         data.lastCommittedSig = 'loading';
+        data.committedInputKey = '';
+        data.cachedCommittedToolIds = null;
         committed.innerHTML = loadHtml;
         committedChanged = true;
       }
@@ -4389,23 +4642,41 @@
       const errSig = `err:${data.error}`;
       if (data.lastCommittedSig !== errSig) {
         data.lastCommittedSig = errSig;
+        data.committedInputKey = '';
+        data.cachedCommittedToolIds = null;
         committed.innerHTML = `<div class="ag-empty">${esc(data.error)}</div>`;
         committedChanged = true;
       }
     } else if (!data.messages.length) {
       if (data.lastCommittedSig !== 'empty') {
         data.lastCommittedSig = 'empty';
+        data.committedInputKey = '';
+        data.cachedCommittedToolIds = null;
         committed.innerHTML = '<div class="ag-empty">No session history recorded yet.</div>';
         committedChanged = true;
       }
     } else {
-      const { timeline, committedToolCallIds } = groupAgentTimeline(data.messages, { name, st, data });
-      committedToolIds = committedToolCallIds;
-      const cSig = timeline.map((b) => `${b.key}=${b.sig}`).join('\n');
-      if (data.lastCommittedSig !== cSig) {
-        const deferred = reconcileCommitted(committed, timeline);
-        if (!deferred) data.lastCommittedSig = cSig;
-        committedChanged = true;
+      const afCount = state.snap?.allowedFiles ? Object.keys(state.snap.allowedFiles).length : 0;
+      const committedInputKey = `${paneKey}|v${data.messagesVersion || 0}|n${data.messages.length}|l${data.lastId || 0}|s${st}|af${afCount}`;
+      if (data.committedInputKey === committedInputKey && !data.committedDeferred && data.cachedCommittedToolIds) {
+        committedToolIds = data.cachedCommittedToolIds;
+      } else {
+        const { timeline, committedToolCallIds } = groupAgentTimeline(data.messages, { name, st, data });
+        committedToolIds = committedToolCallIds;
+        data.cachedCommittedToolIds = committedToolCallIds;
+        const cSig = timeline.map((b) => `${b.key}=${b.sig}`).join('\n');
+        if (data.lastCommittedSig !== cSig) {
+          const deferred = reconcileCommitted(committed, timeline);
+          data.committedDeferred = deferred;
+          if (!deferred) {
+            data.lastCommittedSig = cSig;
+            data.committedInputKey = committedInputKey;
+          }
+          committedChanged = true;
+        } else {
+          data.committedDeferred = false;
+          data.committedInputKey = committedInputKey;
+        }
       }
     }
 
@@ -4445,11 +4716,11 @@
       const footHtml = `<span class="live-dot" aria-hidden="true"></span>` +
         `<span class="ag-live-tool">${esc(curTool)}</span>` +
         `${tps > 0 ? `<span class="ag-live-tps">${tpsEst ? '~' : ''}${esc(fmtTpsCompact(tps))}</span>` : ''}`;
-      if (foot.innerHTML !== footHtml) foot.innerHTML = footHtml;
+      setHtmlIfChanged(foot, footHtml);
       foot.classList.remove('hidden');
     } else {
       foot.classList.add('hidden');
-      if (foot.innerHTML !== '') foot.innerHTML = '';
+      setHtmlIfChanged(foot, '');
     }
     $('agent-pane')?.classList.toggle('has-live-foot', showFoot);
     updateAgentJump(name);
@@ -4507,16 +4778,21 @@
     if (isAgent) {
       renderAgentPane(agentName);
       fetchAgentHistory(agentName, { incremental: !!state.agentTabData[agentName]?.messages?.length });
-    } else {
-      if (state.snap && tab === 'graph') renderGraph();
-      if (state.snap && tab === 'overview') renderOverview();
-      if (state.snap && tab === 'members') renderMembers();
-      if (state.snap && tab === 'feed') measureClamps();
+    } else if (state.snap) {
+      const wasDirty = state.dirtyTabs.has(tab);
+      flushActiveTab();
+      if (!wasDirty && state.view === 'board') {
+        if (tab === 'graph') renderGraph();
+        else if (tab === 'overview') renderOverview();
+        else if (tab === 'members') renderMembers();
+        else if (tab === 'feed') measureClamps();
+      }
     }
     syncWatchdog();
     updateJump();
   }
-  document.querySelector('.tabs').addEventListener('click', (e) => {
+  const tabsNav = document.querySelector('.tabs');
+  tabsNav.addEventListener('click', (e) => {
     const closeBtn = e.target.closest('[data-close-agent]');
     if (closeBtn) {
       e.stopPropagation();
@@ -4526,7 +4802,23 @@
     const t = e.target.closest('.tab[data-tab]');
     if (t) selectTab(t.dataset.tab, false, true);
   });
-  document.querySelector('.tabs').addEventListener('keydown', (e) => {
+  tabsNav.addEventListener('scroll', syncTabsOverflow, { passive: true });
+  tabsNav.addEventListener('wheel', (e) => {
+    if (e.ctrlKey) return;
+    const maxScroll = tabsNav.scrollWidth - tabsNav.clientWidth;
+    if (maxScroll <= 1) return;
+    if (Math.abs(e.deltaY) <= Math.abs(e.deltaX) || e.deltaY === 0) return;
+    e.preventDefault();
+    const scale = e.deltaMode === 1 ? 24 : (e.deltaMode === 2 ? Math.max(80, tabsNav.clientWidth * 0.85) : 1);
+    const delta = e.deltaY * scale;
+    if (typeof tabsNav.scrollBy === 'function') {
+      tabsNav.scrollBy({ left: delta, behavior: 'instant' });
+    } else {
+      tabsNav.scrollLeft += delta;
+    }
+    syncTabsOverflow();
+  }, { passive: false });
+  tabsNav.addEventListener('keydown', (e) => {
     const closeBtn = e.target.closest('[data-close-agent]');
     if (closeBtn && (e.key === 'Enter' || e.key === ' ')) {
       e.preventDefault();
@@ -4758,7 +5050,25 @@
     $('tab-feed').querySelector('.toolbar').classList.toggle('stuck', f.scrollTop > 0);
     updateJump();
   }, { passive: true });
-  new ResizeObserver(keepPinned).observe($('feed'));
+  let lastFeedW = 0;
+  let feedResizeRaf = 0;
+  new ResizeObserver(() => {
+    const f = $('feed');
+    if (!f || !feedShown()) return;
+    const w = Math.floor(f.clientWidth);
+    if (Math.abs(w - lastFeedW) >= 4) {
+      lastFeedW = w;
+      cancelAnimationFrame(feedResizeRaf);
+      feedResizeRaf = requestAnimationFrame(() => {
+        feedResizeRaf = 0;
+        measureClamps();
+        keepPinned();
+        updateJump();
+      });
+    } else {
+      keepPinned();
+    }
+  }).observe($('feed'));
   document.querySelectorAll('.gview-btn').forEach((b) => b.addEventListener('click', () => {
     state.graphView = b.dataset.gview;
     renderGraph();
@@ -4829,16 +5139,65 @@
     else if (e.key === 'ArrowRight') replaySeek((replay.idx ?? graphMsgs().length) + 1);
   });
   let resizeRaf = 0;
-  window.addEventListener('resize', () => {
+  let lastBoardW = 0;
+  let lastBoardH = 0;
+  let lastGraphW = 0;
+  function scheduleLayoutReflow() {
     cancelAnimationFrame(resizeRaf);
     resizeRaf = requestAnimationFrame(() => {
-      if (!state.snap) return;
-      if (state.tab === 'graph') renderGraph();
-      if (state.tab === 'feed') {
+      resizeRaf = 0;
+      if (!state.snap || state.view !== 'board') return;
+      if (state.tab === 'graph') {
+        renderGraph();
+      } else if (state.tab === 'feed') {
         measureClamps();
         keepPinned();
+        updateJump();
+      } else if (typeof state.tab === 'string' && state.tab.startsWith('agent:')) {
+        const name = state.tab.slice(6);
+        const data = state.agentTabData[name];
+        const af = $('agent-feed');
+        if (data?.stick && af && !hasSelectionInside(af)) {
+          af.scrollTop = af.scrollHeight;
+        }
+        updateAgentJump(name);
       }
     });
+  }
+  window.addEventListener('resize', scheduleLayoutReflow, { passive: true });
+  if (typeof ResizeObserver === 'function') {
+    const boardEl = $('board');
+    if (boardEl) {
+      new ResizeObserver(() => {
+        if (state.view !== 'board') return;
+        const w = Math.floor(boardEl.clientWidth);
+        const h = Math.floor(boardEl.clientHeight);
+        if (w < 40) return;
+        if (Math.abs(w - lastBoardW) >= 4 || Math.abs(h - lastBoardH) >= 4) {
+          lastBoardW = w;
+          lastBoardH = h;
+          scheduleLayoutReflow();
+        }
+      }).observe(boardEl);
+    }
+    const graphEl = $('graph');
+    if (graphEl) {
+      new ResizeObserver(() => {
+        if (state.view !== 'board' || state.tab !== 'graph' || state.graphView !== 'mentions') return;
+        const w = Math.floor(graphEl.clientWidth);
+        if (w < 40) return;
+        if (Math.abs(w - lastGraphW) >= 4) {
+          lastGraphW = w;
+          scheduleLayoutReflow();
+        }
+      }).observe(graphEl);
+    }
+    if (tabsNav) {
+      new ResizeObserver(syncTabsOverflow).observe(tabsNav);
+    }
+  }
+  document.fonts?.ready?.then(() => {
+    if (state.snap && feedShown()) measureClamps();
   });
 
   if (urlTabChosen) selectTab(initialTab, false, true);

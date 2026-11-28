@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections import OrderedDict
+import copy
 import json
 import math
 import os
 from pathlib import Path
+import threading
 from typing import Any
 from urllib.parse import quote
 import weakref
@@ -24,6 +27,58 @@ import worktree as worktree_mod
 
 _SERVER_DIR = Path(__file__).resolve().parent
 _OPEN_BOARD_LINK = "[Hermes Swarm](sidecar://hermes-swarm/swarm_board/)"
+_ROLE_POLICY_CACHE_LOCK = threading.Lock()
+_ROLE_POLICY_CACHE: OrderedDict[tuple[str, str, int, int], dict[str, Any]] = OrderedDict()
+_ROLE_POLICY_CACHE_MAX = 32
+
+
+def _load_role_policy_cached(workspace: str | None = None) -> dict[str, Any]:
+    """Load local role_policy cached by `(env_override, path, mtime_ns, size)` while always honoring env overrides."""
+    env_val = str(os.environ.get("HERMES_SWARM_ROLE_POLICY") or "").strip()
+    if env_val.lower() in ("default", "none", "off"):
+        return role_policy_mod.load_role_policy(workspace)
+
+    chosen: Path | None = None
+    chosen_sig: tuple[int, int] | None = None
+    if env_val:
+        explicit = Path(env_val).expanduser()
+        try:
+            st = explicit.stat()
+            if explicit.is_file():
+                chosen = explicit
+                chosen_sig = (int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            pass
+        if chosen is None:
+            return role_policy_mod.load_role_policy(workspace)
+    else:
+        for cand in role_policy_mod.candidate_role_policy_paths(workspace):
+            try:
+                if cand.is_file():
+                    st = cand.stat()
+                    chosen = cand
+                    chosen_sig = (int(st.st_mtime_ns), int(st.st_size))
+                    break
+            except OSError:
+                continue
+        if chosen is None:
+            return role_policy_mod.load_role_policy(workspace)
+
+    assert chosen is not None and chosen_sig is not None
+    cache_key = (env_val, str(chosen), chosen_sig[0], chosen_sig[1])
+    with _ROLE_POLICY_CACHE_LOCK:
+        cached = _ROLE_POLICY_CACHE.get(cache_key)
+        if cached is not None:
+            _ROLE_POLICY_CACHE.move_to_end(cache_key)
+            return copy.deepcopy(cached)
+
+    policy = role_policy_mod.load_role_policy(workspace)
+    with _ROLE_POLICY_CACHE_LOCK:
+        _ROLE_POLICY_CACHE[cache_key] = copy.deepcopy(policy)
+        _ROLE_POLICY_CACHE.move_to_end(cache_key)
+        while len(_ROLE_POLICY_CACHE) > _ROLE_POLICY_CACHE_MAX:
+            _ROLE_POLICY_CACHE.popitem(last=False)
+    return policy
 
 ORCHESTRATOR_INSTRUCTIONS = """\
 You are connected to the Hermes A2A Swarm Bridge (`hermes-a2a`), enabling a 3-tier
@@ -250,7 +305,7 @@ async def swarm_catalog(
     )
     cat["http_url"] = _http_ctrl.url or _swarm_mgr.http_url
     cat["active_workdir"] = resolved_ws or _get_session_val(ctx, "workdir") or _swarm_mgr.get_default_workdir()
-    cat["role_policy"] = role_policy_mod.load_role_policy(cat["active_workdir"])
+    cat["role_policy"] = await asyncio.to_thread(_load_role_policy_cached, cat["active_workdir"])
     return _json_str(cat)
 
 
@@ -422,7 +477,7 @@ async def swarm_manage(
             "http_url": _http_ctrl.url or _swarm_mgr.http_url,
             "observer_ui_url": observer_ui_url,
             "meta": meta,
-            "role_policy": role_policy_mod.load_role_policy(meta.get("workspace") or resolved_ws),
+            "role_policy": await asyncio.to_thread(_load_role_policy_cached, meta.get("workspace") or resolved_ws),
         })
 
     lookup_conv = (
@@ -553,7 +608,7 @@ async def swarm_manage(
             "telemetry": snap.get("telemetry") or {},
             "members": snap.get("members") or [],
             "tasks": tasks_res.get("tasks") or [],
-            "role_policy": role_policy_mod.load_role_policy(meta.get("workspace") or resolved_ws),
+            "role_policy": await asyncio.to_thread(_load_role_policy_cached, meta.get("workspace") or resolved_ws),
         })
 
     raise ValueError(f"Unsupported swarm_manage action: {action!r}")
@@ -607,7 +662,7 @@ async def swarm_worker(
         if not prompt or not prompt.strip():
             raise ValueError("`prompt` is required for action='spawn'.")
         meta_doc = await asyncio.to_thread(_swarm_mgr.store.read_meta, sid) or {}
-        policy = role_policy_mod.load_role_policy(resolved_ws or meta_doc.get("workspace"))
+        policy = await asyncio.to_thread(_load_role_policy_cached, resolved_ws or meta_doc.get("workspace"))
         allowed, policy_msg = role_policy_mod.evaluate_worker_spawn_policy(
             role,
             worker_name=name.strip(),

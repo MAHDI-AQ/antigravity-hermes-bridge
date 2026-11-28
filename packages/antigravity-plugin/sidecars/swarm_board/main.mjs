@@ -29,7 +29,16 @@ const BOARD_FETCH_TIMEOUT_MS = 6000;
 const MAX_FRAME_BYTES = 8 * 1024 * 1024;
 const MAX_SWARM_JSON_BYTES = 16 * 1024 * 1024;
 const MAX_CONV_CACHE_ENTRIES = 100;
+const MAX_LAST_GOOD_ENTRIES = 32;
+const MAX_LAST_GOOD_TOTAL_BYTES = 4 * 1024 * 1024;
 const CONV_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+const TOKEN_FILE_STAT_TTL_MS = 3_000;
+const REGISTRY_CACHE_TTL_MS = 2_000;
+const PID_ALIVE_CACHE_TTL_MS = 5_000;
+const WARN_THROTTLE_MS = 60_000;
+const EVENTS_RETRY_ACTIVE_MS = 5000;
+const EVENTS_RETRY_EMPTY_MS = 10000;
+const SEND_QUEUE_YIELD_MS = 25;
 const HOST_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i;
 const DEFAULT_URL_HOSTS = ['docs.google.com'];
 const ALLOWED_FRAME_EXTS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
@@ -51,8 +60,91 @@ const STATIC_ASSETS = {
 };
 
 const lastSwarmByConv = new Map(); // conv -> { value, ts }
-const lastGoodSwarmByConv = new Map(); // cacheKey -> { value, ts }
-const tokenFileCache = new Map(); // filePath -> { mtimeMs, token }
+const lastMemberByConv = new Map(); // conv -> { value, ts }
+const lastConversationIdsByConv = new Map(); // conv -> { value, ts }
+const lastGoodSwarmByConv = new Map(); // cacheKey -> { value, bytes, ts }
+let lastGoodTotalBytes = 0;
+const inFlightSwarmFetches = new Map(); // key -> Promise<object>
+const tokenFileCache = new Map(); // filePath -> { mtimeMs, size, token, checkedAt }
+const registryCache = new Map(); // registryPath -> { mtimeMs, size, checkedAt, entries }
+const pidAliveCache = new Map(); // pid -> { alive, checkedAt }
+const throttledWarnAt = new Map(); // key -> ts
+
+function warnThrottled(key, message, ttlMs = WARN_THROTTLE_MS) {
+  const now = Date.now();
+  const prev = throttledWarnAt.get(key) || 0;
+  if (now - prev < ttlMs) return;
+  throttledWarnAt.set(key, now);
+  if (throttledWarnAt.size > 500) {
+    const cutoff = now - ttlMs * 10;
+    for (const [k, ts] of throttledWarnAt.entries()) {
+      if (ts < cutoff || throttledWarnAt.size > 500) {
+        throttledWarnAt.delete(k);
+      } else {
+        break;
+      }
+    }
+  }
+  console.warn(message);
+}
+
+function clearThrottledWarn(key) {
+  throttledWarnAt.delete(key);
+}
+
+function stripRawBlobsForCache(payload) {
+  if (!payload || typeof payload !== 'object') return payload;
+  const { raw: _ignoredRaw, raw_blob: _ignoredRawBlob, ...compact } = payload;
+  return compact;
+}
+
+function deleteLastGoodCache(key) {
+  const existing = lastGoodSwarmByConv.get(key);
+  if (!existing) return;
+  lastGoodTotalBytes = Math.max(0, lastGoodTotalBytes - (Number(existing.bytes) || 0));
+  lastGoodSwarmByConv.delete(key);
+}
+
+function setLastGoodCache(key, value) {
+  if (!key || !value || typeof value !== 'object') return;
+  const compact = stripRawBlobsForCache(value);
+  let bytes = 0;
+  try {
+    bytes = Buffer.byteLength(JSON.stringify(compact), 'utf8');
+  } catch {
+    bytes = 0;
+  }
+  if (bytes > MAX_LAST_GOOD_TOTAL_BYTES) {
+    deleteLastGoodCache(key);
+    return;
+  }
+  const now = Date.now();
+  deleteLastGoodCache(key);
+  lastGoodSwarmByConv.set(key, { value: compact, bytes, ts: now });
+  lastGoodTotalBytes += bytes;
+  for (const [k, entry] of lastGoodSwarmByConv.entries()) {
+    if (
+      now - entry.ts > CONV_CACHE_TTL_MS ||
+      lastGoodSwarmByConv.size > MAX_LAST_GOOD_ENTRIES ||
+      lastGoodTotalBytes > MAX_LAST_GOOD_TOTAL_BYTES
+    ) {
+      if (k === key && lastGoodSwarmByConv.size === 1) break;
+      deleteLastGoodCache(k);
+    } else {
+      break;
+    }
+  }
+}
+
+function getLastGoodCache(key) {
+  const entry = lastGoodSwarmByConv.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > CONV_CACHE_TTL_MS) {
+    deleteLastGoodCache(key);
+    return null;
+  }
+  return entry.value;
+}
 
 function setConvCache(map, key, value) {
   if (!key) return;
@@ -317,6 +409,10 @@ export function createSidecarConfig(env = process.env, options = {}) {
   const stateDir = rawStateOverride ? resolve(rawStateOverride) : join(bridgeDir, 'state');
   const registryPath = join(stateDir, 'registry.json');
   const tokenFile = String(env.HERMES_A2A_TOKEN_FILE || '').trim() || join(stateDir, 'internal_token');
+  // Invalidate cached registry/token entries when a fresh config is constructed (e.g. across tests/reloads).
+  registryCache.delete(registryPath);
+  tokenFileCache.delete(resolve(tokenFile));
+  tokenFileCache.delete(join(stateDir, 'internal_token'));
   const rawBoardUrl = String(env.HERMES_A2A_BOARD_URL || '').trim();
   const fallbackBoardUrl = (rawBoardUrl || DEFAULT_BOARD_URL).replace(/\/+$/, '');
   const urlHosts = Array.isArray(options.urlHosts)
@@ -369,20 +465,28 @@ export function resolveDynamicHttpToken(config, { forceRefresh = false } = {}) {
   if (config?.tokenFile) candidates.push(resolve(config.tokenFile));
   if (config?.stateDir) candidates.push(join(config.stateDir, 'internal_token'));
 
+  const now = Date.now();
   for (const filePath of candidates) {
+    if (!filePath) continue;
     try {
-      if (!filePath || !existsSync(filePath)) continue;
-      const mtimeMs = Number(statSync(filePath).mtimeMs) || 0;
       const cached = tokenFileCache.get(filePath);
-      if (!forceRefresh && cached && cached.mtimeMs === mtimeMs && cached.token) {
+      if (!forceRefresh && cached && cached.token && (now - cached.checkedAt) < TOKEN_FILE_STAT_TTL_MS) {
+        return cached.token;
+      }
+      const st = statSync(filePath);
+      const mtimeMs = Number(st.mtimeMs) || 0;
+      const size = Number(st.size) || 0;
+      if (!forceRefresh && cached && cached.mtimeMs === mtimeMs && cached.size === size && cached.token) {
+        cached.checkedAt = now;
         return cached.token;
       }
       const token = readFileSync(filePath, 'utf-8').trim();
       if (token) {
-        tokenFileCache.set(filePath, { mtimeMs, token });
+        tokenFileCache.set(filePath, { mtimeMs, size, token, checkedAt: now });
         return token;
       }
     } catch {
+      tokenFileCache.delete(filePath);
       // Ignore unreadable token file and try next candidate.
     }
   }
@@ -473,12 +577,53 @@ function normalizeRegistryEntry(raw) {
   };
 }
 
-/** Read active HTTP server entries from `<STATE_DIR>/registry.json`. */
+function isPidAliveWithCache(pid, pidAliveFn) {
+  if (pidAliveFn !== isPidAlive) {
+    return pidAliveFn(pid);
+  }
+  const num = typeof pid === 'number' ? pid : Number(String(pid ?? '').trim());
+  if (!Number.isInteger(num) || num <= 0) return false;
+  const now = Date.now();
+  const cached = pidAliveCache.get(num);
+  if (cached && (now - cached.checkedAt) < PID_ALIVE_CACHE_TTL_MS) {
+    return cached.alive;
+  }
+  const alive = isPidAlive(num);
+  if (pidAliveCache.has(num)) pidAliveCache.delete(num);
+  pidAliveCache.set(num, { alive, checkedAt: now });
+  while (pidAliveCache.size > 512) {
+    const oldest = pidAliveCache.keys().next().value;
+    if (oldest === undefined) break;
+    pidAliveCache.delete(oldest);
+  }
+  return alive;
+}
+
+/** Read active HTTP server entries from `<STATE_DIR>/registry.json` with mtime+size+TTL caching. */
 export function readRegistryEntries(registryPath) {
   if (!registryPath) return [];
+  const now = Date.now();
+  const cached = registryCache.get(registryPath);
+  if (cached && (now - cached.checkedAt) < REGISTRY_CACHE_TTL_MS) {
+    return cached.entries;
+  }
+
+  let st;
+  try {
+    st = statSync(registryPath);
+  } catch {
+    registryCache.delete(registryPath);
+    return [];
+  }
+  const mtimeMs = Number(st.mtimeMs) || 0;
+  const size = Number(st.size) || 0;
+  if (cached && cached.mtimeMs === mtimeMs && cached.size === size) {
+    cached.checkedAt = now;
+    return cached.entries;
+  }
+
   let data;
   try {
-    if (!existsSync(registryPath)) return [];
     const text = readFileSync(registryPath, 'utf-8').trim();
     data = text ? JSON.parse(text) : null;
   } catch {
@@ -506,31 +651,40 @@ export function readRegistryEntries(registryPath) {
 
   if (Array.isArray(data)) {
     pushFromContainer(data);
-    return entries;
-  }
-
-  let matchedContainer = false;
-  for (const bucket of ['servers', 'instances', 'entries']) {
-    if (data[bucket] !== undefined) {
-      matchedContainer = true;
-      pushFromContainer(data[bucket]);
+  } else {
+    let matchedContainer = false;
+    for (const bucket of ['servers', 'instances', 'entries']) {
+      if (data[bucket] !== undefined) {
+        matchedContainer = true;
+        pushFromContainer(data[bucket]);
+      }
+    }
+    if (!matchedContainer) {
+      const direct = normalizeRegistryEntry(data);
+      if (direct) entries.push(direct);
+      else pushFromContainer(data);
     }
   }
-  if (!matchedContainer) {
-    const direct = normalizeRegistryEntry(data);
-    if (direct) entries.push(direct);
-    else pushFromContainer(data);
+
+  if (registryCache.has(registryPath)) registryCache.delete(registryPath);
+  registryCache.set(registryPath, { mtimeMs, size, checkedAt: now, entries });
+  while (registryCache.size > 32) {
+    const oldest = registryCache.keys().next().value;
+    if (oldest === undefined) break;
+    registryCache.delete(oldest);
   }
   return entries;
 }
 
-/** Resolve the upstream HTTP server URL from `registry.json` with PID liveness verification. */
+/** Resolve the upstream HTTP server URL from `registry.json` with cached PID liveness verification. */
 export function resolveUpstreamUrl(queryOrData = {}, config = createSidecarConfig()) {
   const hints = extractDiscoveryHints(queryOrData, config);
   const normHintWs = normalizeWorkspacePath(hints.workspace);
   const pidAlive = config.isPidAlive || isPidAlive;
 
-  const liveEntries = readRegistryEntries(config.registryPath).filter((entry) => pidAlive(entry.pid));
+  const liveEntries = readRegistryEntries(config.registryPath).filter((entry) =>
+    isPidAliveWithCache(entry.pid, pidAlive),
+  );
   if (liveEntries.length === 0) {
     return config.fallbackBoardUrl || DEFAULT_BOARD_URL;
   }
@@ -565,7 +719,9 @@ export function resolveUpstreamUrl(queryOrData = {}, config = createSidecarConfi
 /** Return all live upstream HTTP URLs from `registry.json` (or `[fallbackBoardUrl]`). */
 export function resolveAllUpstreamUrls(config = createSidecarConfig()) {
   const pidAlive = config.isPidAlive || isPidAlive;
-  const liveEntries = readRegistryEntries(config.registryPath).filter((entry) => pidAlive(entry.pid));
+  const liveEntries = readRegistryEntries(config.registryPath).filter((entry) =>
+    isPidAliveWithCache(entry.pid, pidAlive),
+  );
   const urls = [];
   const seen = new Set();
   for (const entry of liveEntries) {
@@ -593,17 +749,10 @@ export function injectPreloadScript(html) {
   return `<script src="./preload.js"></script>\n${html}`;
 }
 
-/** Verify whether a returned swarm payload belongs strictly to the requested `conversationId`. */
-export function isSwarmScopedToRequest(swarmObj, { conversationId = '' } = {}) {
-  if (!swarmObj || typeof swarmObj !== 'object') return false;
-  const scopedConv = String(conversationId || '').trim();
-  if (!scopedConv) return false;
-
-  const meta = swarmObj.meta && typeof swarmObj.meta === 'object' ? swarmObj.meta : {};
-  const hasConcreteSwarm = Boolean(
-    swarmObj.swarm || swarmObj.swarmId || swarmObj.id || meta.swarmId || meta.id,
-  );
+function collectPayloadConversationIds(swarmObj) {
   const convSet = new Set();
+  if (!swarmObj || typeof swarmObj !== 'object') return convSet;
+  const meta = swarmObj.meta && typeof swarmObj.meta === 'object' ? swarmObj.meta : {};
   for (const field of [
     swarmObj.primaryConversationId,
     swarmObj.coordinatorConversationId,
@@ -621,6 +770,20 @@ export function isSwarmScopedToRequest(swarmObj, { conversationId = '' } = {}) {
       }
     }
   }
+  return convSet;
+}
+
+/** Verify whether a returned swarm payload belongs strictly to the requested `conversationId`. */
+export function isSwarmScopedToRequest(swarmObj, { conversationId = '' } = {}) {
+  if (!swarmObj || typeof swarmObj !== 'object') return false;
+  const scopedConv = String(conversationId || '').trim();
+  if (!scopedConv) return false;
+
+  const meta = swarmObj.meta && typeof swarmObj.meta === 'object' ? swarmObj.meta : {};
+  const hasConcreteSwarm = Boolean(
+    swarmObj.swarm || swarmObj.swarmId || swarmObj.id || meta.swarmId || meta.id,
+  );
+  const convSet = collectPayloadConversationIds(swarmObj);
 
   if (!hasConcreteSwarm) {
     const hasMessagesOrTasks = (
@@ -638,46 +801,51 @@ export function isSwarmScopedToRequest(swarmObj, { conversationId = '' } = {}) {
 
 /** Serve `board_ui/index.html` with relative `./preload.js`. */
 export async function readHtmlPage(config, ResponseClass = null, appConfig = {}) {
-  const idx = join(config.uiDir, 'index.html');
   let html = '';
   let status = 200;
 
-  if (existsSync(idx)) {
-    html = injectPreloadScript(readFileSync(idx, 'utf-8'));
-  } else {
-    const upstream = resolveUpstreamUrl(
-      { conversationId: appConfig?.conversationId || config.conversationId || '' },
-      config,
-    );
-    const uiUrl = buildTargetUrl(upstream, '/board/ui');
-    try {
-      const firstHeaders = buildUpstreamHeaders(config);
-      let res = await fetch(uiUrl, {
-        headers: firstHeaders,
-        signal: AbortSignal.timeout(3000),
-      });
-      if (res.status === 401 && !config?.hasEnvHttpToken) {
-        const retryHeaders = buildUpstreamHeaders(config, {}, { forceRefresh: true });
-        if (retryHeaders.Authorization && retryHeaders.Authorization !== firstHeaders.Authorization) {
-          try { await res.body?.cancel?.(); } catch {}
-          res = await fetch(uiUrl, {
-            headers: retryHeaders,
-            signal: AbortSignal.timeout(3000),
-          });
+  try {
+    const idx = join(config.uiDir, 'index.html');
+    if (existsSync(idx)) {
+      html = injectPreloadScript(readFileSync(idx, 'utf-8'));
+    } else {
+      const upstream = resolveUpstreamUrl(
+        { conversationId: appConfig?.conversationId || config.conversationId || '' },
+        config,
+      );
+      const uiUrl = buildTargetUrl(upstream, '/board/ui');
+      try {
+        const firstHeaders = buildUpstreamHeaders(config);
+        let res = await fetch(uiUrl, {
+          headers: firstHeaders,
+          signal: AbortSignal.timeout(3000),
+        });
+        if (res.status === 401 && !config?.hasEnvHttpToken) {
+          const retryHeaders = buildUpstreamHeaders(config, {}, { forceRefresh: true });
+          if (retryHeaders.Authorization && retryHeaders.Authorization !== firstHeaders.Authorization) {
+            try { await res.body?.cancel?.(); } catch {}
+            res = await fetch(uiUrl, {
+              headers: retryHeaders,
+              signal: AbortSignal.timeout(3000),
+            });
+          }
         }
+        if (!res.ok) {
+          try { await res.body?.cancel?.(); } catch {}
+          status = res.status >= 500 ? 502 : res.status;
+          html = `<h1>Hermes Swarm UI unavailable</h1><pre>Upstream returned HTTP ${escapeHtml(status)}</pre>`;
+        } else {
+          status = res.status;
+          html = injectPreloadScript(await res.text());
+        }
+      } catch (err) {
+        status = 503;
+        html = `<h1>Hermes Swarm UI unavailable</h1><pre>${escapeHtml(err?.message || err)}</pre>`;
       }
-      if (!res.ok) {
-        try { await res.body?.cancel?.(); } catch {}
-        status = res.status >= 500 ? 502 : res.status;
-        html = `<h1>Hermes Swarm UI unavailable</h1><pre>Upstream returned HTTP ${escapeHtml(status)}</pre>`;
-      } else {
-        status = res.status;
-        html = injectPreloadScript(await res.text());
-      }
-    } catch (err) {
-      status = 503;
-      html = `<h1>Hermes Swarm UI unavailable</h1><pre>${escapeHtml(err?.message || err)}</pre>`;
     }
+  } catch (err) {
+    status = 500;
+    html = `<h1>Hermes Swarm UI error</h1><pre>${escapeHtml(err?.message || err)}</pre>`;
   }
 
   if (ResponseClass) {
@@ -711,7 +879,7 @@ export function readStaticAsset(filename, contentType, config, ResponseClass) {
   }
 }
 
-/** `GET /api/swarm` handler: ETag-aware, read-only, strictly 1:1 `conversationId` scoped. */
+/** `GET /api/swarm` handler: ETag-aware, read-only, strictly 1:1 `conversationId` scoped with in-flight coalescing. */
 export async function handleGetSwarm(
   data = {},
   config = createSidecarConfig(),
@@ -728,240 +896,331 @@ export async function handleGetSwarm(
   const requestedEtag = String(data?.etag || '').trim();
   const upstreamBase = resolveUpstreamUrl({ conversationId: conv }, config);
   const cacheKey = conv || upstreamBase;
-  const qs = new URLSearchParams({ conversationId: conv });
-  if (requestedEtag) qs.set('etag', requestedEtag);
-  const targetUrl = buildTargetUrl(upstreamBase, '/board', `?${qs.toString()}`);
+  const inFlightKey = `${upstreamBase}|${conv}|${requestedEtag}`;
 
-  try {
-    const reqHeaders = {
-      Accept: 'application/json',
-      ...(requestedEtag ? { 'If-None-Match': requestedEtag } : {}),
-    };
-    const firstHeaders = buildUpstreamHeaders(config, reqHeaders);
-    let res = await fetchImpl(targetUrl, {
-      headers: firstHeaders,
-      signal: AbortSignal.timeout(BOARD_FETCH_TIMEOUT_MS),
-    });
-    if (res.status === 401 && !config?.hasEnvHttpToken) {
-      const retryHeaders = buildUpstreamHeaders(config, reqHeaders, { forceRefresh: true });
-      if (retryHeaders.Authorization && retryHeaders.Authorization !== firstHeaders.Authorization) {
-        try { await res.body?.cancel?.(); } catch {}
-        res = await fetchImpl(targetUrl, {
-          headers: retryHeaders,
-          signal: AbortSignal.timeout(BOARD_FETCH_TIMEOUT_MS),
-        });
+  const existingInFlight = inFlightSwarmFetches.get(inFlightKey);
+  if (existingInFlight) {
+    const shared = await existingInFlight;
+    return shared && typeof shared === 'object' ? { ...shared } : shared;
+  }
+
+  const runFetch = async () => {
+    const qs = new URLSearchParams({ conversationId: conv });
+    if (requestedEtag) qs.set('etag', requestedEtag);
+    const targetUrl = buildTargetUrl(upstreamBase, '/board', `?${qs.toString()}`);
+
+    try {
+      const reqHeaders = {
+        Accept: 'application/json',
+        ...(requestedEtag ? { 'If-None-Match': requestedEtag } : {}),
+      };
+      const firstHeaders = buildUpstreamHeaders(config, reqHeaders);
+      let res = await fetchImpl(targetUrl, {
+        headers: firstHeaders,
+        signal: AbortSignal.timeout(BOARD_FETCH_TIMEOUT_MS),
+      });
+      if (res.status === 401 && !config?.hasEnvHttpToken) {
+        const retryHeaders = buildUpstreamHeaders(config, reqHeaders, { forceRefresh: true });
+        if (retryHeaders.Authorization && retryHeaders.Authorization !== firstHeaders.Authorization) {
+          try { await res.body?.cancel?.(); } catch {}
+          res = await fetchImpl(targetUrl, {
+            headers: retryHeaders,
+            signal: AbortSignal.timeout(BOARD_FETCH_TIMEOUT_MS),
+          });
+        }
       }
-    }
 
-    if (res.status === 304) {
-      try { await res.body?.cancel?.(); } catch {}
-      const cachedSwarm = getConvCache(lastSwarmByConv, conv);
-      return {
+      if (res.status === 304) {
+        try { await res.body?.cancel?.(); } catch {}
+        const cachedSwarm = getConvCache(lastSwarmByConv, conv);
+        const cachedMember = getConvCache(lastMemberByConv, conv);
+        const cachedConvIds = getConvCache(lastConversationIdsByConv, conv);
+        const headerMember = String(res.headers.get('x-swarm-member') || '').trim() || null;
+        const restoredMember = headerMember ?? cachedMember ?? null;
+        if (restoredMember !== null) {
+          setConvCache(lastMemberByConv, conv, restoredMember);
+        }
+        return {
+          online: true,
+          transientError: false,
+          conversationId: conv,
+          ...(cachedSwarm ? { swarm: cachedSwarm } : {}),
+          ...(Array.isArray(cachedConvIds) && cachedConvIds.length > 0
+            ? { conversationIds: [...cachedConvIds] }
+            : {}),
+          member: restoredMember,
+          unchanged: true,
+          etag: res.headers.get('etag') || requestedEtag,
+        };
+      }
+
+      if (!res.ok) {
+        try { await res.body?.cancel?.(); } catch {}
+        warnThrottled(
+          `board:${conv}:${res.status}`,
+          `[swarm_board] GET /board returned HTTP ${res.status} for conversationId=${conv}`,
+        );
+        const isTransientHttp = res.status >= 500;
+        const lastGood = isTransientHttp ? getLastGoodCache(cacheKey) : null;
+        if (lastGood) {
+          return {
+            ...lastGood,
+            online: false,
+            transientError: true,
+            unchanged: true,
+            status: res.status,
+            error: `Upstream /board returned HTTP ${res.status}`,
+            conversationId: conv,
+          };
+        }
+        return {
+          online: false,
+          transientError: isTransientHttp,
+          status: res.status,
+          error: `Upstream /board returned HTTP ${res.status}`,
+          conversationId: conv,
+          swarm: null,
+          member: null,
+          members: [],
+          messages: [],
+        };
+      }
+
+      for (const code of [401, 403, 404, 500, 502, 503, 504]) {
+        clearThrottledWarn(`board:${conv}:${code}`);
+      }
+
+      let payload;
+      const rawBytes = await readResponseBytesWithCap(res, MAX_SWARM_JSON_BYTES);
+      if (rawBytes !== null) {
+        payload = JSON.parse(rawBytes.toString('utf-8'));
+      } else {
+        payload = await res.json();
+      }
+      if (!payload || typeof payload !== 'object') {
+        deleteLastGoodCache(cacheKey);
+        lastMemberByConv.delete(conv);
+        lastConversationIdsByConv.delete(conv);
+        return {
+          online: true,
+          transientError: false,
+          conversationId: conv,
+          swarm: null,
+          member: null,
+          members: [],
+          messages: [],
+        };
+      }
+
+      if (payload.unchanged === true) {
+        const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
+        const cachedSwarm = getConvCache(lastSwarmByConv, conv);
+        const cachedConvIds = getConvCache(lastConversationIdsByConv, conv);
+        const payloadSwarm = String(
+          payload.swarm || payload.swarmId || payload.id || meta.swarmId || meta.id || '',
+        ).trim();
+        const hasExplicitConvIdsList =
+          (Array.isArray(payload.conversationIds) && payload.conversationIds.length > 0)
+          || (Array.isArray(meta.conversationIds) && meta.conversationIds.length > 0);
+        const payloadConvSet = collectPayloadConversationIds(payload);
+        const canRestoreCachedConvIds = Boolean(
+          !hasExplicitConvIdsList
+          && cachedSwarm
+          && payloadSwarm
+          && cachedSwarm === payloadSwarm
+          && Array.isArray(cachedConvIds)
+          && cachedConvIds.includes(conv)
+          && (payloadConvSet.size === 0 || [...payloadConvSet].some((c) => cachedConvIds.includes(c))),
+        );
+        const candidatePayload = canRestoreCachedConvIds
+          ? {
+              ...payload,
+              conversationIds: [...new Set([...cachedConvIds, ...payloadConvSet])],
+            }
+          : payload;
+        const candidateConvSet = collectPayloadConversationIds(candidatePayload);
+        const hasAnyConvId = candidateConvSet.size > 0;
+        if (hasAnyConvId) {
+          if (!isSwarmScopedToRequest(candidatePayload, { conversationId: conv })) {
+            deleteLastGoodCache(cacheKey);
+            lastMemberByConv.delete(conv);
+            lastConversationIdsByConv.delete(conv);
+            return {
+              online: true,
+              transientError: false,
+              conversationId: conv,
+              swarm: null,
+              member: null,
+              members: [],
+              messages: [],
+            };
+          }
+        } else {
+          if (!cachedSwarm || !payloadSwarm || cachedSwarm !== payloadSwarm) {
+            deleteLastGoodCache(cacheKey);
+            lastMemberByConv.delete(conv);
+            lastConversationIdsByConv.delete(conv);
+            return {
+              online: true,
+              transientError: false,
+              conversationId: conv,
+              swarm: null,
+              member: null,
+              members: [],
+              messages: [],
+            };
+          }
+        }
+        const { swarms: _ignoredSwarms, ...rest } = candidatePayload;
+        if (payloadSwarm) {
+          setConvCache(lastSwarmByConv, conv, payloadSwarm);
+        }
+        const cachedMember = getConvCache(lastMemberByConv, conv);
+        const restoredMember = rest.member !== undefined && rest.member !== null
+          ? rest.member
+          : (cachedMember ?? null);
+        if (restoredMember !== null) {
+          setConvCache(lastMemberByConv, conv, restoredMember);
+        }
+        const restoredConvIds = candidateConvSet.size > 0
+          ? [...candidateConvSet]
+          : (Array.isArray(cachedConvIds) && cachedConvIds.length > 0 ? [...cachedConvIds] : []);
+        if (restoredConvIds.length > 0) {
+          setConvCache(lastConversationIdsByConv, conv, restoredConvIds);
+        }
+        return {
+          ...rest,
+          ...(restoredConvIds.length > 0 ? { conversationIds: restoredConvIds } : {}),
+          online: true,
+          transientError: false,
+          conversationId: conv,
+          member: restoredMember,
+        };
+      }
+
+      if (!isSwarmScopedToRequest(payload, { conversationId: conv })) {
+        deleteLastGoodCache(cacheKey);
+        lastMemberByConv.delete(conv);
+        lastConversationIdsByConv.delete(conv);
+        return {
+          online: true,
+          transientError: false,
+          conversationId: conv,
+          swarm: null,
+          member: null,
+          members: [],
+          messages: [],
+        };
+      }
+
+      const { swarms: _ignoredSwarms, ...rest } = payload;
+      const swarmId = rest.swarm || rest.id || rest.meta?.swarmId || null;
+
+      const memberVal = rest.member ?? null;
+      const headerEtag = res.headers.get('etag') || '';
+      const resolvedEtag = rest.etag
+        || (swarmId && headerEtag && !headerEtag.includes('|') ? `${swarmId}|${memberVal || ''}|${headerEtag}` : headerEtag)
+        || undefined;
+
+      const mergedUrlHosts = [
+        ...new Set([
+          ...(Array.isArray(rest.urlHosts) ? rest.urlHosts : []),
+          ...(Array.isArray(config?.urlHosts) ? config.urlHosts : DEFAULT_URL_HOSTS),
+        ]),
+      ];
+
+      const flags = config?.flags || { builtinOverview: true, graphTab: true, rawTab: true };
+      const explicit = config?.explicitFlags || {};
+      const builtinOverview = explicit.builtinOverview
+        ? flags.builtinOverview
+        : (rest.builtinOverview !== undefined ? rest.builtinOverview : flags.builtinOverview);
+      const graphTab = explicit.graphTab
+        ? flags.graphTab
+        : (rest.graphTab !== undefined ? rest.graphTab : flags.graphTab);
+      const rawTab = explicit.rawTab
+        ? flags.rawTab
+        : (rest.rawTab !== undefined ? rest.rawTab : flags.rawTab);
+
+      const allowedFiles = (
+        rest.allowedFiles && typeof rest.allowedFiles === 'object' && !Array.isArray(rest.allowedFiles)
+      ) ? rest.allowedFiles : {};
+
+      const result = {
+        ...rest,
+        ...(resolvedEtag ? { etag: resolvedEtag } : {}),
+        urlHosts: mergedUrlHosts,
+        allowedFiles,
+        builtinOverview,
+        graphTab,
+        rawTab,
         online: true,
         transientError: false,
         conversationId: conv,
-        ...(cachedSwarm ? { swarm: cachedSwarm } : {}),
-        unchanged: true,
-        etag: res.headers.get('etag') || requestedEtag,
+        member: memberVal,
       };
-    }
 
-    if (!res.ok) {
-      try { await res.body?.cancel?.(); } catch {}
-      console.warn(`[swarm_board] GET /board returned HTTP ${res.status} for conversationId=${conv}`);
-      const isTransientHttp = res.status >= 500;
-      const lastGood = isTransientHttp ? getConvCache(lastGoodSwarmByConv, cacheKey) : null;
+      const scopedConvIds = [...collectPayloadConversationIds(payload)];
+      if (swarmId) {
+        setConvCache(lastSwarmByConv, conv, String(swarmId));
+        if (memberVal !== null) {
+          setConvCache(lastMemberByConv, conv, memberVal);
+        } else {
+          lastMemberByConv.delete(conv);
+        }
+        if (scopedConvIds.length > 0) {
+          setConvCache(lastConversationIdsByConv, conv, scopedConvIds);
+        } else {
+          lastConversationIdsByConv.delete(conv);
+        }
+        setLastGoodCache(cacheKey, result);
+      } else {
+        lastSwarmByConv.delete(conv);
+        lastMemberByConv.delete(conv);
+        lastConversationIdsByConv.delete(conv);
+        deleteLastGoodCache(cacheKey);
+      }
+
+      return result;
+    } catch (err) {
+      const isTimeout = err?.name === 'TimeoutError'
+        || err?.name === 'AbortError'
+        || /timeout/i.test(String(err?.message || ''));
+      const status = err?.code === 'PAYLOAD_TOO_LARGE' ? 502 : (isTimeout ? 504 : 503);
+      const errorMsg = err?.message ? String(err.message) : 'Upstream /board request failed';
+      const lastGood = getLastGoodCache(cacheKey);
       if (lastGood) {
         return {
           ...lastGood,
           online: false,
           transientError: true,
           unchanged: true,
-          status: res.status,
-          error: `Upstream /board returned HTTP ${res.status}`,
+          status,
+          error: errorMsg,
           conversationId: conv,
         };
       }
       return {
         online: false,
-        transientError: isTransientHttp,
-        status: res.status,
-        error: `Upstream /board returned HTTP ${res.status}`,
-        conversationId: conv,
-        swarm: null,
-        member: null,
-        members: [],
-        messages: [],
-      };
-    }
-
-    let payload;
-    const rawBytes = await readResponseBytesWithCap(res, MAX_SWARM_JSON_BYTES);
-    if (rawBytes !== null) {
-      payload = JSON.parse(rawBytes.toString('utf-8'));
-    } else {
-      payload = await res.json();
-    }
-    if (!payload || typeof payload !== 'object') {
-      lastGoodSwarmByConv.delete(cacheKey);
-      return {
-        online: true,
-        transientError: false,
-        conversationId: conv,
-        swarm: null,
-        member: null,
-        members: [],
-        messages: [],
-      };
-    }
-
-    if (payload.unchanged === true) {
-      const meta = payload.meta && typeof payload.meta === 'object' ? payload.meta : {};
-      const hasAnyConvId = Boolean(
-        payload.primaryConversationId
-        || payload.coordinatorConversationId
-        || payload.conversationId
-        || meta.primaryConversationId
-        || meta.coordinatorConversationId
-        || meta.conversationId
-        || (Array.isArray(payload.conversationIds) && payload.conversationIds.length > 0)
-        || (Array.isArray(meta.conversationIds) && meta.conversationIds.length > 0)
-      );
-      if (hasAnyConvId) {
-        if (!isSwarmScopedToRequest(payload, { conversationId: conv })) {
-          lastGoodSwarmByConv.delete(cacheKey);
-          return {
-            online: true,
-            transientError: false,
-            conversationId: conv,
-            swarm: null,
-            member: null,
-            members: [],
-            messages: [],
-          };
-        }
-      } else {
-        const cachedSwarm = getConvCache(lastSwarmByConv, conv);
-        const payloadSwarm = String(payload.swarm || payload.swarmId || payload.id || meta.swarmId || meta.id || '').trim();
-        if (!cachedSwarm || !payloadSwarm || cachedSwarm !== payloadSwarm) {
-          lastGoodSwarmByConv.delete(cacheKey);
-          return {
-            online: true,
-            transientError: false,
-            conversationId: conv,
-            swarm: null,
-            member: null,
-            members: [],
-            messages: [],
-          };
-        }
-      }
-      const { swarms: _ignoredSwarms, ...rest } = payload;
-      return {
-        ...rest,
-        online: true,
-        transientError: false,
-        conversationId: conv,
-      };
-    }
-
-    if (!isSwarmScopedToRequest(payload, { conversationId: conv })) {
-      lastGoodSwarmByConv.delete(cacheKey);
-      return {
-        online: true,
-        transientError: false,
-        conversationId: conv,
-        swarm: null,
-        member: null,
-        members: [],
-        messages: [],
-      };
-    }
-
-    const { swarms: _ignoredSwarms, ...rest } = payload;
-    const swarmId = rest.swarm || rest.id || rest.meta?.swarmId || null;
-
-    const memberVal = rest.member ?? null;
-    const headerEtag = res.headers.get('etag') || '';
-    const resolvedEtag = rest.etag
-      || (swarmId && headerEtag && !headerEtag.includes('|') ? `${swarmId}|${memberVal || ''}|${headerEtag}` : headerEtag)
-      || undefined;
-
-    const mergedUrlHosts = [
-      ...new Set([
-        ...(Array.isArray(rest.urlHosts) ? rest.urlHosts : []),
-        ...(Array.isArray(config?.urlHosts) ? config.urlHosts : DEFAULT_URL_HOSTS),
-      ]),
-    ];
-
-    const flags = config?.flags || { builtinOverview: true, graphTab: true, rawTab: true };
-    const explicit = config?.explicitFlags || {};
-    const builtinOverview = explicit.builtinOverview
-      ? flags.builtinOverview
-      : (rest.builtinOverview !== undefined ? rest.builtinOverview : flags.builtinOverview);
-    const graphTab = explicit.graphTab
-      ? flags.graphTab
-      : (rest.graphTab !== undefined ? rest.graphTab : flags.graphTab);
-    const rawTab = explicit.rawTab
-      ? flags.rawTab
-      : (rest.rawTab !== undefined ? rest.rawTab : flags.rawTab);
-
-    const allowedFiles = (
-      rest.allowedFiles && typeof rest.allowedFiles === 'object' && !Array.isArray(rest.allowedFiles)
-    ) ? rest.allowedFiles : {};
-
-    const result = {
-      ...rest,
-      ...(resolvedEtag ? { etag: resolvedEtag } : {}),
-      urlHosts: mergedUrlHosts,
-      allowedFiles,
-      builtinOverview,
-      graphTab,
-      rawTab,
-      online: true,
-      transientError: false,
-      conversationId: conv,
-      member: memberVal,
-    };
-
-    if (swarmId) {
-      setConvCache(lastSwarmByConv, conv, String(swarmId));
-      setConvCache(lastGoodSwarmByConv, cacheKey, result);
-    } else {
-      lastSwarmByConv.delete(conv);
-      lastGoodSwarmByConv.delete(cacheKey);
-    }
-
-    return result;
-  } catch (err) {
-    const isTimeout = err?.name === 'TimeoutError'
-      || err?.name === 'AbortError'
-      || /timeout/i.test(String(err?.message || ''));
-    const status = err?.code === 'PAYLOAD_TOO_LARGE' ? 502 : (isTimeout ? 504 : 503);
-    const errorMsg = err?.message ? String(err.message) : 'Upstream /board request failed';
-    const lastGood = getConvCache(lastGoodSwarmByConv, cacheKey);
-    if (lastGood) {
-      return {
-        ...lastGood,
-        online: false,
         transientError: true,
-        unchanged: true,
         status,
         error: errorMsg,
         conversationId: conv,
+        swarm: null,
+        member: null,
+        members: [],
+        messages: [],
       };
     }
-    return {
-      online: false,
-      transientError: true,
-      status,
-      error: errorMsg,
-      conversationId: conv,
-      swarm: null,
-      member: null,
-      members: [],
-      messages: [],
-    };
+  };
+
+  const pendingPromise = runFetch();
+  inFlightSwarmFetches.set(inFlightKey, pendingPromise);
+  try {
+    return await pendingPromise;
+  } finally {
+    if (inFlightSwarmFetches.get(inFlightKey) === pendingPromise) {
+      inFlightSwarmFetches.delete(inFlightKey);
+    }
   }
 }
 
@@ -969,7 +1228,7 @@ export async function handleGetSwarm(
  * `GET /api/events` handler: read-only, strictly 1:1 `conversationId` scoped SSE response.
  * Note: `SidecarApp` (`sidecar_sdk/index.mjs`) buffers `Response.body` and immediately calls
  * `res.end()`, so this returns a valid single-burst SSE payload (`text/event-stream`) rather
- * than a long-lived chunked stream.
+ * than a long-lived chunked stream, with a conservative retry hint to prevent 1s reconnect storms.
  */
 export async function handleGetEvents(
   data = {},
@@ -985,7 +1244,7 @@ export async function handleGetEvents(
     : payload?.unchanged
       ? 'unchanged'
       : (data?.etag ? 'update' : 'snapshot');
-  const retryMs = payload?.swarm ? 1000 : 3000;
+  const retryMs = payload?.swarm ? EVENTS_RETRY_ACTIVE_MS : EVENTS_RETRY_EMPTY_MS;
   const sseBody =
     `retry: ${retryMs}\n` +
     `id: ${head}\n` +
@@ -1052,7 +1311,8 @@ export async function handleGetFrame(
     }
     if (!res.ok) {
       try { await res.body?.cancel?.(); } catch {}
-      console.warn(
+      warnThrottled(
+        `frame:${conv}:${cleanPath}:${res.status}`,
         `[swarm_board] GET /board/frame returned HTTP ${res.status} for conversationId=${conv} path=${cleanPath}`,
       );
       const status = res.status === 401 || res.status === 403
@@ -1065,6 +1325,9 @@ export async function handleGetFrame(
         status,
         contentType: 'text/plain',
       });
+    }
+    for (const code of [401, 403, 404, 500, 502, 503]) {
+      clearThrottledWarn(`frame:${conv}:${cleanPath}:${code}`);
     }
     const rawMime = String(res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
     if (!ALLOWED_FRAME_MIMES.has(rawMime)) {
@@ -1153,7 +1416,8 @@ export async function handleGetMemberHistory(
     }
     if (!res.ok) {
       try { await res.body?.cancel?.(); } catch {}
-      console.warn(
+      warnThrottled(
+        `history:${conv}:${member}:${res.status}`,
         `[swarm_board] GET /board/member/history returned HTTP ${res.status} for conversationId=${conv} member=${member}`,
       );
       const status = res.status === 401 || res.status === 403
@@ -1181,7 +1445,8 @@ export async function handleGetMemberHistory(
       payload = await res.json();
     }
     if (!payload || typeof payload !== 'object' || !isSwarmScopedToRequest(payload, { conversationId: conv })) {
-      console.warn(
+      warnThrottled(
+        `history-scope:${conv}:${member}`,
         `[swarm_board] GET /api/member/history rejected 403 (conversation scope validation failed) for conversationId=${conv} member=${member}`,
       );
       return jsonReply(
@@ -1197,6 +1462,10 @@ export async function handleGetMemberHistory(
       );
     }
 
+    for (const code of [401, 403, 404, 500, 502, 503]) {
+      clearThrottledWarn(`history:${conv}:${member}:${code}`);
+    }
+    clearThrottledWarn(`history-scope:${conv}:${member}`);
     return jsonReply(payload, 200);
   } catch (err) {
     if (err?.code === 'PAYLOAD_TOO_LARGE') {
@@ -1207,6 +1476,40 @@ export async function handleGetMemberHistory(
       503,
     );
   }
+}
+
+/**
+ * Create a serialized async wrapper around `app.sendMessage` (preferring
+ * `app.sendMessageAsync` when provided by newer `sidecar_sdk` releases).
+ *
+ * NOTE: Upstream `sidecar_sdk/index.mjs` currently implements `app.sendMessage`
+ * via synchronous `execFileSync` (external to this plugin). Serializing calls
+ * through an async FIFO queue and yielding to the event loop between dispatches
+ * lets pending HTTP requests flush cleanly between consecutive wakeups.
+ */
+function createQueuedSendMessage(app) {
+  if (typeof app?.sendMessageAsync === 'function') {
+    return (convId, message, opts) => Promise.resolve(app.sendMessageAsync(convId, message, opts));
+  }
+  let tail = Promise.resolve();
+  let queuedCount = 0;
+  return (convId, message, opts) => {
+    queuedCount += 1;
+    const run = async () => {
+      await new Promise((r) => setImmediate(r));
+      try {
+        return await Promise.resolve(app.sendMessage(convId, message, opts));
+      } finally {
+        queuedCount = Math.max(0, queuedCount - 1);
+        if (queuedCount > 0) {
+          await new Promise((r) => setTimeout(r, SEND_QUEUE_YIELD_MS));
+        }
+      }
+    };
+    const next = tail.then(run, run);
+    tail = next.catch(() => {});
+    return next;
+  };
 }
 
 /** Boot `SidecarApp`, register clean GET-only routes, and start the host-local wakeup bridge. */
@@ -1246,11 +1549,15 @@ export async function startSidecar(env = process.env, options = {}) {
 
   const server = await app.run();
 
-  if (typeof app.sendMessage === 'function' && env.HERMES_SWARM_DISABLE_WAKEUP !== '1') {
+  if (
+    (typeof app.sendMessageAsync === 'function' || typeof app.sendMessage === 'function') &&
+    env.HERMES_SWARM_DISABLE_WAKEUP !== '1'
+  ) {
     const cursorFile = String(env.HERMES_SWARM_CURSOR_FILE || '').trim() || defaultCursorFilePath(env);
     const appDataDirs = Array.isArray(options?.appDataDirs) ? options.appDataDirs : config.appDataDirs;
+    const queuedSendMessage = createQueuedSendMessage(app);
     wakeupBridge = createWakeupBridge({
-      sendMessage: (convId, message, opts) => Promise.resolve(app.sendMessage(convId, message, opts)),
+      sendMessage: queuedSendMessage,
       config: {
         ...config,
         conversationId: app.config?.conversationId || config.conversationId,

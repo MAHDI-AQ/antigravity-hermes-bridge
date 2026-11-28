@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
@@ -27,7 +28,14 @@ _DRIVE_PATH_RE = re.compile(r"^([A-Za-z]):[\\/]?(.*)$")
 _SWARM_ID_CLEAN_RE = re.compile(r"[^a-z0-9_-]+")
 _CONV_RESOLVE_CACHE: dict[tuple[str, str], tuple[float, str | None]] = {}
 _CONV_RESOLVE_CACHE_LOCK = threading.Lock()
-_CONV_RESOLVE_TTL_S = 1.5
+_CONV_RESOLVE_TTL_S = 5.0
+_CONV_RESOLVE_NEG_TTL_S = 1.5
+_META_CACHE: OrderedDict[str, tuple[tuple[int, int, int, int], dict[str, Any]]] = OrderedDict()
+_META_CACHE_LOCK = threading.Lock()
+_META_CACHE_MAX = 128
+_TEMP_SWEEP_LAST: dict[str, float] = {}
+_TEMP_SWEEP_LOCK = threading.Lock()
+_TEMP_SWEEP_INTERVAL_S = 30.0
 
 
 class _LockBox:
@@ -41,6 +49,7 @@ class _LockBox:
 
 _THREAD_LOCKS: weakref.WeakValueDictionary[str, _LockBox] = weakref.WeakValueDictionary()
 _SWARM_RLOCKS: weakref.WeakValueDictionary[str, _LockBox] = weakref.WeakValueDictionary()
+_SWARM_LOG_LOCKS: weakref.WeakValueDictionary[str, _LockBox] = weakref.WeakValueDictionary()
 _LOCKS_GUARD = threading.Lock()
 
 
@@ -55,13 +64,24 @@ def _acquire_lock_box(path: Path) -> _LockBox:
 
 
 def get_swarm_thread_lock(swarm_id: str) -> threading.RLock:
-    """Return a bounded weak-referenced RLock scoped to a single swarm."""
+    """Return a bounded weak-referenced RLock scoped to a single swarm's board file operations."""
     sid = sanitize_swarm_id(swarm_id) or "default"
     with _LOCKS_GUARD:
         box = _SWARM_RLOCKS.get(sid)
         if box is None:
             box = _LockBox(reentrant=True)
             _SWARM_RLOCKS[sid] = box
+        return box.lock  # type: ignore[return-value]
+
+
+def get_swarm_log_lock(swarm_id: str) -> threading.RLock:
+    """Return a dedicated bounded weak-referenced RLock for per-swarm JSONL log appends."""
+    sid = sanitize_swarm_id(swarm_id) or "default"
+    with _LOCKS_GUARD:
+        box = _SWARM_LOG_LOCKS.get(sid)
+        if box is None:
+            box = _LockBox(reentrant=True)
+            _SWARM_LOG_LOCKS[sid] = box
         return box.lock  # type: ignore[return-value]
 
 
@@ -288,7 +308,7 @@ def _unlink_with_retries(path: Path, attempts: int = 20) -> bool:
 def _reap_lock_file(lock_path: Path, expected_token: str | None) -> bool:
     """Re-verify holder token and rename dead/stale/released lock aside before unlinking."""
     _, _, _, cur_token = _read_lock_holder(lock_path)
-    if expected_token is not None and cur_token != expected_token:
+    if cur_token != expected_token:
         return False
     reap_path = lock_path.with_name(f"{lock_path.name}.reap.{uuid.uuid4().hex[:8]}")
     try:
@@ -383,6 +403,15 @@ def atomic_file_lock(
 
 def _sweep_stale_temp_files(target: Path, max_age_seconds: float = 60.0) -> None:
     """Best-effort cleanup of stale `*.tmp.*` and `*.reap.*` files older than `max_age_seconds`."""
+    now_m = time.monotonic()
+    sweep_key = f"{target.parent}|{target.name}"
+    with _TEMP_SWEEP_LOCK:
+        last_m = _TEMP_SWEEP_LAST.get(sweep_key)
+        if last_m is not None and (now_m - last_m) < _TEMP_SWEEP_INTERVAL_S:
+            return
+        if len(_TEMP_SWEEP_LAST) > 512:
+            _TEMP_SWEEP_LAST.clear()
+        _TEMP_SWEEP_LAST[sweep_key] = now_m
     now = time.time()
     prefixes = (f"{target.name}.tmp.", f"{target.name}.reap.")
     try:
@@ -564,7 +593,7 @@ def append_swarm_log(
     line = json.dumps(record, ensure_ascii=False, default=str) + "\n"
     limit = max(1024, int(max_bytes))
     try:
-        with get_swarm_thread_lock(paths.swarm_id):
+        with get_swarm_log_lock(paths.swarm_id):
             paths.logs_dir.mkdir(parents=True, exist_ok=True)
             try:
                 if log_file.is_file() and log_file.stat().st_size >= limit:
@@ -804,12 +833,37 @@ def migrate_board_v1_to_v2(raw: dict[str, Any] | None, swarm_id: str) -> dict[st
     return base
 
 
+def _clone_meta_dict(meta: dict[str, Any]) -> dict[str, Any]:
+    out = dict(meta)
+    out["conversationIds"] = list(meta.get("conversationIds") or [])
+    return out
+
+
 def read_swarm_meta(swarm_id: str, *, state_dir: Path | None = None) -> dict[str, Any] | None:
     paths = resolve_swarm_paths(swarm_id, state_dir=state_dir)
+    cache_key = str(paths.meta_file)
+    try:
+        st = paths.meta_file.stat()
+        sig = (int(st.st_mtime_ns), int(st.st_size), int(st.st_ctime_ns), int(getattr(st, "st_ino", 0)))
+    except OSError:
+        with _META_CACHE_LOCK:
+            _META_CACHE.pop(cache_key, None)
+        return None
+    with _META_CACHE_LOCK:
+        cached = _META_CACHE.get(cache_key)
+        if cached is not None and cached[0] == sig:
+            _META_CACHE.move_to_end(cache_key)
+            return _clone_meta_dict(cached[1])
     data = read_json_safe(paths.meta_file, None)
     if not isinstance(data, dict):
         return None
-    return migrate_meta_v1_to_v2(data, paths.swarm_id)
+    migrated = migrate_meta_v1_to_v2(data, paths.swarm_id)
+    with _META_CACHE_LOCK:
+        _META_CACHE[cache_key] = (sig, _clone_meta_dict(migrated))
+        _META_CACHE.move_to_end(cache_key)
+        while len(_META_CACHE) > _META_CACHE_MAX:
+            _META_CACHE.popitem(last=False)
+    return migrated
 
 
 def upsert_swarm_meta(
@@ -884,6 +938,8 @@ def upsert_swarm_meta(
         if not meta.get("createdAt"):
             meta["createdAt"] = ts
         atomic_write_json(paths.meta_file, meta)
+        with _META_CACHE_LOCK:
+            _META_CACHE.pop(str(paths.meta_file), None)
         with _CONV_RESOLVE_CACHE_LOCK:
             _CONV_RESOLVE_CACHE.clear()
         return meta
@@ -1092,8 +1148,10 @@ def resolve_swarm_for_conversation(
     now_m = time.monotonic()
     with _CONV_RESOLVE_CACHE_LOCK:
         cached = _CONV_RESOLVE_CACHE.get(cache_key)
-        if cached is not None and (now_m - cached[0]) < _CONV_RESOLVE_TTL_S:
-            return cached[1]
+        if cached is not None:
+            ttl = _CONV_RESOLVE_TTL_S if cached[1] is not None else _CONV_RESOLVE_NEG_TTL_S
+            if (now_m - cached[0]) < ttl:
+                return cached[1]
     if not swarms_dir.is_dir():
         return None
 
@@ -1389,4 +1447,23 @@ class SwarmStore:
             meta["wakeSeq"] = next_seq
             meta["updatedAt"] = models.now_iso()
             atomic_write_json(paths.meta_file, meta)
+            with _META_CACHE_LOCK:
+                _META_CACHE.pop(str(paths.meta_file), None)
             return next_seq
+
+    def persist_wake_seq(self, swarm_id: str, min_wake_seq: int) -> int:
+        """Atomically persist `wakeSeq >= min_wake_seq` in `meta.json` without losing monotonicity."""
+        target = max(0, int(min_wake_seq or 0))
+        paths = self.paths(swarm_id)
+        with atomic_file_lock(paths.meta_lock):
+            existing = read_json_safe(paths.meta_file, None, raise_on_error=True)
+            meta = migrate_meta_v1_to_v2(existing, paths.swarm_id)
+            cur_seq = max(0, int(meta.get("wakeSeq") or 0))
+            if target <= cur_seq:
+                return cur_seq
+            meta["wakeSeq"] = target
+            meta["updatedAt"] = models.now_iso()
+            atomic_write_json(paths.meta_file, meta)
+            with _META_CACHE_LOCK:
+                _META_CACHE.pop(str(paths.meta_file), None)
+            return target

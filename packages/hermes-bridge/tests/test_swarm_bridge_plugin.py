@@ -1354,6 +1354,145 @@ class SwarmBridgePluginTests(unittest.TestCase):
             self.assertIs(after_to.get("waiting"), False, msg=after_to)
             self.assertIsNone(after_to.get("waitSince"), msg=after_to)
 
+    def test_p0_lock_token_verified_eviction_release_win_handle_and_401_env_token_file_fallback(self) -> None:
+        import ctypes
+        import sys
+        from hermes_swarm_bridge import swarm_tools
+
+        # 1. _pid_alive uses 64-bit-safe c_void_p restype on Windows and reports live/dead accurately
+        if sys.platform == "win32":
+            self.assertIs(swarm_tools._K32.OpenProcess.restype, ctypes.c_void_p)
+        self.assertTrue(swarm_tools._pid_alive(os.getpid()))
+        self.assertFalse(swarm_tools._pid_alive(9999999))
+
+        # 2. _reap_lock_file refuses to evict a lock whose on-disk token changed (new live holder)
+        lock_path = Path(self.tmp.name) / "token_verify.lock"
+        live_payload = {"pid": os.getpid(), "ts": time.time(), "token": "live-holder-token", "released": False}
+        lock_path.write_text(json.dumps(live_payload), encoding="utf-8")
+        self.assertFalse(
+            swarm_tools._reap_lock_file(lock_path, expected_token="stale-dead-token"),
+            "Must NOT evict lock when on-disk token no longer matches expected stale token",
+        )
+        self.assertTrue(lock_path.is_file())
+        self.assertEqual(json.loads(swarm_tools._read_text_shared(lock_path))["token"], "live-holder-token")
+
+        # Matching token DOES reap cleanly without leaving .evicted files
+        self.assertTrue(swarm_tools._reap_lock_file(lock_path, expected_token="live-holder-token"))
+        self.assertFalse(lock_path.exists())
+        self.assertEqual(list(Path(self.tmp.name).glob("*.evicted.*")), [])
+
+        # 3. _atomic_file_lock finally: must NOT unlink or overwrite another holder's lockfile
+        release_lock_path = Path(self.tmp.name) / "release_verify.lock"
+        other_holder = {"pid": os.getpid(), "ts": time.time(), "token": "foreign-holder-tok", "released": False}
+        with swarm_tools._atomic_file_lock(release_lock_path, timeout=2.0):
+            # Simulate external eviction + takeover by another process while we held the lock
+            release_lock_path.write_text(json.dumps(other_holder), encoding="utf-8")
+        self.assertTrue(release_lock_path.is_file(), "finally: must not unlink another holder's lock")
+        after_doc = json.loads(swarm_tools._read_text_shared(release_lock_path))
+        self.assertEqual(after_doc["token"], "foreign-holder-tok")
+        self.assertIs(after_doc["released"], False, "finally: must not overwrite another holder's lock as released")
+        release_lock_path.unlink(missing_ok=True)
+
+        # 4. _http_request_json reloads token_file on 401 EVEN WHEN has_env_token=True
+        tok_file = Path(self.tmp.name) / "fresh_internal_token"
+        tok_file.write_text("fresh-disk-token-401\n", encoding="utf-8")
+        seen_auths: list[str] = []
+
+        class _AuthFallbackHandler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):  # noqa: A002
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                _ = self.rfile.read(length)
+                auth = self.headers.get("Authorization") or ""
+                seen_auths.append(auth)
+                if auth != "Bearer fresh-disk-token-401":
+                    raw = json.dumps({"ok": False, "error": "unauthorized"}).encode("utf-8")
+                    self.send_response(401)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    self.wfile.write(raw)
+                    return
+                raw = json.dumps({"seq": 77, "id": "bmsg-401-ok", "summary": "recovered"}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), _AuthFallbackHandler)
+        port = srv.server_address[1]
+        st = threading.Thread(target=srv.serve_forever, daemon=True)
+        st.start()
+        try:
+            # Direct _http_request_json call with has_env_token=True
+            direct_cfg = {"token": "stale-env-tok", "token_file": str(tok_file), "has_env_token": "1"}
+            res = swarm_tools._http_request_json(
+                f"http://127.0.0.1:{port}/internal/board/post",
+                method="POST",
+                token="stale-env-tok",
+                payload={"summary": "hello"},
+                token_file=str(tok_file),
+                has_env_token=True,
+                cfg=direct_cfg,
+            )
+            self.assertTrue(res["ok"], msg=res)
+            self.assertEqual(res["status"], 200)
+            self.assertEqual(direct_cfg["token"], "fresh-disk-token-401")
+            self.assertEqual(seen_auths, ["Bearer stale-env-tok", "Bearer fresh-disk-token-401"])
+
+            # End-to-end swarm_post with stale HERMES_SWARM_HTTP_TOKEN + valid HERMES_SWARM_TOKEN_FILE
+            seen_auths.clear()
+            env = {
+                **self.base_clear_env,
+                "HERMES_SWARM_ID": "swarm-401-env",
+                "HERMES_SWARM_AGENT": "coder-401",
+                "HERMES_SWARM_HTTP_URL": f"http://127.0.0.1:{port}",
+                "HERMES_SWARM_HTTP_TOKEN": "stale-env-tok",
+                "HERMES_SWARM_TOKEN_FILE": str(tok_file),
+                "HERMES_SWARM_BOARD_DIR": str(self.board_dir),
+            }
+            with _EnvPatch(env):
+                ctx = _FakeCtx()
+                self.plugin.register(ctx)
+                post_res = json.loads(ctx.tools["swarm_post"]["handler"]({"summary": "env token fallback"}))
+                self.assertTrue(post_res["ok"], msg=post_res)
+                self.assertEqual(post_res["source"], "http")
+                self.assertEqual(post_res["message"]["seq"], 77)
+                self.assertEqual(seen_auths, ["Bearer stale-env-tok", "Bearer fresh-disk-token-401"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_m6_reap_lock_file_rejects_live_token_when_expected_token_is_none(self) -> None:
+        from hermes_swarm_bridge import swarm_tools
+
+        # Live holder lock with a token MUST NOT be reaped when expected_token is None
+        live_lock = Path(self.tmp.name) / "m6_live_token.lock"
+        live_payload = {"pid": os.getpid(), "ts": time.time(), "token": "live-holder-uuid", "released": False}
+        live_lock.write_text(json.dumps(live_payload), encoding="utf-8")
+        self.assertFalse(
+            swarm_tools._reap_lock_file(live_lock, expected_token=None),
+            "Must NOT reap a live lock carrying a token when expected_token is None",
+        )
+        self.assertTrue(live_lock.is_file())
+        self.assertEqual(json.loads(swarm_tools._read_text_shared(live_lock))["token"], "live-holder-uuid")
+
+        # Legacy tokenless JSON lockfile (cur_token is None) still reaps cleanly when expected_token is None
+        legacy_json_lock = Path(self.tmp.name) / "m6_legacy_json.lock"
+        legacy_json_lock.write_text(json.dumps({"pid": 9999999, "ts": 1.0}), encoding="utf-8")
+        self.assertTrue(swarm_tools._reap_lock_file(legacy_json_lock, expected_token=None))
+        self.assertFalse(legacy_json_lock.exists())
+
+        # Corrupt / non-JSON tokenless lockfile (cur_token is None) also reaps cleanly
+        corrupt_lock = Path(self.tmp.name) / "m6_corrupt.lock"
+        corrupt_lock.write_text("stale-non-json", encoding="utf-8")
+        self.assertTrue(swarm_tools._reap_lock_file(corrupt_lock, expected_token=None))
+        self.assertFalse(corrupt_lock.exists())
+        self.assertEqual(list(Path(self.tmp.name).glob("*.reap.*")), [])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

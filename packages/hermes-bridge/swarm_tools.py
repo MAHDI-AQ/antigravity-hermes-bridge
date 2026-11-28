@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import contextvars
+import ctypes
 from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
 import random
 import re
+import sys
 import threading
 import time
 from typing import Any, Iterator, Mapping
@@ -18,6 +20,32 @@ import urllib.parse
 import urllib.request
 import uuid
 import weakref
+
+if sys.platform == "win32":
+    from ctypes import wintypes
+    import msvcrt
+
+    _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _K32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    _K32.OpenProcess.restype = ctypes.c_void_p
+    _K32.GetExitCodeProcess.argtypes = [ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)]
+    _K32.GetExitCodeProcess.restype = wintypes.BOOL
+    _K32.CloseHandle.argtypes = [ctypes.c_void_p]
+    _K32.CloseHandle.restype = wintypes.BOOL
+    _K32.CreateFileW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+    ]
+    _K32.CreateFileW.restype = ctypes.c_void_p
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+else:
+    _K32 = None
+    _INVALID_HANDLE_VALUE = -1
 
 SCHEMA_VERSION = 2
 DEFAULT_CHANNEL = "#general"
@@ -270,9 +298,12 @@ def _find_registry_state_dir(board_dir_raw: str) -> Path | None:
             return bp
         if bp.parent.name == "swarms" and (bp.parent.parent / "internal_token").is_file():
             return bp.parent.parent
-    default_state = Path.home() / "Tools" / "hermes-a2a-mcp" / "state"
-    if (default_state / "registry.json").is_file():
-        return default_state
+    for default_state in (
+        Path.home() / "Tools" / "hermes-a2a-mcp" / "state",
+        Path.home() / ".local" / "share" / "hermes-swarm" / "mcp-server" / "state",
+    ):
+        if (default_state / "registry.json").is_file() or (default_state / "internal_token").is_file():
+            return default_state
     return None
 
 
@@ -393,6 +424,39 @@ def _discover_from_registry(
     return None, state_dir
 
 
+def _read_text_shared(path: Path) -> str:
+    """Read UTF-8 text from `path`, using Windows FILE_SHARE_DELETE/READ/WRITE flags when available."""
+    if sys.platform == "win32" and _K32 is not None:
+        generic_read = 0x80000000
+        share_all = 0x00000001 | 0x00000002 | 0x00000004  # FILE_SHARE_READ | WRITE | DELETE
+        open_existing = 3
+        file_attr_normal = 0x80
+        handle = _K32.CreateFileW(
+            str(path),
+            generic_read,
+            share_all,
+            None,
+            open_existing,
+            file_attr_normal,
+            None,
+        )
+        if not handle or handle == _INVALID_HANDLE_VALUE:
+            err = ctypes.get_last_error()
+            if err in (2, 3):  # ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND
+                raise FileNotFoundError(str(path))
+            if err == 5:  # ERROR_ACCESS_DENIED
+                raise PermissionError(f"Access denied reading {path}")
+            raise ctypes.WinError(err)
+        try:
+            fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        except Exception:
+            _K32.CloseHandle(handle)
+            raise
+        with os.fdopen(fd, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    return path.read_text(encoding="utf-8", errors="replace")
+
+
 def _read_token_file(path_str: str) -> str:
     if not path_str:
         return ""
@@ -400,7 +464,7 @@ def _read_token_file(path_str: str) -> str:
     if not p.is_file():
         return ""
     try:
-        return p.read_text(encoding="utf-8", errors="replace").strip()
+        return _read_text_shared(p).strip()
     except OSError:
         return ""
 
@@ -597,20 +661,17 @@ def _resolve_board_paths(cfg: dict[str, str]) -> tuple[Path, Path] | None:
 def _pid_alive(pid: int) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
-    if os.name == "nt":
+    if sys.platform == "win32" and _K32 is not None:
         try:
-            import ctypes
-
-            k32 = ctypes.windll.kernel32
-            handle = k32.OpenProcess(0x1000, False, pid)
-            if not handle:
-                return k32.GetLastError() == 5
+            handle = _K32.OpenProcess(0x1000, False, int(pid))
+            if not handle or handle == _INVALID_HANDLE_VALUE:
+                return ctypes.get_last_error() == 5
             try:
-                code = ctypes.c_ulong()
-                ok = k32.GetExitCodeProcess(handle, ctypes.byref(code))
+                code = wintypes.DWORD()
+                ok = _K32.GetExitCodeProcess(handle, ctypes.byref(code))
                 return bool(ok and code.value == 259)
             finally:
-                k32.CloseHandle(handle)
+                _K32.CloseHandle(handle)
         except Exception:
             return False
     try:
@@ -624,26 +685,28 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
-def _read_lock_holder(lock_path: Path) -> tuple[int | None, float | None, bool]:
+def _read_lock_holder(lock_path: Path) -> tuple[int | None, float | None, bool, str | None]:
     try:
-        raw = lock_path.read_text(encoding="utf-8", errors="replace").strip()
+        raw = _read_text_shared(lock_path).strip()
         if raw.startswith("{"):
             data = json.loads(raw)
             if isinstance(data, dict):
                 pid_raw = data.get("pid")
                 ts_raw = data.get("ts")
                 released = bool(data.get("released", False))
+                token_raw = data.get("token")
                 return (
                     int(pid_raw) if pid_raw is not None else None,
                     float(ts_raw) if ts_raw is not None else None,
                     released,
+                    str(token_raw) if token_raw is not None else None,
                 )
     except Exception:
         pass
     try:
-        return None, lock_path.stat().st_mtime, False
+        return None, lock_path.stat().st_mtime, False, None
     except OSError:
-        return None, None, False
+        return None, None, False, None
 
 
 def _unlink_with_retries(path: Path, attempts: int = 20) -> bool:
@@ -658,6 +721,22 @@ def _unlink_with_retries(path: Path, attempts: int = 20) -> bool:
     return not path.exists()
 
 
+def _reap_lock_file(lock_path: Path, expected_token: str | None) -> bool:
+    """Re-verify holder token and rename dead/stale/released lock aside before unlinking."""
+    _, _, _, cur_token = _read_lock_holder(lock_path)
+    if cur_token != expected_token:
+        return False
+    reap_path = lock_path.with_name(f"{lock_path.name}.reap.{uuid.uuid4().hex[:8]}")
+    try:
+        os.replace(str(lock_path), str(reap_path))
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    _unlink_with_retries(reap_path, attempts=4)
+    return True
+
+
 @contextmanager
 def _atomic_file_lock(lock_path: Path, timeout: float = 5.0, stale_seconds: float = 30.0) -> Iterator[None]:
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -669,10 +748,7 @@ def _atomic_file_lock(lock_path: Path, timeout: float = 5.0, stale_seconds: floa
 
     acquired = False
     lock_token = uuid.uuid4().hex
-    last_holder_check = 0.0
-    pid_val: int | None = None
-    ts_val: float | None = None
-    released_flag = False
+    attempt = 0
     try:
         while True:
             try:
@@ -691,42 +767,46 @@ def _atomic_file_lock(lock_path: Path, timeout: float = 5.0, stale_seconds: floa
                 break
             except FileExistsError:
                 now_mono = time.monotonic()
-                if last_holder_check == 0.0 or (now_mono - last_holder_check) >= 0.15:
-                    pid_val, ts_val, released_flag = _read_lock_holder(lock_path)
-                    last_holder_check = now_mono
+                pid_val, ts_val, released_flag, cur_token = _read_lock_holder(lock_path)
+                if ts_val is None:
+                    try:
+                        ts_val = lock_path.stat().st_mtime
+                    except OSError:
+                        ts_val = None
 
                 is_released = released_flag or pid_val == 0
                 is_dead_pid = pid_val is not None and pid_val > 0 and not _pid_alive(pid_val)
                 is_stale = ts_val is not None and (time.time() - ts_val) > stale_seconds
                 if is_released or is_dead_pid or (is_stale and (pid_val is None or not _pid_alive(pid_val))):
-                    if _unlink_with_retries(lock_path, attempts=4):
-                        last_holder_check = 0.0
+                    if _reap_lock_file(lock_path, cur_token):
+                        attempt = 0
                         continue
-                    evicted_path = lock_path.with_name(f"{lock_path.name}.evicted.{os.getpid()}.{time.time_ns()}")
-                    try:
-                        os.replace(str(lock_path), str(evicted_path))
-                        _unlink_with_retries(evicted_path, attempts=2)
-                        last_holder_check = 0.0
-                        continue
-                    except OSError:
-                        pass
 
                 if now_mono >= deadline:
                     raise TimeoutError(f"Timed out acquiring lock {lock_path}")
                 remaining = deadline - now_mono
-                time.sleep(min(0.02, max(0.004, remaining)))
+                base_sleep = min(0.05, 0.003 * (1.4 ** min(attempt, 10)))
+                jittered = base_sleep * random.uniform(0.5, 1.5)
+                attempt += 1
+                time.sleep(min(remaining, max(0.002, jittered)))
 
         yield
     finally:
         try:
-            if acquired and not _unlink_with_retries(lock_path, attempts=20) and lock_path.exists():
-                try:
-                    lock_path.write_text(
-                        json.dumps({"pid": 0, "ts": 0.0, "token": lock_token, "released": True}),
-                        encoding="utf-8",
-                    )
-                except OSError:
-                    pass
+            if acquired:
+                _, _, _, on_disk_token = _read_lock_holder(lock_path)
+                if on_disk_token == lock_token:
+                    removed = _unlink_with_retries(lock_path, attempts=20)
+                    if not removed and lock_path.exists():
+                        _, _, _, still_token = _read_lock_holder(lock_path)
+                        if still_token == lock_token:
+                            try:
+                                lock_path.write_text(
+                                    json.dumps({"pid": 0, "ts": 0.0, "token": lock_token, "released": True}),
+                                    encoding="utf-8",
+                                )
+                            except OSError:
+                                pass
         finally:
             box.lock.release()
 
@@ -759,15 +839,14 @@ def _read_json_safe(path: Path, default: Any = None) -> Any:
     if not path.is_file():
         return default
 
-
     for attempt in range(5):
         try:
-            raw = path.read_text(encoding="utf-8", errors="replace")
+            raw = _read_text_shared(path)
             if not raw.strip():
                 return default
-
-
             return json.loads(raw)
+        except FileNotFoundError:
+            return default
         except (PermissionError, OSError, ValueError):
             if attempt < 4:
                 time.sleep(0.01 * (attempt + 1))
@@ -1145,8 +1224,15 @@ def _http_request_json(
     res = _do_once(token)
     eff_token_file = token_file or (cfg.get("token_file", "") if cfg else "")
     eff_env_token = has_env_token or bool(cfg and cfg.get("has_env_token"))
-    if res["status"] == 401 and eff_token_file and not eff_env_token:
-        _log_bridge_event(cfg, "http_retry", url=url, method=method, status=401, reason="token_refresh")
+    if res["status"] == 401 and eff_token_file:
+        _log_bridge_event(
+            cfg,
+            "http_retry",
+            url=url,
+            method=method,
+            status=401,
+            reason="token_file_fallback" if eff_env_token else "token_refresh",
+        )
         refreshed = _read_token_file(eff_token_file)
         if refreshed and refreshed != token:
             if cfg is not None:
