@@ -4837,9 +4837,10 @@ def _build_transcript_summary_from_parsed(parsed: dict[str, Any]) -> dict[str, A
 
 def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str, Any], list[int]]:
     """Parse an Antigravity JSONL transcript with bounded LRU caching keyed by `(str(path), mtime_ns, size, ino)`."""
-    path_str = str(log_path)
     try:
-        st = log_path.stat()
+        resolved_log = log_path.resolve()
+        path_str = str(resolved_log)
+        st = resolved_log.stat()
         cache_key = (path_str, int(st.st_mtime_ns), int(st.st_size), int(getattr(st, "st_ino", 0)))
         mtime_ms = int(st.st_mtime * 1000)
     except OSError:
@@ -4886,7 +4887,7 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
         live_current_tool = None
 
     try:
-        raw_lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        raw_lines = resolved_log.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return _empty_parsed_transcript(), []
 
@@ -5197,7 +5198,7 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
     }
     summary_entry = _build_transcript_summary_from_parsed(entry)
     try:
-        st_after = log_path.stat()
+        st_after = resolved_log.stat()
         key_after = (path_str, int(st_after.st_mtime_ns), int(st_after.st_size), int(getattr(st_after, "st_ino", 0)))
     except OSError:
         key_after = None
@@ -5215,7 +5216,7 @@ def _parse_antigravity_transcript_cached_entry(log_path: Path) -> tuple[dict[str
                     # Tie on (mtime_ns, size): only evict prev_key if cur_rev >= prev_rev (or disk matches cache_key).
                     if cur_rev[2] < prev_rev[2]:
                         try:
-                            st_live = log_path.stat()
+                            st_live = resolved_log.stat()
                             live_key = (
                                 path_str,
                                 int(st_live.st_mtime_ns),

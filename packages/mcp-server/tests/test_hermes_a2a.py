@@ -6635,10 +6635,15 @@ class BackendPerfAndFreezeRegressionTests(unittest.TestCase):
         read_count = 0
         orig_read_text = Path.read_text
 
+        resolved_tfile = tfile.resolve()
+
         def _counting_read_text(path_obj: Path, *args, **kwargs):
             nonlocal read_count
-            if path_obj == tfile:
-                read_count += 1
+            try:
+                if path_obj.resolve() == resolved_tfile:
+                    read_count += 1
+            except OSError:
+                pass
             return orig_read_text(path_obj, *args, **kwargs)
 
         try:
